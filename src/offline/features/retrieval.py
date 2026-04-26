@@ -23,11 +23,12 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.retrieval")
-_PREPROCESS_VERSION = 9
+_PREPROCESS_VERSION = 11
 _SEQUENCE_TRAIN_SCHEMA = "prefix_expanded_v1"
 _RECENCY_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
 _RECENCY_BUCKET_BOUNDARIES_SECONDS = np.asarray(_RECENCY_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
 _RECENCY_BUCKET_COUNT = len(_RECENCY_BUCKET_BOUNDARIES_DAYS) + 2
+_POPULARITY_BUCKET_COUNT = 10
 
 
 
@@ -83,23 +84,13 @@ def process_features(df_movies, df_ratings, df_users):
 
 
 
-def _pad_scalar_or_sequence(values, max_seq_len: int, padding_value: int = 0):
-    if np.isscalar(values):
-        return np.int32(values)
-    if isinstance(values, np.ndarray) and values.ndim == 0:
-        return np.int32(values.item())
-
-    if isinstance(values, (list, tuple)) and values and isinstance(values[0], (list, tuple, np.ndarray)):
-        flattened_parts = [np.asarray(part, dtype=np.int32).reshape(-1) for part in values if len(np.asarray(part).reshape(-1)) > 0]
-        arr = np.concatenate(flattened_parts) if flattened_parts else np.array([], dtype=np.int32)
-    else:
-        arr = np.asarray(values, dtype=np.int32).reshape(-1)
-
-    arr = arr[-max_seq_len:]
+def _pad_sequence(values, max_seq_len: int, padding_value: int = 0):
+    arr = np.asarray(values, dtype=np.int32).reshape(-1)[-max_seq_len:]
     padded = np.full(max_seq_len, padding_value, dtype=np.int32)
     if arr.size > 0:
         padded[-arr.size:] = arr
     return padded
+
 
 
 
@@ -167,7 +158,6 @@ def _build_sequence_train_split(grouped_users, user_columns, max_hist_seq_len: i
         "occupation": np.zeros(sample_count, dtype=np.int32),
         "zip_code": np.zeros(sample_count, dtype=np.int32),
         "hist_movie_id": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
-        "hist_genres": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_recency_bucket": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_rating": np.zeros((sample_count, max_hist_seq_len), dtype=np.float32),
         "hist_feedback": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
@@ -183,7 +173,6 @@ def _build_sequence_train_split(grouped_users, user_columns, max_hist_seq_len: i
             continue
         user_features = {col: np.int32(grouped_feats[col].iloc[0]) for col in user_columns}
         movie_sequence = grouped_feats["movie_id"].to_numpy(dtype=np.int32, copy=False)
-        genre_sequence = grouped_feats["genres"].tolist()
         rating_sequence = grouped_feats["rating"].to_numpy(dtype=np.float32, copy=False)
         timestamp_sequence = grouped_feats["timestamp"].to_numpy(dtype=np.int64, copy=False)
 
@@ -192,22 +181,20 @@ def _build_sequence_train_split(grouped_users, user_columns, max_hist_seq_len: i
             if target_rating < threshold:
                 continue
             prefix_movie_sequence = movie_sequence[:target_idx]
-            prefix_genre_sequence = genre_sequence[:target_idx]
             prefix_rating_sequence = rating_sequence[:target_idx]
             prefix_timestamp_sequence = timestamp_sequence[:target_idx]
 
             sequence_train["user_id"][row_idx] = np.int32(user_id_value)
             for col in user_columns:
                 sequence_train[col][row_idx] = user_features[col]
-            sequence_train["hist_movie_id"][row_idx] = _pad_scalar_or_sequence(prefix_movie_sequence, max_hist_seq_len, padding_value)
-            sequence_train["hist_genres"][row_idx] = _pad_scalar_or_sequence(prefix_genre_sequence, max_hist_seq_len, padding_value)
+            sequence_train["hist_movie_id"][row_idx] = _pad_sequence(prefix_movie_sequence, max_hist_seq_len, padding_value)
             sequence_train["hist_recency_bucket"][row_idx] = _recency_buckets(
                 prefix_timestamp_sequence,
                 timestamp_sequence[target_idx],
                 max_hist_seq_len,
                 padding_value,
             )
-            sequence_train["hist_rating"][row_idx] = _pad_scalar_or_sequence(prefix_rating_sequence, max_hist_seq_len, 0.0)
+            sequence_train["hist_rating"][row_idx] = _pad_sequence(prefix_rating_sequence, max_hist_seq_len, 0.0)
             sequence_train["hist_feedback"][row_idx] = _feedback_tokens(
                 prefix_rating_sequence,
                 max_hist_seq_len,
@@ -266,7 +253,6 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
         "occupation": np.zeros(train_sample_count, dtype=np.int32),
         "zip_code": np.zeros(train_sample_count, dtype=np.int32),
         "hist_movie_id": np.zeros((train_sample_count, max_hist_seq_len), dtype=np.int32),
-        "hist_genres": np.zeros((train_sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_recency_bucket": np.zeros((train_sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_rating": np.zeros((train_sample_count, max_hist_seq_len), dtype=np.float32),
         "movie_id": np.zeros(train_sample_count, dtype=np.int32),
@@ -279,7 +265,6 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
         "occupation": np.zeros(test_sample_count, dtype=np.int32),
         "zip_code": np.zeros(test_sample_count, dtype=np.int32),
         "hist_movie_id": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.int32),
-        "hist_genres": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_recency_bucket": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_rating": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.float32),
         "hist_feedback": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.int32),
@@ -296,7 +281,6 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
 
         user_features = {col: np.int32(grouped_feats[col].iloc[0]) for col in user_columns}
         movie_sequence = grouped_feats["movie_id"].to_numpy(dtype=np.int32, copy=False)
-        genre_sequence = grouped_feats["genres"].tolist()
         rating_sequence = grouped_feats["rating"].to_numpy(dtype=np.float32, copy=False)
         timestamp_sequence = grouped_feats["timestamp"].to_numpy(dtype=np.int64, copy=False)
         positive_target_indices = [idx for idx in range(1, history_length) if float(rating_sequence[idx]) >= threshold]
@@ -307,10 +291,9 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
         test_data_dict["user_id"][test_row] = np.int32(user_id_value)
         for col in user_columns:
             test_data_dict[col][test_row] = user_features[col]
-        test_data_dict["hist_movie_id"][test_row] = _pad_scalar_or_sequence(movie_sequence[:test_target_idx], max_hist_seq_len, padding_value)
-        test_data_dict["hist_genres"][test_row] = _pad_scalar_or_sequence(genre_sequence[:test_target_idx], max_hist_seq_len, padding_value)
+        test_data_dict["hist_movie_id"][test_row] = _pad_sequence(movie_sequence[:test_target_idx], max_hist_seq_len, padding_value)
         test_data_dict["hist_recency_bucket"][test_row] = _recency_buckets(timestamp_sequence[:test_target_idx], timestamp_sequence[test_target_idx], max_hist_seq_len, padding_value)
-        test_data_dict["hist_rating"][test_row] = _pad_scalar_or_sequence(rating_sequence[:test_target_idx], max_hist_seq_len, 0.0)
+        test_data_dict["hist_rating"][test_row] = _pad_sequence(rating_sequence[:test_target_idx], max_hist_seq_len, 0.0)
         test_data_dict["hist_feedback"][test_row] = _feedback_tokens(
             rating_sequence[:test_target_idx],
             max_hist_seq_len,
@@ -325,10 +308,9 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
             train_data_dict["user_id"][train_row] = np.int32(user_id_value)
             for col in user_columns:
                 train_data_dict[col][train_row] = user_features[col]
-            train_data_dict["hist_movie_id"][train_row] = _pad_scalar_or_sequence(movie_sequence[:i], max_hist_seq_len, padding_value)
-            train_data_dict["hist_genres"][train_row] = _pad_scalar_or_sequence(genre_sequence[:i], max_hist_seq_len, padding_value)
+            train_data_dict["hist_movie_id"][train_row] = _pad_sequence(movie_sequence[:i], max_hist_seq_len, padding_value)
             train_data_dict["hist_recency_bucket"][train_row] = _recency_buckets(timestamp_sequence[:i], timestamp_sequence[i], max_hist_seq_len, padding_value)
-            train_data_dict["hist_rating"][train_row] = _pad_scalar_or_sequence(rating_sequence[:i], max_hist_seq_len, 0.0)
+            train_data_dict["hist_rating"][train_row] = _pad_sequence(rating_sequence[:i], max_hist_seq_len, 0.0)
             train_data_dict["movie_id"][train_row] = np.int32(movie_sequence[i])
             train_data_dict["rating"][train_row] = np.float32(rating_sequence[i])
             train_row += 1
@@ -440,6 +422,7 @@ def run_retrieval_preprocessing():
     vocab_dict = {**user_vocab, **movie_vocab}
     feature_dict = {k: len(v) + 1 for k, v in vocab_dict.items()}
     feature_dict["hist_recency_bucket"] = _RECENCY_BUCKET_COUNT
+    feature_dict["popularity"] = _POPULARITY_BUCKET_COUNT + 1
     save_pickle(samples, RETRIEVAL_SAMPLE_PATH)
     save_pickle(vocab_dict, RETRIEVAL_VOCAB_DICT_PATH)
     save_pickle(feature_dict, RETRIEVAL_FEATURE_DICT_PATH)

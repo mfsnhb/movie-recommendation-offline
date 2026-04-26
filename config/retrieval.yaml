@@ -1,7 +1,7 @@
 common:
   training:
-    batch_size: 512
-    epochs: 10
+    batch_size: 768
+    epochs: 5
     learning_rate: 0.0005
     weight_decay: 1.0e-5
     log_every_n_batches: 100
@@ -32,6 +32,7 @@ common:
       - sequence
       - item_cf
       - genre
+      - popular
 
 models:
   two_tower:
@@ -45,18 +46,15 @@ models:
   sequence:
     architecture:
       embedding_dim: 32
-      num_heads: 4
-      num_layers: 4
-      ffn_dim: 128
+      hidden_dim: 64
+      num_layers: 1
       max_len: 150
       dropout: 0.1
-      use_recency_embedding: false
-      use_feedback_embedding: false
-      use_final_norm: true
-      ffn_activation: relu
     training:
       sequence_num_negatives: 32
       sequence_user_negative_ratio: 0.75
+      sequence_loss: bce
+      sequence_history_feedback: positive
 
   item2item:
     enabled: false

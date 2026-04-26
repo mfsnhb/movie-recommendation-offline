@@ -1,12 +1,12 @@
-default_model: deepfm
+default_model: din
 
 common:
   training:
-    validation_ratio: 0.1
+    validation_samples_per_user: 1
+    validation_max_users: 6040
     early_stopping_patience: 2
     min_delta: 1.0e-4
-    train_negatives: 7
-    eval_negatives: 49
+    train_negatives: 15
     rating_weighting_enabled: true
     rating_weight_neutral: 3.0
     rating_weight_scale: 0.25
@@ -23,7 +23,7 @@ models:
   deepfm:
     framework: torch
     architecture:
-      embedding_dim: 32
+      embedding_dim: 64
       dnn_hidden_dims: [256, 128]
       dropout: 0.1
     training:
@@ -36,7 +36,7 @@ models:
   din:
     framework: torch
     architecture:
-      embedding_dim: 32
+      embedding_dim: 64
       dnn_hidden_dims: [256, 128]
       attention_hidden_dims: [128, 64]
       dropout: 0.1
@@ -45,26 +45,4 @@ models:
       epochs: 10
       learning_rate: 0.001
       weight_decay: 1.0e-5
-      log_every_n_batches: 20
-
-  xgboost:
-    framework: xgboost
-    params:
-      n_estimators: 300
-      max_depth: 6
-      learning_rate: 0.05
-      subsample: 0.9
-      colsample_bytree: 0.9
-      reg_lambda: 1.0
-      min_child_weight: 1.0
-
-  xgboost_ranker:
-    framework: xgboost
-    params:
-      n_estimators: 300
-      max_depth: 6
-      learning_rate: 0.05
-      subsample: 0.9
-      colsample_bytree: 0.9
-      reg_lambda: 1.0
-      min_child_weight: 1.0
+      log_every_n_batches: 100

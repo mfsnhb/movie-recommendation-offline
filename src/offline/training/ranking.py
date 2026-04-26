@@ -6,23 +6,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset
 
 from offline.evaluate.metrics import ranking_metrics, save_metrics
 from offline.evaluate.multi_recall import evaluate_final_candidates
 from offline.models.deepfm import DeepFMModel
 from offline.models.din import DINModel
-from offline.models.xgboost import (
-    evaluate_final_candidates_xgboost,
-    evaluate_xgboost_scores,
-    predict_xgboost_scores,
-    train_xgboost_model,
-)
 from offline.ranking.dataset import (
     SequenceRankingDataset,
-    SequenceRankingEvalCollator,
     SequenceRankingTrainCollator,
-    SequenceRankingValidationCollator,
     batch_to_device,
     build_inference_batch,
 )
@@ -34,8 +26,6 @@ from offline.ranking.protocol import (
     get_all_item_ids,
     get_item_feature_arrays,
 )
-from offline.ranking.wrapper import PointwiseCandidateRanker
-from offline.ranking.xgboost_features import build_xgboost_training_frame
 from offline.utils.config import resolve_ranking_config, resolve_ranking_model_names
 from offline.utils.io import (
     CONFIG_DIR,
@@ -56,7 +46,8 @@ from offline.utils.logging import format_eta, get_logger
 logger = get_logger("offline.training.ranking")
 POINTWISE_RANKING_FIELDS = STATIC_USER_FIELDS + POINTWISE_ITEM_FIELDS
 _TORCH_RANKING_MODELS = {"deepfm", "din"}
-_XGBOOST_RANKING_MODELS = {"xgboost", "xgboost_ranker"}
+_RANKING_INFERENCE_BATCH_SIZE = 64
+_DEFAULT_MAX_VALIDATION_USERS = 6040
 
 
 
@@ -88,10 +79,7 @@ def run_ranking_training(model_name: str | None = None, models=None, warm_start:
 
     if evaluate:
         for selected_model in selected_models:
-            if selected_model in _TORCH_RANKING_MODELS:
-                results.setdefault(selected_model, {})["ranking"] = evaluate_ranking_model(selected_model)
-            else:
-                results.setdefault(selected_model, {})["ranking"] = load_pickle(get_ranking_model_config_path(selected_model)).get("latest_ranking_metrics")
+            results.setdefault(selected_model, {})["ranking"] = evaluate_ranking_model(selected_model)
 
     if final_evaluate:
         for selected_model in selected_models:
@@ -109,10 +97,6 @@ def train_ranking_models(models=None, warm_start: bool = True):
             results[model_name] = train_deepfm(warm_start=warm_start)
         elif model_name == "din":
             results[model_name] = train_din(warm_start=warm_start)
-        elif model_name == "xgboost":
-            results[model_name] = train_xgboost(warm_start=warm_start)
-        elif model_name == "xgboost_ranker":
-            results[model_name] = train_xgboost_ranker(warm_start=warm_start)
         else:
             raise ValueError(f"Unsupported ranking model: {model_name}")
     return results
@@ -129,61 +113,36 @@ def train_din(warm_start: bool = True):
 
 
 
-def train_xgboost(warm_start: bool = True):
-    return _run_xgboost_training("xgboost", warm_start=warm_start)
-
-
-
-def train_xgboost_ranker(warm_start: bool = True):
-    return _run_xgboost_training("xgboost_ranker", warm_start=warm_start)
-
-
-
 def evaluate_ranking_model(model_name: str) -> dict:
     normalized_model_name = model_name.strip().lower()
-    if normalized_model_name in _XGBOOST_RANKING_MODELS:
-        ranking_metrics_path = get_ranking_metrics_path(normalized_model_name)
-        if not ranking_metrics_path.exists():
-            raise FileNotFoundError(f"Missing ranking metrics for {normalized_model_name}")
-        import json
-
-        return json.loads(ranking_metrics_path.read_text(encoding="utf-8"))
-
     settings = yaml.safe_load((CONFIG_DIR / "ranking.yaml").read_text(encoding="utf-8")) or {}
     resolved_config = resolve_ranking_config(settings, requested_model_name=normalized_model_name)
     ranking_samples = load_pickle(RANKING_SAMPLE_PATH)
     item_catalog = load_pickle(ITEM_CATALOG_PATH)
-    feature_dict = load_pickle(RANKING_FEATURE_DICT_PATH)
     item_features = get_item_feature_arrays(item_catalog)
     all_item_ids = get_all_item_ids(item_catalog)
-    training_settings = resolved_config["training_settings"]
+    fused_candidates_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
+    if not fused_candidates_by_user:
+        raise FileNotFoundError("Missing fused multi-recall candidates for ranking evaluation")
+
+    feature_dict = load_pickle(RANKING_FEATURE_DICT_PATH)
     model_settings = resolved_config["model_settings"]
     emb_dim = int(model_settings.get("embedding_dim", 16))
-    eval_negatives = int(training_settings.get("eval_negatives", 49))
-    batch_size = int(training_settings.get("batch_size", 256))
-    if normalized_model_name == "din":
-        batch_size = int(training_settings.get("din_batch_size", batch_size))
-
-    test_dataset = SequenceRankingDataset(ranking_samples["test"])
-    fused_candidates_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=SequenceRankingEvalCollator(
-            item_features=item_features,
-            all_item_ids=all_item_ids,
-            num_negatives=eval_negatives,
-            seed=193,
-            fused_candidates_by_user=fused_candidates_by_user,
-        ),
-    )
-
+    final_topk = int(resolved_config["evaluation_settings"].get("final_topk", 20))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(get_ranking_model_path(normalized_model_name), map_location=device)
     model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim).to(device)
     model.load_state_dict(checkpoint["state_dict"], strict=False)
-    metrics = _evaluate_ranking(model, test_loader, device)
+    metrics = _evaluate_fused_candidates_subset(
+        model,
+        ranking_samples["test"],
+        list(range(int(len(ranking_samples["test"]["user_id"])))),
+        item_features,
+        all_item_ids,
+        device,
+        final_topk=final_topk,
+        fused_candidates_by_user=fused_candidates_by_user,
+    )
     save_metrics(get_ranking_metrics_path(normalized_model_name), metrics)
     logger.info("Ranking metrics saved | model=%s | path=%s | metrics=%s", normalized_model_name, get_ranking_metrics_path(normalized_model_name).name, metrics)
     return metrics
@@ -198,33 +157,17 @@ def evaluate_final_ranking(model_name: str) -> dict:
     item_catalog = load_pickle(ITEM_CATALOG_PATH)
     item_features = get_item_feature_arrays(item_catalog)
     all_item_ids = get_all_item_ids(item_catalog)
-    item_popularity = np.asarray(ranking_samples.get("item_popularity", np.zeros(0, dtype=np.int64)))
     final_topk = int(resolved_config["evaluation_settings"].get("final_topk", 20))
     final_metrics_path = get_final_metrics_path(normalized_model_name)
 
-    if normalized_model_name in _XGBOOST_RANKING_MODELS:
-        import xgboost as xgb
-
-        booster = xgb.Booster()
-        booster.load_model(get_ranking_model_path(normalized_model_name))
-        final_metrics = evaluate_final_candidates_xgboost(
-            booster,
-            ranking_samples,
-            item_features=item_features,
-            item_popularity=item_popularity,
-            all_item_ids=all_item_ids,
-            final_topk=final_topk,
-            use_ranker=normalized_model_name == "xgboost_ranker",
-        )
-    else:
-        feature_dict = load_pickle(RANKING_FEATURE_DICT_PATH)
-        model_settings = resolved_config["model_settings"]
-        emb_dim = int(model_settings.get("embedding_dim", 16))
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load(get_ranking_model_path(normalized_model_name), map_location=device)
-        model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim).to(device)
-        model.load_state_dict(checkpoint["state_dict"], strict=False)
-        final_metrics = _evaluate_final_candidates(model, ranking_samples, item_features, all_item_ids, device, final_topk)
+    feature_dict = load_pickle(RANKING_FEATURE_DICT_PATH)
+    model_settings = resolved_config["model_settings"]
+    emb_dim = int(model_settings.get("embedding_dim", 16))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(get_ranking_model_path(normalized_model_name), map_location=device)
+    model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim).to(device)
+    model.load_state_dict(checkpoint["state_dict"], strict=False)
+    final_metrics = _evaluate_final_candidates(model, ranking_samples, item_features, all_item_ids, device, final_topk)
 
     save_metrics(final_metrics_path, final_metrics)
     logger.info("Final metrics saved | model=%s | path=%s | metrics=%s", normalized_model_name, final_metrics_path.name, final_metrics)
@@ -246,16 +189,15 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
 
     train_dataset = SequenceRankingDataset(ranking_samples["train"])
     fused_candidates_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
-    val_ratio = float(training_settings.get("validation_ratio", 0.1))
-    val_size = max(1, int(len(train_dataset) * val_ratio)) if len(train_dataset) > 1 else 0
-    train_size = max(len(train_dataset) - val_size, 0)
-    val_indices: list[int] = []
-    if train_size == 0:
-        train_subset = train_dataset
-        val_subset = None
-    else:
-        train_subset, val_subset = random_split(train_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
-        val_indices = [int(index) for index in val_subset.indices]
+    validation_samples_per_user = int(training_settings.get("validation_samples_per_user", 2))
+    validation_max_users = int(training_settings.get("validation_max_users", _DEFAULT_MAX_VALIDATION_USERS))
+    train_indices, val_indices = _split_latest_user_validation_indices(
+        ranking_samples["train"],
+        fused_candidates_by_user,
+        samples_per_user=validation_samples_per_user,
+        max_users=validation_max_users,
+    )
+    train_subset = Subset(train_dataset, train_indices) if val_indices else train_dataset
 
     batch_size = int(training_settings.get("batch_size", 256))
     epochs = int(training_settings.get("epochs", 3))
@@ -266,15 +208,13 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     min_delta = float(training_settings.get("min_delta", 1e-4))
     emb_dim = int(model_settings.get("embedding_dim", 16))
     train_negatives = int(training_settings.get("train_negatives", 7))
-    eval_negatives = int(training_settings.get("eval_negatives", 49))
-    if model_name == "din":
-        batch_size = int(training_settings.get("din_batch_size", batch_size))
-        log_every_n_batches = int(training_settings.get("din_log_every_n_batches", log_every_n_batches))
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
         shuffle=True,
+        pin_memory=device.type == "cuda",
         collate_fn=SequenceRankingTrainCollator(
             item_features=item_features,
             all_item_ids=all_item_ids,
@@ -283,7 +223,6 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
         ),
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _build_model(model_name, feature_dict, model_settings, emb_dim).to(device)
     ranking_model_path = get_ranking_model_path(model_name)
     ranking_model_config_path = get_ranking_model_config_path(model_name)
@@ -294,12 +233,13 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     logger.info(
-        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | val_samples=%s | batch_size=%s | epochs=%s | train_negatives=%s | fused_validation=%s | warm_start=%s",
+        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | val_samples=%s | val_users=%s | batch_size=%s | epochs=%s | train_negatives=%s | fused_validation=%s | warm_start=%s",
         model_name,
         ranking_samples.get("protocol", "unknown"),
         device,
-        len(train_dataset),
+        len(train_indices),
         len(val_indices),
+        len({int(ranking_samples["train"]["user_id"][idx]) for idx in val_indices}),
         batch_size,
         epochs,
         train_negatives,
@@ -323,7 +263,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             optimizer.zero_grad()
             logits = model(batch)
             sample_weight = _target_rating_weights(batch["target_rating"], training_settings)
-            loss = _candidate_loss(logits, batch["target_index"], sample_weight)
+            loss = _listwise_candidate_loss(logits, batch["candidate_relevance"], batch["candidate_mask"], sample_weight)
             loss.backward()
             optimizer.step()
 
@@ -452,6 +392,38 @@ def _resolve_ranking_user_candidate_pool(ranking_samples: dict) -> dict[int, np.
 
 
 
+def _split_latest_user_validation_indices(
+    split_data: dict,
+    fused_candidates_by_user: dict[int, np.ndarray] | None,
+    samples_per_user: int,
+    max_users: int,
+) -> tuple[list[int], list[int]]:
+    total_rows = int(len(split_data["user_id"]))
+    if samples_per_user <= 0 or total_rows <= 0:
+        return list(range(total_rows)), []
+
+    user_ids = np.asarray(split_data["user_id"], dtype=np.int32)
+    val_indices_by_user: dict[int, list[int]] = {}
+    for sample_idx in range(total_rows - 1, -1, -1):
+        user_id = int(user_ids[sample_idx])
+        if user_id in val_indices_by_user:
+            if len(val_indices_by_user[user_id]) >= samples_per_user:
+                continue
+        elif max_users > 0 and len(val_indices_by_user) >= max_users:
+            continue
+        if fused_candidates_by_user is not None:
+            candidates = fused_candidates_by_user.get(user_id)
+            if candidates is None or int(np.asarray(candidates).size) == 0:
+                continue
+        val_indices_by_user.setdefault(user_id, []).append(sample_idx)
+
+    val_index_set = {sample_idx for indices in val_indices_by_user.values() for sample_idx in indices}
+    train_indices = [sample_idx for sample_idx in range(total_rows) if sample_idx not in val_index_set]
+    val_indices = sorted(val_index_set)
+    return train_indices, val_indices
+
+
+
 def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_dim: int):
     if model_name == "deepfm":
         scorer = DeepFMModel(
@@ -462,7 +434,7 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
             dropout=float(model_settings.get("dropout", 0.1)),
             history_fields=POINTWISE_SEQUENCE_FIELDS,
         )
-        return PointwiseCandidateRanker(scorer, static_fields=STATIC_USER_FIELDS)
+        return scorer
 
     if model_name == "din":
         scorer = DINModel(
@@ -473,163 +445,33 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
             attention_hidden_dims=model_settings.get("attention_hidden_dims"),
             dropout=float(model_settings.get("dropout", 0.1)),
         )
-        return PointwiseCandidateRanker(scorer, static_fields=STATIC_USER_FIELDS)
+        return scorer
 
     raise ValueError(f"Unsupported ranking model: {model_name}")
 
 
 
-def _run_xgboost_training(model_name: str, warm_start: bool = True):
-    settings = yaml.safe_load((CONFIG_DIR / "ranking.yaml").read_text(encoding="utf-8")) or {}
-    resolved_config = resolve_ranking_config(settings, requested_model_name=model_name)
-    training_settings = resolved_config["training_settings"]
-    evaluation_settings = resolved_config["evaluation_settings"]
-    xgboost_params = resolved_config["xgboost_params"]
-    ranking_samples = load_pickle(RANKING_SAMPLE_PATH)
-    item_catalog = load_pickle(ITEM_CATALOG_PATH)
-    feature_dict = load_pickle(RANKING_FEATURE_DICT_PATH)
-    item_features = get_item_feature_arrays(item_catalog)
-    all_item_ids = get_all_item_ids(item_catalog)
-    fused_candidates_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
-    item_popularity = np.asarray(ranking_samples.get("item_popularity", np.zeros(0, dtype=np.int64)))
-    train_negatives = int(training_settings.get("train_negatives", 7))
-    eval_negatives = int(training_settings.get("eval_negatives", 49))
-    ranking_model_path = get_ranking_model_path(model_name)
-    ranking_model_config_path = get_ranking_model_config_path(model_name)
-    ranking_metrics_path = get_ranking_metrics_path(model_name)
-
-    train_rows, train_labels, train_groups, train_weights = build_xgboost_training_frame(
-        ranking_samples["train"],
-        item_features=item_features,
-        all_item_ids=all_item_ids,
-        num_negatives=train_negatives,
-        item_popularity=item_popularity,
-        seed=42,
-    )
-    test_rows, test_labels, test_groups, _ = build_xgboost_training_frame(
-        ranking_samples["test"],
-        item_features=item_features,
-        all_item_ids=all_item_ids,
-        num_negatives=eval_negatives,
-        item_popularity=item_popularity,
-        seed=193,
-        fused_candidates_by_user=fused_candidates_by_user,
-    )
-    if train_rows.size == 0 or test_rows.size == 0:
-        raise ValueError("XGBoost ranking received empty training or evaluation rows")
-
-    model_params = dict(xgboost_params or {})
-    model_params.setdefault("n_estimators", 300)
-    model_params.setdefault("max_depth", 6)
-    model_params.setdefault("learning_rate", 0.05)
-    model_params.setdefault("subsample", 0.9)
-    model_params.setdefault("colsample_bytree", 0.9)
-    model_params.setdefault("reg_lambda", 1.0)
-    model_params.setdefault("min_child_weight", 1.0)
-    model_params.setdefault("random_state", 42)
-    model_params.setdefault("tree_method", "hist")
-    model_params.setdefault("device", "cuda" if torch.cuda.is_available() else "cpu")
-
-    logger.info(
-        "XGBoost training start | model=%s | protocol=%s | train_rows=%s | test_rows=%s | train_negatives=%s | eval_negatives=%s | warm_start=%s",
-        model_name,
-        ranking_samples.get("protocol", "unknown"),
-        int(train_rows.shape[0]),
-        int(test_rows.shape[0]),
-        train_negatives,
-        eval_negatives,
-        warm_start,
-    )
-
-    warm_start_path = ranking_model_path if warm_start and ranking_model_path.exists() else None
-    booster = train_xgboost_model(
-        model_name,
-        train_rows=train_rows,
-        train_labels=train_labels,
-        train_groups=train_groups,
-        model_params=model_params,
-        warm_start_model_path=warm_start_path,
-        sample_weights=train_weights,
-    )
-    test_scores = predict_xgboost_scores(booster, test_rows, use_ranker=model_name == "xgboost_ranker")
-    metrics = evaluate_xgboost_scores(test_labels, test_scores, test_groups)
-    save_metrics(ranking_metrics_path, metrics)
-    booster.save_model(ranking_model_path)
-    save_pickle(
-        {
-            "protocol": ranking_samples.get("protocol", "unknown"),
-            "model_name": model_name,
-            "feature_dict": feature_dict,
-            "model_settings": model_params,
-            "training_settings": training_settings,
-            "evaluation_settings": evaluation_settings,
-            "train_negatives": train_negatives,
-            "eval_negatives": eval_negatives,
-            "latest_ranking_metrics": metrics,
-        },
-        ranking_model_config_path,
-    )
-    logger.info("Ranking metrics saved | model=%s | path=%s | metrics=%s", model_name, ranking_metrics_path.name, metrics)
-    return {"model_name": model_name, "model_path": str(ranking_model_path), "config_path": str(ranking_model_config_path), "ranking": metrics}
-
-
-
-def _candidate_loss(logits: torch.Tensor, target_index: torch.Tensor, sample_weight: torch.Tensor | None = None) -> torch.Tensor:
-    losses = F.cross_entropy(logits, target_index, reduction="none")
+def _listwise_candidate_loss(
+    logits: torch.Tensor,
+    relevance: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    mask = candidate_mask.bool()
+    masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+    gains = torch.clamp(relevance.float(), min=0.0) * mask.float()
+    gain_sums = gains.sum(dim=1, keepdim=True)
+    valid_rows = mask.any(dim=1) & gain_sums.squeeze(1).gt(0)
+    if not valid_rows.any():
+        return torch.zeros((), dtype=logits.dtype, device=logits.device)
+    target_dist = gains[valid_rows] / gain_sums[valid_rows].clamp_min(1e-9)
+    pred_log_probs = F.log_softmax(masked_logits[valid_rows], dim=1)
+    losses = -(target_dist * pred_log_probs).sum(dim=1)
     if sample_weight is None:
         return losses.mean()
-    normalized = sample_weight.float() / sample_weight.float().mean().clamp_min(1e-9)
-    return (losses * normalized).mean()
-
-
-
-def _evaluate_loss(model, data_loader, device: torch.device, training_settings: dict | None = None) -> float:
-    model.eval()
-    total_loss = 0.0
-    total_groups = 0
-    with torch.no_grad():
-        for batch in data_loader:
-            batch = batch_to_device(batch, device)
-            logits = model(batch)
-            sample_weight = _target_rating_weights(batch["target_rating"], training_settings)
-            loss = _candidate_loss(logits, batch["target_index"], sample_weight)
-            batch_groups = int(batch["target_index"].numel())
-            total_loss += float(loss.item()) * batch_groups
-            total_groups += batch_groups
-    return total_loss / max(total_groups, 1)
-
-
-
-def _evaluate_ranking(model, data_loader, device: torch.device) -> dict:
-    model.eval()
-    flat_labels: list[np.ndarray] = []
-    flat_scores: list[np.ndarray] = []
-    flat_user_ids: list[np.ndarray] = []
-    group_losses: list[float] = []
-
-    with torch.no_grad():
-        for batch in data_loader:
-            batch = batch_to_device(batch, device)
-            logits = model(batch)
-            probabilities = torch.softmax(logits, dim=-1)
-            target_index = batch["target_index"]
-            positive_probabilities = probabilities.gather(1, target_index.unsqueeze(1)).squeeze(1)
-            group_losses.extend((-torch.log(positive_probabilities.clamp_min(1e-9))).cpu().numpy().tolist())
-
-            labels = torch.zeros_like(probabilities)
-            labels.scatter_(1, target_index.unsqueeze(1), 1.0)
-            user_ids = batch["user_id_original"].cpu().numpy()
-
-            flat_labels.append(labels.cpu().numpy().reshape(-1))
-            flat_scores.append(probabilities.cpu().numpy().reshape(-1))
-            flat_user_ids.append(np.repeat(user_ids, probabilities.size(1)))
-
-    labels = np.concatenate(flat_labels) if flat_labels else np.zeros(0, dtype=np.float32)
-    scores = np.concatenate(flat_scores) if flat_scores else np.zeros(0, dtype=np.float32)
-    user_ids = np.concatenate(flat_user_ids) if flat_user_ids else np.zeros(0, dtype=np.int32)
-    metrics = ranking_metrics(labels, scores, user_ids)
-    metrics["group_cross_entropy"] = float(np.mean(group_losses)) if group_losses else 0.0
-    return metrics
+    weights = sample_weight[valid_rows].float()
+    weights = weights / weights.mean().clamp_min(1e-9)
+    return (losses * weights).mean()
 
 
 
@@ -647,33 +489,62 @@ def _evaluate_fused_candidates_subset(
     candidate_ids: list[list[int]] = []
     candidate_scores: list[list[float]] = []
     candidate_labels: list[list[float]] = []
+    flat_user_ids: list[int] = []
+    flat_scores: list[float] = []
+    flat_labels: list[float] = []
     skipped_missing_candidates = 0
+    inference_batch_size = _RANKING_INFERENCE_BATCH_SIZE
 
     model.eval()
     with torch.no_grad():
-        for sample_idx in sample_indices:
-            sample = extract_split_sample(split_data, sample_idx)
-            user_id = int(sample["user_id"])
-            candidates = fused_candidates_by_user.get(user_id)
-            if candidates is None or int(np.asarray(candidates).size) == 0:
-                skipped_missing_candidates += 1
+        for start in range(0, len(sample_indices), inference_batch_size):
+            batch_indices = sample_indices[start : start + inference_batch_size]
+            samples = []
+            candidate_pools = []
+            for sample_idx in batch_indices:
+                sample = extract_split_sample(split_data, sample_idx)
+                user_id = int(sample["user_id"])
+                candidates = fused_candidates_by_user.get(user_id)
+                if candidates is None or int(np.asarray(candidates).size) == 0:
+                    skipped_missing_candidates += 1
+                    continue
+                samples.append(sample)
+                candidate_pools.append(np.asarray(candidates, dtype=np.int32))
+
+            if not samples:
                 continue
-            batch, valid_candidates = build_inference_batch(sample, np.asarray(candidates, dtype=np.int32).tolist(), item_features)
-            if batch is None or not valid_candidates:
+
+            batch, valid_candidates_by_sample, valid_indices = build_inference_batch(samples, candidate_pools, item_features)
+            if batch is None:
                 continue
 
             batch = batch_to_device(batch, device)
-            scores = model(batch)[0].cpu().numpy().tolist()
-            target = int(sample["target_movie_id"])
-            ranked_pairs = sorted(zip(valid_candidates, scores), key=lambda pair: pair[1], reverse=True)[:final_topk]
-            ranked_candidates = [int(candidate) for candidate, _ in ranked_pairs]
-            ranked_scores = [float(score) for _, score in ranked_pairs]
-            ranked_labels = [1.0 if int(candidate) == target else 0.0 for candidate in ranked_candidates]
+            batch_scores = model(batch).cpu().numpy()
+            for row_idx, valid_candidates in enumerate(valid_candidates_by_sample):
+                sample = samples[valid_indices[row_idx]]
+                scores = batch_scores[row_idx, : len(valid_candidates)]
+                candidates_array = np.asarray(valid_candidates, dtype=np.int32)
+                take = min(final_topk, int(scores.shape[0]))
+                if take <= 0:
+                    continue
+                if take < scores.shape[0]:
+                    top_positions = np.argpartition(scores, -take)[-take:]
+                    top_positions = top_positions[np.argsort(scores[top_positions])[::-1]]
+                else:
+                    top_positions = np.argsort(scores)[::-1]
+                ranked_candidates_array = candidates_array[top_positions]
+                ranked_scores_array = scores[top_positions]
+                target = int(sample["target_movie_id"])
+                labels = (candidates_array == target).astype(float)
+                user_id = int(sample["user_id"])
+                flat_user_ids.extend([user_id] * int(scores.shape[0]))
+                flat_scores.extend(scores.astype(float).tolist())
+                flat_labels.extend(labels.tolist())
 
-            candidate_user_ids.append(user_id)
-            candidate_ids.append(ranked_candidates)
-            candidate_scores.append(ranked_scores)
-            candidate_labels.append(ranked_labels)
+                candidate_user_ids.append(user_id)
+                candidate_ids.append(ranked_candidates_array.astype(int).tolist())
+                candidate_scores.append(ranked_scores_array.astype(float).tolist())
+                candidate_labels.append(labels[top_positions].astype(float).tolist())
 
     metrics = evaluate_final_candidates(
         np.asarray(candidate_user_ids, dtype=np.int32),
@@ -683,6 +554,14 @@ def _evaluate_fused_candidates_subset(
         all_item_ids=all_item_ids,
         output_path=None,
     )
+    if flat_labels:
+        metrics.update(
+            ranking_metrics(
+                np.asarray(flat_labels, dtype=np.float32),
+                np.asarray(flat_scores, dtype=np.float32),
+                np.asarray(flat_user_ids, dtype=np.int32),
+            )
+        )
     metrics["evaluated_users"] = int(len(candidate_user_ids))
     metrics["skipped_missing_candidates"] = int(skipped_missing_candidates)
     return metrics

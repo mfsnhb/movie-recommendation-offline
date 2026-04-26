@@ -63,8 +63,6 @@ def get_ranking_model_path(model_name: str | None = None) -> Path:
     normalized = _normalize_model_name(model_name)
     if normalized == "deepfm":
         return RANKING_MODEL_PATH
-    if normalized in {"xgboost", "xgboost_ranker"}:
-        return MODELS_DIR / f"ranking_model_{normalized}.json"
     return MODELS_DIR / f"ranking_model_{normalized}.pt"
 
 

@@ -18,8 +18,8 @@ env/
 !.env.example
 
 # Raw data and generated artifacts
-data/
-outputs/
+/data/
+/outputs/
 
 # Model and metric artifacts
 *.pt

@@ -7,7 +7,7 @@ import torch
 import yaml
 
 from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, precision_at_k, recall_at_k, save_metrics
-from offline.models.sequence_retrieval import SequenceRetrievalModel
+from offline.models.sequence_retrieval import SequenceRetrievalModel, filter_sequence_history
 from offline.models.two_tower import TwoTowerRetrievalModel
 from offline.ranking.protocol import get_all_item_ids, get_item_feature_arrays
 from offline.utils.config import resolve_multi_recall_route_names, resolve_retrieval_config
@@ -156,9 +156,9 @@ def build_route_outputs(topk: int, routes: list[str] | None = None):
 
     for route_name in route_order:
         if route_name == "two_tower":
-            route_outputs[route_name] = _build_two_tower_output(test, encoded_movie_ids, device, topk)
+            route_outputs[route_name] = _build_two_tower_output(test, encoded_movie_ids, item_features, device, topk)
         elif route_name == "sequence":
-            route_outputs[route_name] = _build_sequence_output(test, encoded_movie_ids, device, topk)
+            route_outputs[route_name] = _build_sequence_output(test, encoded_movie_ids, item_features, device, topk)
         elif route_name == "item2item":
             route_outputs[route_name] = _build_item2item_output(test, topk)
         elif route_name == "item_cf":
@@ -226,7 +226,22 @@ def _empty_route_output(test_user_ids) -> dict[int, dict[int, float]]:
 
 
 
-def _build_two_tower_output(test_data: dict, encoded_movie_ids: np.ndarray | None, device: torch.device, topk: int):
+def _item_feature_tensors(item_features: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
+    return {field: torch.as_tensor(values, dtype=torch.long, device=device) for field, values in item_features.items()}
+
+
+def _build_item_batch(item_ids: torch.Tensor, item_features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    item_ids = item_ids.long()
+    return {
+        "movie_id": item_ids,
+        "genres": item_features["genres"][item_ids],
+        "isAdult": item_features["isAdult"][item_ids],
+        "startYear": item_features["startYear"][item_ids],
+        "popularity": item_features["popularity"][item_ids],
+    }
+
+
+def _build_two_tower_output(test_data: dict, encoded_movie_ids: np.ndarray | None, item_features: dict[str, np.ndarray], device: torch.device, topk: int):
     if encoded_movie_ids is None or not RETRIEVAL_MODEL_PATH.exists() or not ITEM_EMBEDDINGS_PATH.exists() or not RETRIEVAL_FEATURE_DICT_PATH.exists():
         logger.info("Multi-recall route skipped | route=two_tower | reason=missing_artifact")
         return _empty_route_output(test_data["user_id"])
@@ -255,11 +270,11 @@ def _build_two_tower_output(test_data: dict, encoded_movie_ids: np.ndarray | Non
     ).to(device)
     model.load_state_dict(retrieval_checkpoint["state_dict"])
     model.eval()
-    return _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk)
+    return _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, _item_feature_tensors(item_features, device), device, topk)
 
 
 
-def _build_sequence_output(test_data: dict, encoded_movie_ids: np.ndarray | None, device: torch.device, topk: int):
+def _build_sequence_output(test_data: dict, encoded_movie_ids: np.ndarray | None, item_features: dict[str, np.ndarray], device: torch.device, topk: int):
     if encoded_movie_ids is None or not SEQUENCE_MODEL_PATH.exists() or not SEQUENCE_ITEM_EMBEDDINGS_PATH.exists() or not RETRIEVAL_FEATURE_DICT_PATH.exists():
         logger.info("Multi-recall route skipped | route=sequence | reason=missing_artifact")
         return _empty_route_output(test_data["user_id"])
@@ -275,19 +290,16 @@ def _build_sequence_output(test_data: dict, encoded_movie_ids: np.ndarray | None
     model = SequenceRetrievalModel(
         feature_dict,
         emb_dim,
-        num_heads=int(model_settings.get("num_heads", model_settings.get("sequence_num_heads", 2))),
-        num_layers=int(model_settings.get("num_layers", model_settings.get("sequence_num_layers", 2))),
-        ffn_dim=int(model_settings.get("ffn_dim", model_settings.get("sequence_ffn_dim", 128))),
+        hidden_dim=int(model_settings.get("hidden_dim", emb_dim)),
+        num_layers=int(model_settings.get("num_layers", 1)),
         max_len=int(model_settings.get("max_len", model_settings.get("sequence_max_len", 10))),
         dropout=float(model_settings.get("dropout", model_settings.get("sequence_dropout", 0.1))),
-        use_recency_embedding=bool(model_settings.get("use_recency_embedding", False)),
-        use_feedback_embedding=bool(model_settings.get("use_feedback_embedding", False)),
-        use_final_norm=bool(model_settings.get("use_final_norm", True)),
-        ffn_activation=str(model_settings.get("ffn_activation", "relu")),
     ).to(device)
     model.load_state_dict(sequence_checkpoint["state_dict"])
     model.eval()
-    return _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk)
+    training_settings = sequence_checkpoint.get("training_settings", {})
+    history_feedback = str(training_settings.get("sequence_history_feedback", "positive")).strip().lower()
+    return _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, _item_feature_tensors(item_features, device), device, topk, history_feedback=history_feedback)
 
 
 
@@ -331,7 +343,7 @@ def _build_popular_output(test_data: dict, topk: int):
 
 
 
-def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk):
+def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, item_feature_tensors, device, topk):
     outputs = {}
     with torch.no_grad():
         for idx, user_id in enumerate(test_data["user_id"]):
@@ -342,10 +354,11 @@ def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, devic
                 "occupation": torch.tensor([int(test_data["occupation"][idx])], dtype=torch.long, device=device),
                 "zip_code": torch.tensor([int(test_data["zip_code"][idx])], dtype=torch.long, device=device),
                 "hist_movie_id": torch.tensor(np.asarray(test_data["hist_movie_id"][idx]).reshape(1, -1), dtype=torch.long, device=device),
-                "hist_genres": torch.tensor(np.asarray(test_data["hist_genres"][idx]).reshape(1, -1), dtype=torch.long, device=device),
                 "hist_recency_bucket": torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device),
                 "hist_rating": torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device),
             }
+            hist_item_batch = _build_item_batch(batch["hist_movie_id"], item_feature_tensors)
+            batch.update({f"hist_{field}": value for field, value in hist_item_batch.items() if field != "movie_id"})
             user_embedding = model.encode_user(batch).cpu().numpy()[0]
             scores = embeddings @ user_embedding
             top_indices = np.argsort(scores)[::-1][:topk]
@@ -354,17 +367,25 @@ def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, devic
 
 
 
-def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk):
+def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, item_feature_tensors, device, topk, history_feedback: str = "positive"):
     outputs = {}
     with torch.no_grad():
         for idx, user_id in enumerate(test_data["user_id"]):
             hist_movie_ids = torch.tensor(np.asarray(test_data["hist_movie_id"][idx]).reshape(1, -1), dtype=torch.long, device=device)
             hist_recency_bucket = torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device)
             hist_feedback = torch.tensor(np.asarray(test_data["hist_feedback"][idx]).reshape(1, -1), dtype=torch.long, device=device)
+            hist_movie_ids, hist_recency_bucket, hist_feedback = filter_sequence_history(
+                hist_movie_ids,
+                hist_recency_bucket,
+                hist_feedback,
+                history_feedback,
+            )
+            hist_item_features = _build_item_batch(hist_movie_ids, item_feature_tensors)
             user_embedding = model.encode_user(
                 hist_movie_ids,
                 hist_recency_bucket,
                 hist_feedback,
+                {field: value for field, value in hist_item_features.items() if field != "movie_id"},
             ).cpu().numpy()[0]
             scores = embeddings @ user_embedding
             top_indices = np.argsort(scores)[::-1][:topk]
@@ -425,20 +446,19 @@ def _item_cf_candidates(test_data, item_cf_model, topk):
 def _genre_candidates(test_data, genre_to_items: dict[int, list[int]], item_features: dict[str, np.ndarray], all_item_ids: np.ndarray, topk: int):
     if not genre_to_items:
         genre_to_items = defaultdict(list)
-        genre_matrix = np.asarray(item_features.get("genres_multi", item_features["genres"]), dtype=np.int32)
+        genre_matrix = np.asarray(item_features["genres"], dtype=np.int32)
         for item_id in all_item_ids.tolist():
-            genre_tokens = np.asarray(genre_matrix[item_id]).reshape(-1)
-            valid_genres = [int(token) for token in genre_tokens.tolist() if int(token) > 0]
-            if not valid_genres:
-                valid_genres = [int(item_features["genres"][item_id])]
-            for genre_id in valid_genres:
+            for genre_id in (idx + 1 for idx in np.flatnonzero(genre_matrix[item_id]).tolist()):
                 genre_to_items[int(genre_id)].append(int(item_id))
     outputs = {}
     for idx, user_id in enumerate(test_data["user_id"]):
-        genre_history = [int(x) for x in np.asarray(test_data["hist_genres"][idx]).reshape(-1) if int(x) > 0]
+        history_ids = np.asarray(test_data["hist_movie_id"][idx], dtype=np.int32).reshape(-1)
+        valid_history = history_ids[(history_ids > 0) & (history_ids < item_features["genres"].shape[0])]
         preference_scores = Counter()
-        for rank, genre in enumerate(reversed(genre_history[-10:]), start=1):
-            preference_scores[int(genre)] += 1.0 / rank
+        for rank, movie_id in enumerate(reversed(valid_history[-10:]), start=1):
+            movie_genres = np.flatnonzero(np.asarray(item_features["genres"][movie_id], dtype=np.int32)).tolist()
+            for genre_idx in movie_genres:
+                preference_scores[int(genre_idx) + 1] += 1.0 / rank
         scores = {}
         for genre, genre_weight in preference_scores.most_common(3):
             for item_rank, item_id in enumerate(genre_to_items.get(int(genre), [])[: topk // 2 or 1], start=1):

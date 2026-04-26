@@ -4,14 +4,12 @@ import numpy as np
 
 
 STATIC_USER_FIELDS = ["user_id", "gender", "age", "occupation", "zip_code"]
-POINTWISE_ITEM_FIELDS = ["movie_id", "genres", "isAdult", "startYear"]
-POINTWISE_SEQUENCE_FIELDS = ["hist_movie_id", "hist_genres"]
-POINTWISE_RANKING_FIELDS = STATIC_USER_FIELDS + POINTWISE_ITEM_FIELDS + POINTWISE_SEQUENCE_FIELDS
+POINTWISE_ITEM_FIELDS = ["movie_id", "genres", "isAdult", "startYear", "popularity"]
+POINTWISE_SEQUENCE_FIELDS = ["context_movie_id"]
 
-CONTEXT_FIELDS = ["context_movie_id", "context_genres", "context_rating", "context_low_rating_mask", "context_length"]
-CANDIDATE_FIELDS = ["candidate_movie_id", "candidate_genres", "candidate_isAdult", "candidate_startYear"]
-ITEM_FEATURE_FIELDS = ["genres", "isAdult", "startYear"]
-OPTIONAL_ITEM_FEATURE_FIELDS = ["genres_multi"]
+CONTEXT_FIELDS = ["context_movie_id", "context_rating", "context_low_rating_mask", "context_length"]
+CANDIDATE_FIELDS = ["candidate_movie_id", "candidate_genres", "candidate_isAdult", "candidate_startYear", "candidate_popularity"]
+ITEM_FEATURE_FIELDS = ["genres", "isAdult", "startYear", "popularity"]
 
 
 def _as_int_array(value) -> np.ndarray:
@@ -22,18 +20,11 @@ def _as_int_array(value) -> np.ndarray:
 
 def get_item_feature_arrays(source: dict) -> dict[str, np.ndarray]:
     if all(field in source for field in ITEM_FEATURE_FIELDS):
-        arrays = {field: np.asarray(source[field], dtype=np.int32) for field in ITEM_FEATURE_FIELDS}
-        for field in OPTIONAL_ITEM_FEATURE_FIELDS:
-            if field in source:
-                arrays[field] = np.asarray(source[field], dtype=np.int32)
-        return arrays
+        return {field: np.asarray(source[field], dtype=np.int32) for field in ITEM_FEATURE_FIELDS}
 
     item_features = source.get("item_features")
     if item_features is not None:
-        arrays = {field: np.asarray(values, dtype=np.int32) for field, values in item_features.items()}
-        for field in ITEM_FEATURE_FIELDS:
-            arrays.setdefault(field, np.zeros(0, dtype=np.int32))
-        return arrays
+        return {field: np.asarray(item_features[field], dtype=np.int32) for field in ITEM_FEATURE_FIELDS}
 
     item_lookup = {}
     for split_name in ("train", "test"):
@@ -45,16 +36,19 @@ def get_item_feature_arrays(source: dict) -> dict[str, np.ndarray]:
             if encoded_movie_id <= 0 or encoded_movie_id in item_lookup:
                 continue
             item_lookup[encoded_movie_id] = {
-                "genres": int(split["target_genres"][idx]) if "target_genres" in split else 0,
-                "isAdult": int(split["target_isAdult"][idx]) if "target_isAdult" in split else 0,
-                "startYear": int(split["target_startYear"][idx]) if "target_startYear" in split else 0,
+                "genres": np.zeros(1, dtype=np.int32),
+                "isAdult": 0,
+                "startYear": 0,
+                "popularity": 0,
             }
 
     max_movie_id = max(item_lookup) if item_lookup else 0
-    arrays = {field: np.zeros(max_movie_id + 1, dtype=np.int32) for field in ITEM_FEATURE_FIELDS}
-    for movie_id, features in item_lookup.items():
-        for field in ITEM_FEATURE_FIELDS:
-            arrays[field][movie_id] = int(features[field])
+    arrays = {
+        "genres": np.zeros((max_movie_id + 1, 1), dtype=np.int32),
+        "isAdult": np.zeros(max_movie_id + 1, dtype=np.int32),
+        "startYear": np.zeros(max_movie_id + 1, dtype=np.int32),
+        "popularity": np.zeros(max_movie_id + 1, dtype=np.int32),
+    }
     return arrays
 
 
@@ -63,7 +57,7 @@ def get_all_item_ids(source: dict) -> np.ndarray:
         return np.asarray(source["all_item_ids"], dtype=np.int32)
 
     item_features = get_item_feature_arrays(source)
-    if item_features["genres"].size <= 1:
+    if item_features["genres"].shape[0] <= 1:
         return np.zeros(0, dtype=np.int32)
     return np.arange(1, item_features["genres"].shape[0], dtype=np.int32)
 

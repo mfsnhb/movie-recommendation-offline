@@ -3,29 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-
-def _build_mlp(input_dim: int, hidden_dims: list[int], output_dim: int, dropout: float = 0.0) -> nn.Sequential:
-    layers: list[nn.Module] = []
-    prev_dim = input_dim
-    for hidden_dim in hidden_dims:
-        layers.append(nn.Linear(prev_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-        prev_dim = hidden_dim
-    layers.append(nn.Linear(prev_dim, output_dim))
-    return nn.Sequential(*layers)
-
-
-class MeanPooling(nn.Module):
-    def forward(self, embeddings: torch.Tensor, tokens: torch.Tensor, low_rating_mask: torch.Tensor | None = None) -> torch.Tensor:
-        mask = tokens.gt(0)
-        if low_rating_mask is not None:
-            mask = mask & ~low_rating_mask.gt(0)
-        mask = mask.unsqueeze(-1)
-        summed = (embeddings * mask).sum(dim=1)
-        counts = mask.sum(dim=1).clamp_min(1)
-        return summed / counts
+from offline.models.feature_encoders import MovieFeatureEncoder, UserFeatureEncoder, build_mlp
 
 
 class DeepFMModel(nn.Module):
@@ -39,35 +17,45 @@ class DeepFMModel(nn.Module):
         history_fields: list[str] | None = None,
     ):
         super().__init__()
-        self.fields = fields
-        self.history_fields = history_fields or []
-        self.history_base_fields = {
-            "hist_movie_id": "movie_id",
-            "hist_genres": "genres",
-        }
-        self.linear_embeddings = nn.ModuleDict({field: nn.Embedding(feature_dict[field], 1, padding_idx=0) for field in fields})
-        self.fm_embeddings = nn.ModuleDict({field: nn.Embedding(feature_dict[field], emb_dim, padding_idx=0) for field in fields})
-        self.pool = MeanPooling()
-        self.dnn = _build_mlp((len(fields) + len(self.history_fields)) * emb_dim, dnn_hidden_dims or [128, 64], 1, dropout=dropout)
+        del fields, history_fields
+        self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
+        self.user_encoder = UserFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
+        self.movie_linear = nn.Embedding(feature_dict["movie_id"], 1, padding_idx=0)
+        self.dnn = build_mlp(emb_dim * 3, dnn_hidden_dims or [128, 64], 1, dropout=dropout)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        linear_terms = []
-        fm_vectors = []
-        for field in self.fields:
-            values = batch[field]
-            linear_terms.append(self.linear_embeddings[field](values))
-            fm_vectors.append(self.fm_embeddings[field](values))
-        linear_logit = torch.stack(linear_terms, dim=0).sum(dim=0).squeeze(-1)
-        fm_stack = torch.stack(fm_vectors, dim=1)
-        summed = fm_stack.sum(dim=1)
-        fm_logit = 0.5 * ((summed * summed) - (fm_stack * fm_stack).sum(dim=1)).sum(dim=1)
-        history_vectors = []
-        history_low_rating_mask = batch.get("hist_low_rating_mask")
-        for history_field in self.history_fields:
-            base_field = self.history_base_fields[history_field]
-            tokens = batch[history_field]
-            embeddings = self.fm_embeddings[base_field](tokens)
-            history_vectors.append(self.pool(embeddings, tokens, history_low_rating_mask))
-        dnn_input = torch.cat(fm_vectors + history_vectors, dim=1)
-        dnn_logit = self.dnn(dnn_input).squeeze(-1)
-        return linear_logit + fm_logit + dnn_logit
+        candidate_movie_id = batch["candidate_movie_id"]
+        batch_size, candidate_size = candidate_movie_id.shape
+        candidate_movie = self.movie_encoder({
+            "movie_id": candidate_movie_id,
+            "genres": batch["candidate_genres"],
+            "isAdult": batch["candidate_isAdult"],
+            "startYear": batch["candidate_startYear"],
+            "popularity": batch["candidate_popularity"],
+        })
+        context_movie = self.movie_encoder({
+            "movie_id": batch["context_movie_id"],
+            "genres": batch["context_genres"],
+            "isAdult": batch["context_isAdult"],
+            "startYear": batch["context_startYear"],
+            "popularity": batch["context_popularity"],
+        })
+        history_mask = batch["context_movie_id"].gt(0)
+        if "context_low_rating_mask" in batch:
+            history_mask = history_mask & ~batch["context_low_rating_mask"].gt(0)
+        history_weights = history_mask.unsqueeze(-1).float()
+        pooled_history = (context_movie * history_weights).sum(dim=1) / history_weights.sum(dim=1).clamp_min(1e-9)
+        user_embedding = self.user_encoder(batch, context_movie, history_mask)
+        pooled_history = pooled_history.unsqueeze(1).expand(-1, candidate_size, -1)
+        user_vector = user_embedding.unsqueeze(1).expand(-1, candidate_size, -1)
+        fm_vectors = torch.stack([candidate_movie, pooled_history, user_vector], dim=2)
+        summed = fm_vectors.sum(dim=2)
+        fm_logit = 0.5 * ((summed * summed) - (fm_vectors * fm_vectors).sum(dim=2)).sum(dim=2)
+        linear_logit = self.movie_linear(candidate_movie_id).squeeze(-1)
+        dnn_input = torch.cat([candidate_movie, pooled_history, user_vector], dim=-1)
+        dnn_logit = self.dnn(dnn_input.reshape(batch_size * candidate_size, -1)).view(batch_size, candidate_size)
+        logits = linear_logit + fm_logit + dnn_logit
+        candidate_mask = batch.get("candidate_mask")
+        if candidate_mask is not None:
+            logits = logits.masked_fill(~candidate_mask, torch.finfo(logits.dtype).min)
+        return logits

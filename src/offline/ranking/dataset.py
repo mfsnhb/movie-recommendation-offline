@@ -14,14 +14,7 @@ except ModuleNotFoundError:  # pragma: no cover - preprocessing can run without 
         pass
 
 
-from offline.ranking.protocol import (
-    CANDIDATE_FIELDS,
-    CONTEXT_FIELDS,
-    STATIC_USER_FIELDS,
-    extract_split_sample,
-    get_seen_movie_ids,
-    sample_negative_ids_with_candidates,
-)
+from offline.ranking.protocol import CANDIDATE_FIELDS, CONTEXT_FIELDS, ITEM_FEATURE_FIELDS, STATIC_USER_FIELDS, extract_split_sample
 
 
 class SequenceRankingDataset(Dataset):
@@ -39,47 +32,50 @@ class SequenceRankingDataset(Dataset):
 def batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     if torch is None:
         raise ModuleNotFoundError("torch is required for ranking training")
-    return {field: value.to(device) for field, value in batch.items()}
+    return {field: value.to(device, non_blocking=True) for field, value in batch.items()}
 
 
 def build_inference_batch(
-    sample: dict,
-    candidate_movie_ids: list[int],
+    samples: list[dict],
+    candidate_movie_ids: list[np.ndarray | list[int]],
     item_features: dict[str, np.ndarray],
-) -> tuple[dict[str, torch.Tensor] | None, list[int]]:
+) -> tuple[dict[str, torch.Tensor] | None, list[list[int]], list[int]]:
     if torch is None:
         raise ModuleNotFoundError("torch is required for ranking inference")
 
-    valid_candidates = [
-        int(movie_id)
-        for movie_id in candidate_movie_ids
-        if 0 < int(movie_id) < item_features["genres"].shape[0]
-    ]
-    if not valid_candidates:
-        return None, []
+    valid_samples: list[dict] = []
+    valid_candidates_by_sample: list[list[int]] = []
+    valid_indices: list[int] = []
+    max_candidate_size = 0
+    for sample_idx, (sample, raw_candidates) in enumerate(zip(samples, candidate_movie_ids, strict=False)):
+        valid_candidates = [
+            int(movie_id)
+            for movie_id in np.asarray(raw_candidates, dtype=np.int32).reshape(-1).tolist()
+            if 0 < int(movie_id) < item_features["genres"].shape[0]
+        ]
+        if not valid_candidates:
+            continue
+        valid_samples.append(sample)
+        valid_candidates_by_sample.append(valid_candidates)
+        valid_indices.append(sample_idx)
+        max_candidate_size = max(max_candidate_size, len(valid_candidates))
+
+    if not valid_samples:
+        return None, [], []
 
     batch = _init_batch_arrays(
-        batch_size=1,
-        context_width=len(np.asarray(sample["context_movie_id"]).reshape(-1)),
-        candidate_size=len(valid_candidates),
+        batch_size=len(valid_samples),
+        context_width=len(np.asarray(valid_samples[0]["context_movie_id"]).reshape(-1)),
+        candidate_size=max_candidate_size,
+        genre_count=int(item_features["genres"].shape[1]),
     )
-    _fill_base_fields(batch, sample, row_idx=0)
-    candidate_ids = np.asarray(valid_candidates, dtype=np.int32)
-    _fill_candidate_slot(batch, row_idx=0, candidate_ids=candidate_ids, item_features=item_features)
-    return _numpy_batch_to_torch(batch), valid_candidates
-
-
-def _resolve_candidate_pool(
-    sample: dict,
-    fused_candidates_by_user: dict[int, np.ndarray] | None,
-) -> np.ndarray | None:
-    if not fused_candidates_by_user:
-        return None
-    user_id = int(sample["user_id"])
-    candidate_pool = fused_candidates_by_user.get(user_id)
-    if candidate_pool is None or int(np.asarray(candidate_pool).size) == 0:
-        return None
-    return np.asarray(candidate_pool, dtype=np.int32).reshape(-1)
+    candidate_ids = np.zeros((len(valid_samples), max_candidate_size), dtype=np.int32)
+    for row_idx, (sample, valid_candidates) in enumerate(zip(valid_samples, valid_candidates_by_sample, strict=True)):
+        _fill_base_fields(batch, sample, row_idx=row_idx)
+        _fill_context_slots(batch, item_features=item_features, row_idx=row_idx)
+        candidate_ids[row_idx, : len(valid_candidates)] = np.asarray(valid_candidates, dtype=np.int32)
+    _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=item_features)
+    return _numpy_batch_to_torch(batch), valid_candidates_by_sample, valid_indices
 
 
 @dataclass
@@ -88,16 +84,14 @@ class SequenceRankingTrainCollator:
     all_item_ids: np.ndarray
     num_negatives: int
     seed: int = 42
-    fused_candidates_by_user: dict[int, np.ndarray] | None = None
 
     def __post_init__(self) -> None:
         self.all_item_ids = np.asarray(self.all_item_ids, dtype=np.int32)
         self.item_features = {field: np.asarray(values, dtype=np.int32) for field, values in self.item_features.items()}
-        if self.fused_candidates_by_user is not None:
-            self.fused_candidates_by_user = {
-                int(user_id): np.asarray(candidate_ids, dtype=np.int32)
-                for user_id, candidate_ids in self.fused_candidates_by_user.items()
-            }
+        max_item_id = int(self.all_item_ids.max()) if self.all_item_ids.size else 0
+        self.item_id_positions = np.full(max_item_id + 1, -1, dtype=np.int32)
+        if self.all_item_ids.size:
+            self.item_id_positions[self.all_item_ids] = np.arange(self.all_item_ids.size, dtype=np.int32)
         self.rng = np.random.default_rng(self.seed)
 
     def __call__(self, samples: list[dict]) -> dict[str, torch.Tensor]:
@@ -105,104 +99,62 @@ class SequenceRankingTrainCollator:
             batch_size=len(samples),
             context_width=len(np.asarray(samples[0]["context_movie_id"]).reshape(-1)),
             candidate_size=self.num_negatives + 1,
+            genre_count=int(self.item_features["genres"].shape[1]),
         )
+        positive_ids = np.zeros(len(samples), dtype=np.int32)
         for row_idx, sample in enumerate(samples):
             _fill_base_fields(batch, sample, row_idx=row_idx)
-            positive_movie_id = int(sample["target_movie_id"])
-            negatives = sample_negative_ids_with_candidates(
-                self.all_item_ids,
-                get_seen_movie_ids(sample),
-                positive_movie_id,
-                self.num_negatives,
-                self.rng,
-                candidate_pool=_resolve_candidate_pool(sample, self.fused_candidates_by_user),
-            )
-            candidate_ids = np.concatenate([[positive_movie_id], negatives], axis=0)
-            _fill_candidate_slot(batch, row_idx=row_idx, candidate_ids=candidate_ids, item_features=self.item_features)
+            _fill_context_slots(batch, item_features=self.item_features, row_idx=row_idx)
+            positive_ids[row_idx] = int(sample["target_movie_id"])
+
+        negative_ids = _sample_batch_negative_ids(
+            all_item_ids=self.all_item_ids,
+            item_id_positions=self.item_id_positions,
+            context_movie_ids=batch["context_movie_id"],
+            positive_ids=positive_ids,
+            count=self.num_negatives,
+            rng=self.rng,
+        )
+        candidate_ids = np.concatenate([positive_ids.reshape(-1, 1), negative_ids], axis=1)
+        _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=self.item_features)
         return _numpy_batch_to_torch(batch)
 
 
-@dataclass
-class SequenceRankingValidationCollator:
-    item_features: dict[str, np.ndarray]
-    all_item_ids: np.ndarray
-    num_negatives: int
-    seed: int = 97
-    fused_candidates_by_user: dict[int, np.ndarray] | None = None
+def _sample_batch_negative_ids(
+    all_item_ids: np.ndarray,
+    item_id_positions: np.ndarray,
+    context_movie_ids: np.ndarray,
+    positive_ids: np.ndarray,
+    count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    batch_size = int(positive_ids.shape[0])
+    if count <= 0:
+        return np.zeros((batch_size, 0), dtype=np.int32)
+    if all_item_ids.size == 0:
+        return np.zeros((batch_size, count), dtype=np.int32)
 
-    def __post_init__(self) -> None:
-        self.all_item_ids = np.asarray(self.all_item_ids, dtype=np.int32)
-        self.item_features = {field: np.asarray(values, dtype=np.int32) for field, values in self.item_features.items()}
-        if self.fused_candidates_by_user is not None:
-            self.fused_candidates_by_user = {
-                int(user_id): np.asarray(candidate_ids, dtype=np.int32)
-                for user_id, candidate_ids in self.fused_candidates_by_user.items()
-            }
+    scores = rng.random((batch_size, all_item_ids.size), dtype=np.float32)
+    blocked_ids = np.concatenate([context_movie_ids.astype(np.int32, copy=False), positive_ids.reshape(-1, 1)], axis=1)
+    flat_blocked = blocked_ids.reshape(-1)
+    flat_rows = np.repeat(np.arange(batch_size, dtype=np.int64), blocked_ids.shape[1])
+    valid_blocked = (flat_blocked > 0) & (flat_blocked < item_id_positions.shape[0])
+    if np.any(valid_blocked):
+        blocked_positions = item_id_positions[flat_blocked[valid_blocked]]
+        valid_positions = blocked_positions >= 0
+        if np.any(valid_positions):
+            scores[flat_rows[valid_blocked][valid_positions], blocked_positions[valid_positions]] = -1.0
 
-    def __call__(self, samples: list[dict]) -> dict[str, torch.Tensor]:
-        batch = _init_batch_arrays(
-            batch_size=len(samples),
-            context_width=len(np.asarray(samples[0]["context_movie_id"]).reshape(-1)),
-            candidate_size=self.num_negatives + 1,
-        )
-        for row_idx, sample in enumerate(samples):
-            _fill_base_fields(batch, sample, row_idx=row_idx)
-            positive_movie_id = int(sample["target_movie_id"])
-            rng = np.random.default_rng(self.seed + int(sample.get("user_id_original", sample["user_id"])) + positive_movie_id * 1009)
-            negatives = sample_negative_ids_with_candidates(
-                self.all_item_ids,
-                get_seen_movie_ids(sample),
-                positive_movie_id,
-                self.num_negatives,
-                rng,
-                candidate_pool=_resolve_candidate_pool(sample, self.fused_candidates_by_user),
-            )
-            candidate_ids = np.concatenate([[positive_movie_id], negatives], axis=0)
-            _fill_candidate_slot(batch, row_idx=row_idx, candidate_ids=candidate_ids, item_features=self.item_features)
-        return _numpy_batch_to_torch(batch)
+    take = min(count, int(all_item_ids.size))
+    selected_positions = np.argpartition(scores, kth=all_item_ids.size - take, axis=1)[:, -take:]
+    selected_scores = np.take_along_axis(scores, selected_positions, axis=1)
+    selected_ids = np.where(selected_scores >= 0.0, all_item_ids[selected_positions], 0).astype(np.int32, copy=False)
+    negatives = np.zeros((batch_size, count), dtype=np.int32)
+    negatives[:, :take] = selected_ids
+    return negatives
 
 
-@dataclass
-class SequenceRankingEvalCollator:
-    item_features: dict[str, np.ndarray]
-    all_item_ids: np.ndarray
-    num_negatives: int
-    seed: int = 193
-    fused_candidates_by_user: dict[int, np.ndarray] | None = None
-
-    def __post_init__(self) -> None:
-        self.all_item_ids = np.asarray(self.all_item_ids, dtype=np.int32)
-        self.item_features = {field: np.asarray(values, dtype=np.int32) for field, values in self.item_features.items()}
-        if self.fused_candidates_by_user is not None:
-            self.fused_candidates_by_user = {
-                int(user_id): np.asarray(candidate_ids, dtype=np.int32)
-                for user_id, candidate_ids in self.fused_candidates_by_user.items()
-            }
-
-    def __call__(self, samples: list[dict]) -> dict[str, torch.Tensor]:
-        batch = _init_batch_arrays(
-            batch_size=len(samples),
-            context_width=len(np.asarray(samples[0]["context_movie_id"]).reshape(-1)),
-            candidate_size=self.num_negatives + 1,
-        )
-        for row_idx, sample in enumerate(samples):
-            _fill_base_fields(batch, sample, row_idx=row_idx)
-            positive_movie_id = int(sample["target_movie_id"])
-            rng = np.random.default_rng(self.seed + int(sample.get("user_id_original", sample["user_id"])) + positive_movie_id * 1009)
-            negatives = sample_negative_ids_with_candidates(
-                self.all_item_ids,
-                get_seen_movie_ids(sample),
-                positive_movie_id,
-                self.num_negatives,
-                rng,
-                candidate_pool=_resolve_candidate_pool(sample, self.fused_candidates_by_user),
-            )
-            candidate_ids = np.concatenate([[positive_movie_id], negatives], axis=0)
-            _fill_candidate_slot(batch, row_idx=row_idx, candidate_ids=candidate_ids, item_features=self.item_features)
-        return _numpy_batch_to_torch(batch)
-
-
-def _init_batch_arrays(batch_size: int, context_width: int, candidate_size: int) -> dict[str, np.ndarray]:
+def _init_batch_arrays(batch_size: int, context_width: int, candidate_size: int, genre_count: int) -> dict[str, np.ndarray]:
     batch = {field: np.zeros(batch_size, dtype=np.int32) for field in STATIC_USER_FIELDS}
     batch["user_id_original"] = np.zeros(batch_size, dtype=np.int32)
     for field in CONTEXT_FIELDS:
@@ -212,11 +164,19 @@ def _init_batch_arrays(batch_size: int, context_width: int, candidate_size: int)
             batch[field] = np.zeros((batch_size, context_width), dtype=np.float32)
         else:
             batch[field] = np.zeros((batch_size, context_width), dtype=np.int32)
+    batch["context_genres"] = np.zeros((batch_size, context_width, genre_count), dtype=np.int32)
+    for field in ITEM_FEATURE_FIELDS:
+        if field != "genres":
+            batch[f"context_{field}"] = np.zeros((batch_size, context_width), dtype=np.int32)
     batch["target_index"] = np.zeros(batch_size, dtype=np.int64)
     batch["target_rating"] = np.zeros(batch_size, dtype=np.float32)
     batch["candidate_mask"] = np.zeros((batch_size, candidate_size), dtype=bool)
     for field in CANDIDATE_FIELDS:
-        batch[field] = np.zeros((batch_size, candidate_size), dtype=np.int32)
+        if field == "candidate_genres":
+            batch[field] = np.zeros((batch_size, candidate_size, genre_count), dtype=np.int32)
+        else:
+            batch[field] = np.zeros((batch_size, candidate_size), dtype=np.int32)
+    batch["candidate_relevance"] = np.zeros((batch_size, candidate_size), dtype=np.float32)
     return batch
 
 
@@ -225,25 +185,41 @@ def _fill_base_fields(batch: dict[str, np.ndarray], sample: dict, row_idx: int) 
         batch[field][row_idx] = int(sample[field])
     batch["user_id_original"][row_idx] = int(sample.get("user_id_original", sample["user_id"]))
     batch["context_movie_id"][row_idx] = np.asarray(sample["context_movie_id"], dtype=np.int32)
-    batch["context_genres"][row_idx] = np.asarray(sample["context_genres"], dtype=np.int32)
     batch["context_rating"][row_idx] = np.asarray(sample.get("context_rating", np.zeros_like(sample["context_movie_id"], dtype=np.float32)), dtype=np.float32)
     batch["context_low_rating_mask"][row_idx] = np.asarray(sample.get("context_low_rating_mask", np.zeros_like(sample["context_movie_id"], dtype=np.float32)), dtype=np.float32)
     batch["context_length"][row_idx] = int(sample["context_length"])
     batch["target_rating"][row_idx] = float(sample.get("target_rating", 0.0))
 
 
-def _fill_candidate_slot(
+def _fill_context_slots(batch: dict[str, np.ndarray], item_features: dict[str, np.ndarray], row_idx: int) -> None:
+    context_ids = batch["context_movie_id"][row_idx]
+    valid_mask = (context_ids > 0) & (context_ids < item_features["genres"].shape[0])
+    safe_context_ids = np.where(valid_mask, context_ids, 0).astype(np.int32, copy=False)
+    batch["context_genres"][row_idx] = item_features["genres"][safe_context_ids]
+    batch["context_isAdult"][row_idx] = item_features["isAdult"][safe_context_ids]
+    batch["context_startYear"][row_idx] = item_features["startYear"][safe_context_ids]
+    batch["context_popularity"][row_idx] = item_features["popularity"][safe_context_ids]
+
+
+def _fill_candidate_slots(
     batch: dict[str, np.ndarray],
-    row_idx: int,
     candidate_ids: np.ndarray,
     item_features: dict[str, np.ndarray],
 ) -> None:
-    batch["target_index"][row_idx] = 0
-    batch["candidate_mask"][row_idx, : candidate_ids.shape[0]] = True
-    batch["candidate_movie_id"][row_idx, : candidate_ids.shape[0]] = candidate_ids
-    batch["candidate_genres"][row_idx, : candidate_ids.shape[0]] = item_features["genres"][candidate_ids]
-    batch["candidate_isAdult"][row_idx, : candidate_ids.shape[0]] = item_features["isAdult"][candidate_ids]
-    batch["candidate_startYear"][row_idx, : candidate_ids.shape[0]] = item_features["startYear"][candidate_ids]
+    candidate_ids = np.asarray(candidate_ids, dtype=np.int32)
+    candidate_size = min(candidate_ids.shape[1], batch["candidate_movie_id"].shape[1])
+    candidate_ids = candidate_ids[:, :candidate_size]
+    valid_mask = (candidate_ids > 0) & (candidate_ids < item_features["genres"].shape[0])
+    safe_candidate_ids = np.where(valid_mask, candidate_ids, 0).astype(np.int32, copy=False)
+    batch["target_index"][: candidate_ids.shape[0]] = 0
+    batch["candidate_mask"][:, :candidate_size] = valid_mask
+    batch["candidate_movie_id"][:, :candidate_size] = safe_candidate_ids
+    batch["candidate_genres"][:, :candidate_size] = item_features["genres"][safe_candidate_ids]
+    batch["candidate_isAdult"][:, :candidate_size] = item_features["isAdult"][safe_candidate_ids]
+    batch["candidate_startYear"][:, :candidate_size] = item_features["startYear"][safe_candidate_ids]
+    batch["candidate_popularity"][:, :candidate_size] = item_features["popularity"][safe_candidate_ids]
+    batch["candidate_relevance"][:, :candidate_size] = 0.0
+    batch["candidate_relevance"][:, 0] = batch["target_rating"]
 
 
 def _numpy_batch_to_torch(batch: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
@@ -255,7 +231,7 @@ def _numpy_batch_to_torch(batch: dict[str, np.ndarray]) -> dict[str, torch.Tenso
             result[field] = torch.as_tensor(values, dtype=torch.bool)
         elif field == "target_index":
             result[field] = torch.as_tensor(values, dtype=torch.long)
-        elif field in {"context_rating", "target_rating"}:
+        elif field in {"context_rating", "context_low_rating_mask", "target_rating", "candidate_relevance"}:
             result[field] = torch.as_tensor(values, dtype=torch.float32)
         else:
             result[field] = torch.as_tensor(values, dtype=torch.long)

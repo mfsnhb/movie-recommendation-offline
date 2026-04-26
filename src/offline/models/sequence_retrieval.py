@@ -1,40 +1,61 @@
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
 
+from offline.models.feature_encoders import MovieFeatureEncoder
 
-class SASRecBlock(nn.Module):
-    def __init__(self, emb_dim: int, num_heads: int, ffn_dim: int, dropout: float, ffn_activation: str = "relu"):
-        super().__init__()
-        activation = nn.GELU() if str(ffn_activation).strip().lower() == "gelu" else nn.ReLU()
-        self.attn_norm = nn.LayerNorm(emb_dim)
-        self.attn = nn.MultiheadAttention(emb_dim, num_heads, dropout=dropout, batch_first=True)
-        self.ffn_norm = nn.LayerNorm(emb_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(emb_dim, ffn_dim),
-            activation,
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, emb_dim),
-            nn.Dropout(dropout),
-        )
 
-    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor, causal_mask: torch.Tensor) -> torch.Tensor:
-        residual = x
-        normed = self.attn_norm(x)
-        attn_output, _ = self.attn(
-            normed,
-            normed,
-            normed,
-            key_padding_mask=key_padding_mask,
-            attn_mask=causal_mask,
-            need_weights=False,
-        )
-        x = residual + attn_output
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
+def _left_align_by_mask(values: torch.Tensor, keep_mask: torch.Tensor) -> torch.Tensor:
+    width = values.size(1)
+    columns = torch.arange(width, device=values.device).unsqueeze(0).expand_as(values)
+    order_keys = torch.where(keep_mask, columns, columns + width)
+    order = order_keys.argsort(dim=1)
+    return _left_align_by_order(values, order, keep_mask.sum(dim=1))
+
+
+def _left_align_by_order(values: torch.Tensor, order: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    width = values.size(1)
+    columns = torch.arange(width, device=values.device).unsqueeze(0)
+    gather_order = order.view(*order.shape, *([1] * (values.ndim - 2))).expand_as(values)
+    gathered = values.gather(1, gather_order)
+    valid_shape = (values.size(0), width) + (1,) * (values.ndim - 2)
+    valid_positions = columns.lt(counts.unsqueeze(1)).view(valid_shape)
+    return torch.where(valid_positions, gathered, torch.zeros_like(values))
+
+
+def right_align_by_mask(values: torch.Tensor, keep_mask: torch.Tensor) -> torch.Tensor:
+    width = values.size(1)
+    compact = _left_align_by_mask(values, keep_mask)
+    counts = keep_mask.sum(dim=1)
+    gather_positions = torch.arange(width, device=values.device).unsqueeze(0) - (width - counts).unsqueeze(1)
+    valid_positions = gather_positions.ge(0) & gather_positions.lt(counts.unsqueeze(1))
+    gathered = compact.gather(1, gather_positions.clamp_min(0))
+    return torch.where(valid_positions, gathered, torch.zeros_like(values))
+
+
+def _right_align_sequence_states(states: torch.Tensor, compact_mask: torch.Tensor) -> torch.Tensor:
+    batch_size, width, hidden_dim = states.shape
+    counts = compact_mask.sum(dim=1)
+    source_positions = torch.arange(width, device=states.device).unsqueeze(0) - (width - counts).unsqueeze(1)
+    valid_positions = source_positions.ge(0) & source_positions.lt(counts.unsqueeze(1))
+    gathered = states.gather(1, source_positions.clamp_min(0).unsqueeze(-1).expand(batch_size, width, hidden_dim))
+    return torch.where(valid_positions.unsqueeze(-1), gathered, torch.zeros_like(states))
+
+
+def filter_sequence_history(
+    hist_movie_ids: torch.Tensor,
+    hist_recency_bucket: torch.Tensor | None = None,
+    hist_feedback: torch.Tensor | None = None,
+    history_feedback: str = "positive",
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if history_feedback != "positive" or hist_feedback is None:
+        return hist_movie_ids, hist_recency_bucket, hist_feedback
+    keep_mask = hist_movie_ids.gt(0) & hist_feedback.eq(3)
+    filtered_movie_ids = right_align_by_mask(hist_movie_ids, keep_mask)
+    filtered_recency = right_align_by_mask(hist_recency_bucket, keep_mask) if hist_recency_bucket is not None else None
+    filtered_feedback = right_align_by_mask(hist_feedback, keep_mask)
+    return filtered_movie_ids, filtered_recency, filtered_feedback
 
 
 class SequenceRetrievalModel(nn.Module):
@@ -42,64 +63,75 @@ class SequenceRetrievalModel(nn.Module):
         self,
         feature_dict: dict,
         emb_dim: int,
-        num_heads: int = 2,
-        num_layers: int = 2,
-        ffn_dim: int = 128,
+        hidden_dim: int | None = None,
+        num_layers: int = 1,
         max_len: int = 10,
         dropout: float = 0.1,
-        use_recency_embedding: bool = False,
-        use_feedback_embedding: bool = False,
-        use_final_norm: bool = True,
-        ffn_activation: str = "relu",
     ):
         super().__init__()
         self.max_len = max_len
-        self.emb_scale = math.sqrt(emb_dim)
-        self.use_recency_embedding = use_recency_embedding
-        self.use_feedback_embedding = use_feedback_embedding
-        self.movie_emb = nn.Embedding(feature_dict["movie_id"], emb_dim, padding_idx=0)
-        self.recency_emb = nn.Embedding(feature_dict["hist_recency_bucket"], emb_dim, padding_idx=0)
-        self.feedback_emb = nn.Embedding(4, emb_dim, padding_idx=0)
-        self.pos_emb = nn.Embedding(max_len, emb_dim)
+        self.hidden_dim = int(hidden_dim or emb_dim)
+        self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
         self.dropout = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
-            SASRecBlock(emb_dim, num_heads, ffn_dim, dropout, ffn_activation=ffn_activation) for _ in range(num_layers)
-        ])
-        self.final_norm = nn.LayerNorm(emb_dim) if use_final_norm else nn.Identity()
+        self.gru = nn.GRU(
+            input_size=emb_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            batch_first=True,
+        )
+        self.output = nn.Linear(self.hidden_dim, emb_dim) if self.hidden_dim != emb_dim else nn.Identity()
+        self.final_norm = nn.LayerNorm(emb_dim)
 
     def encode_sequence(
         self,
         hist_movie_ids: torch.Tensor,
         hist_recency_bucket: torch.Tensor | None = None,
         hist_feedback: torch.Tensor | None = None,
+        hist_item_features: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
+        del hist_recency_bucket, hist_feedback
+        if hist_item_features is None:
+            raise ValueError("hist_item_features is required for sequence encoding")
         hist_movie_ids = hist_movie_ids[:, -self.max_len :]
-        positions = torch.arange(hist_movie_ids.size(1), device=hist_movie_ids.device).unsqueeze(0).expand_as(hist_movie_ids)
-        key_padding_mask = hist_movie_ids.eq(0)
-
-        x = self.movie_emb(hist_movie_ids) * self.emb_scale + self.pos_emb(positions)
-        if self.use_recency_embedding and hist_recency_bucket is not None:
-            hist_recency_bucket = hist_recency_bucket[:, -self.max_len :]
-            x = x + self.recency_emb(hist_recency_bucket)
-        if self.use_feedback_embedding and hist_feedback is not None:
-            hist_feedback = hist_feedback[:, -self.max_len :]
-            x = x + self.feedback_emb(hist_feedback.clamp_min(0).clamp_max(3))
-        x = self.dropout(x)
-        x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-        causal_mask = torch.triu(
-            torch.ones(hist_movie_ids.size(1), hist_movie_ids.size(1), device=hist_movie_ids.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        for block in self.blocks:
-            x = block(x, key_padding_mask=key_padding_mask, causal_mask=causal_mask)
-            x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-        x = self.final_norm(x)
-        x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-        visible_mask = ~key_padding_mask
+        hist_item_features = {field: value[:, -self.max_len :] for field, value in hist_item_features.items()}
+        visible_mask = hist_movie_ids.gt(0)
+        width = hist_movie_ids.size(1)
+        columns = torch.arange(width, device=hist_movie_ids.device).unsqueeze(0).expand_as(hist_movie_ids)
+        order_keys = torch.where(visible_mask, columns, columns + width)
+        order = order_keys.argsort(dim=1)
+        counts = visible_mask.sum(dim=1)
+        compact_movie_ids = _left_align_by_order(hist_movie_ids, order, counts)
+        compact_features = {
+            "movie_id": compact_movie_ids,
+            "genres": _left_align_by_order(hist_item_features["genres"], order, counts),
+            "isAdult": _left_align_by_order(hist_item_features["isAdult"], order, counts),
+            "startYear": _left_align_by_order(hist_item_features["startYear"], order, counts),
+            "popularity": _left_align_by_order(hist_item_features["popularity"], order, counts),
+        }
+        compact_mask = compact_movie_ids.gt(0)
+        lengths = compact_mask.sum(dim=1).cpu()
+        x = self.dropout(self.movie_encoder(compact_features))
+        compact_states = torch.zeros(hist_movie_ids.size(0), hist_movie_ids.size(1), self.hidden_dim, device=hist_movie_ids.device, dtype=x.dtype)
+        non_empty = lengths.gt(0)
+        if non_empty.any():
+            non_empty_indices = non_empty.to(device=hist_movie_ids.device)
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x[non_empty_indices],
+                lengths[non_empty],
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            packed_output, _ = self.gru(packed)
+            unpacked, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True, total_length=hist_movie_ids.size(1))
+            compact_states[non_empty_indices] = unpacked
+        hidden_states = _right_align_sequence_states(compact_states, compact_mask)
+        hidden_states = self.final_norm(self.output(hidden_states))
+        hidden_states = hidden_states.masked_fill(~visible_mask.unsqueeze(-1), 0.0)
         return {
-            "hidden_states": x,
+            "hidden_states": hidden_states,
             "visible_mask": visible_mask,
-            "padding_mask": key_padding_mask,
+            "padding_mask": ~visible_mask,
         }
 
     def encode_user(
@@ -107,34 +139,20 @@ class SequenceRetrievalModel(nn.Module):
         hist_movie_ids: torch.Tensor,
         hist_recency_bucket: torch.Tensor | None = None,
         hist_feedback: torch.Tensor | None = None,
+        hist_item_features: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        sequence_outputs = self.encode_sequence(hist_movie_ids, hist_recency_bucket, hist_feedback)
+        sequence_outputs = self.encode_sequence(hist_movie_ids, hist_recency_bucket, hist_feedback, hist_item_features)
         hidden_states = sequence_outputs["hidden_states"]
         visible_mask = sequence_outputs["visible_mask"]
-        valid_lengths = visible_mask.sum(dim=1) - 1
-        valid_lengths = valid_lengths.clamp_min(0)
-        user_repr = hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), valid_lengths]
-        empty_history = visible_mask.sum(dim=1).eq(0)
+        visible_counts = visible_mask.sum(dim=1)
+        last_indices = visible_mask.size(1) - 1 - torch.flip(visible_mask, dims=[1]).long().argmax(dim=1)
+        last_indices = torch.where(visible_counts.gt(0), last_indices, torch.zeros_like(last_indices))
+        user_repr = hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), last_indices]
+        empty_history = visible_counts.eq(0)
         if empty_history.any():
             user_repr = user_repr.clone()
             user_repr[empty_history] = 0.0
         return user_repr
 
     def encode_item(self, item_batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        return self.movie_emb(item_batch["movie_id"])
-
-    def next_item_logits(self, user_repr: torch.Tensor) -> torch.Tensor:
-        logits = user_repr @ self.movie_emb.weight.T
-        logits[:, 0] = torch.finfo(logits.dtype).min
-        return logits
-
-    def forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        user_repr = self.encode_user(
-            batch["hist_movie_id"],
-            batch.get("hist_recency_bucket"),
-            batch.get("hist_feedback"),
-        )
-        item_repr = self.encode_item(batch["item"])
-        logits = user_repr @ item_repr.T
-        labels = torch.arange(logits.size(0), device=logits.device)
-        return logits, labels
+        return self.movie_encoder(item_batch)

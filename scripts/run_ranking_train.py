@@ -11,7 +11,7 @@ from offline.training.ranking import run_ranking_training
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["deepfm", "din", "xgboost", "xgboost_ranker"], default=None)
+    parser.add_argument("--model", choices=["deepfm", "din"], default=None)
     parser.add_argument("--models", default=None)
     parser.add_argument("--no-warm-start", action="store_true")
     parser.add_argument("--no-evaluate", action="store_true")

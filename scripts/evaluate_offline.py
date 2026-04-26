@@ -17,7 +17,7 @@ from offline.utils.io import (
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ranking-models", default="deepfm,din,xgboost,xgboost_ranker")
+    parser.add_argument("--ranking-models", default="deepfm,din")
     args = parser.parse_args()
 
     for path in (RETRIEVAL_METRICS_PATH, MULTI_RECALL_METRICS_PATH):

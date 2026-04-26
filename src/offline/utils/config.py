@@ -6,7 +6,7 @@ import yaml
 
 
 RETRIEVAL_ROUTE_NAMES = ("two_tower", "sequence", "item2item", "item_cf", "genre", "popular")
-RANKING_MODEL_NAMES = ("deepfm", "din", "xgboost", "xgboost_ranker")
+RANKING_MODEL_NAMES = ("deepfm", "din")
 
 
 def load_yaml_config(path: Path) -> dict:
@@ -137,25 +137,16 @@ def resolve_ranking_config(settings: dict, requested_model_name: str | None = No
             "model_settings": dict(model_entry.get("architecture", {})),
             "training_settings": _merge_dict(common_training, model_entry.get("training", {})),
             "evaluation_settings": _merge_dict(common_evaluation, model_entry.get("evaluation", {})),
-            "xgboost_params": dict(model_entry.get("params", {})),
         }
 
     legacy_model_settings = settings.get("model", {})
     legacy_model_name = (requested_model_name or legacy_model_settings.get("name", "deepfm")).strip().lower()
-    legacy_xgboost_settings = settings.get("xgboost", {})
-    xgboost_params = {}
-    if legacy_model_name in {"xgboost", "xgboost_ranker"}:
-        xgboost_params = dict(
-            (legacy_xgboost_settings.get("ranker") if legacy_model_name == "xgboost_ranker" else legacy_xgboost_settings.get("pointwise"))
-            or {}
-        )
     return {
         "model_name": legacy_model_name,
-        "framework": "xgboost" if legacy_model_name in {"xgboost", "xgboost_ranker"} else "torch",
+        "framework": "torch",
         "model_settings": dict(legacy_model_settings),
         "training_settings": dict(settings.get("training", {})),
         "evaluation_settings": dict(settings.get("evaluation", {})),
-        "xgboost_params": xgboost_params,
     }
 
 
@@ -215,9 +206,8 @@ def resolve_retrieval_config(settings: dict) -> dict:
         },
         "sequence_settings": {
             "embedding_dim": legacy_model_settings.get("embedding_dim", 32),
-            "num_heads": legacy_model_settings.get("sequence_num_heads", 2),
-            "num_layers": legacy_model_settings.get("sequence_num_layers", 2),
-            "ffn_dim": legacy_model_settings.get("sequence_ffn_dim", 128),
+            "hidden_dim": legacy_model_settings.get("sequence_hidden_dim", legacy_model_settings.get("embedding_dim", 32)),
+            "num_layers": legacy_model_settings.get("sequence_num_layers", 1),
             "max_len": legacy_model_settings.get("sequence_max_len", 10),
             "dropout": legacy_model_settings.get("sequence_dropout", 0.1),
         },
