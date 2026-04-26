@@ -19,6 +19,7 @@ env/
 
 # Raw data and generated artifacts
 /data/
+/data/raw/
 /outputs/
 
 # Model and metric artifacts
