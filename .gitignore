@@ -1,0 +1,43 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Raw data and generated artifacts
+data/
+outputs/
+
+# Model and metric artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.pkl
+*.pickle
+*.joblib
+*.jsonl
+
+# Logs and runtime files
+*.log
+logs/
+nohup.out
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/

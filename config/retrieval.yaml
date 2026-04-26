@@ -1,0 +1,73 @@
+common:
+  training:
+    batch_size: 512
+    epochs: 10
+    learning_rate: 0.0005
+    weight_decay: 1.0e-5
+    log_every_n_batches: 100
+    early_stopping_patience: 2
+    min_delta: 1.0e-4
+    negative_sampling: mixed
+    hard_negative_queue_size: 4096
+    hard_negative_topk: 32
+    two_tower_num_sampled_negatives: 64
+    export_batch_size: 4096
+    two_tower_temperature: 0.05
+    rating_weighting_enabled: false
+    rating_weight_neutral: 3.0
+    rating_weight_scale: 0.25
+    rating_weight_min: 0.0
+    rating_weight_max: 1.0
+    positive_rating_min: 4.0
+    negative_rating_max: 2.0
+    neutral_rating: 3.0
+  evaluation:
+    topk: 200
+  multi_recall:
+    enabled: true
+    fusion_mode: item_cf_first
+    item_cf_min_quota_ratio: 0.6
+    routes:
+      - two_tower
+      - sequence
+      - item_cf
+      - genre
+
+models:
+  two_tower:
+    architecture:
+      embedding_dim: 32
+      user_hidden_dims: [256, 128]
+      item_hidden_dims: [256, 128]
+      short_history_length: 10
+      dropout: 0.1
+
+  sequence:
+    architecture:
+      embedding_dim: 32
+      num_heads: 4
+      num_layers: 4
+      ffn_dim: 128
+      max_len: 150
+      dropout: 0.1
+      use_recency_embedding: false
+      use_feedback_embedding: false
+      use_final_norm: true
+      ffn_activation: relu
+    training:
+      sequence_num_negatives: 32
+      sequence_user_negative_ratio: 0.75
+
+  item2item:
+    enabled: false
+    architecture:
+      embedding_dim: 32
+      window_size: 10
+      negative_samples: 5
+    training:
+      epochs: 3
+      learning_rate: 0.025
+      batch_size: 2048
+      negative_sampling: hard
+      hard_negative_queue_size: 4096
+      hard_negative_topk: 16

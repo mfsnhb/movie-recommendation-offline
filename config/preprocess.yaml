@@ -1,0 +1,11 @@
+retrieval:
+  max_seq_len: 150
+  positive_rating_min: 4.0
+  negative_rating_max: 2.0
+  neutral_rating: 3.0
+  sequence_negative_pool_size: 150
+
+ranking:
+  max_seq_len: 100
+  positive_rating_min: 4.0
+  negative_rating_max: 2.0
