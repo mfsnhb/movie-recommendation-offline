@@ -35,8 +35,6 @@ outputs/
 - `protocol.py`：排序样本协议、item feature helper、通用字段定义
 - `preprocess.py`：构造前缀展开的正样本训练集与最终评测样本
 - `dataset.py`：在线负采样、train/val/test collator、inference batch 协议
-- `xgboost_features.py`：把同一份排序协议在线展开成 XGBoost 所需 tabular frame
-- `wrapper.py`：把 pointwise scorer 包装成 candidate ranker
 
 `src/offline/features/ranking.py`、`src/offline/data/ranking_sequence.py`、`src/offline/models/sequence_ranker.py` 现在只保留兼容导出，方便旧入口不报错。
 
