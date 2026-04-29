@@ -4,7 +4,6 @@ import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, Subset
 
@@ -48,27 +47,6 @@ POINTWISE_RANKING_FIELDS = STATIC_USER_FIELDS + POINTWISE_ITEM_FIELDS
 _TORCH_RANKING_MODELS = {"deepfm", "din"}
 _RANKING_INFERENCE_BATCH_SIZE = 64
 _DEFAULT_MAX_VALIDATION_USERS = 6040
-
-
-
-def _resolve_rating_weighting_settings(training_settings: dict | None) -> dict[str, float | bool]:
-    source = dict(training_settings or {})
-    return {
-        "enabled": bool(source.get("rating_weighting_enabled", False)),
-        "neutral": float(source.get("rating_weight_neutral", 3.0)),
-        "scale": float(source.get("rating_weight_scale", 0.25)),
-        "min": float(source.get("rating_weight_min", 0.5)),
-        "max": float(source.get("rating_weight_max", 1.5)),
-    }
-
-
-
-def _target_rating_weights(target_ratings: torch.Tensor, training_settings: dict | None) -> torch.Tensor:
-    config = _resolve_rating_weighting_settings(training_settings)
-    if not bool(config["enabled"]):
-        return torch.ones_like(target_ratings, dtype=torch.float32)
-    weights = 1.0 + float(config["scale"]) * (target_ratings.float() - float(config["neutral"]))
-    return weights.clamp(min=float(config["min"]), max=float(config["max"])).to(dtype=torch.float32)
 
 
 
@@ -262,8 +240,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             batch = batch_to_device(batch, device)
             optimizer.zero_grad()
             logits = model(batch)
-            sample_weight = _target_rating_weights(batch["target_rating"], training_settings)
-            loss = _listwise_candidate_loss(logits, batch["candidate_relevance"], batch["candidate_mask"], sample_weight)
+            loss = _listwise_candidate_loss(logits, batch["candidate_relevance"], batch["candidate_mask"])
             loss.backward()
             optimizer.step()
 
@@ -455,7 +432,6 @@ def _listwise_candidate_loss(
     logits: torch.Tensor,
     relevance: torch.Tensor,
     candidate_mask: torch.Tensor,
-    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     mask = candidate_mask.bool()
     masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
@@ -464,14 +440,11 @@ def _listwise_candidate_loss(
     valid_rows = mask.any(dim=1) & gain_sums.squeeze(1).gt(0)
     if not valid_rows.any():
         return torch.zeros((), dtype=logits.dtype, device=logits.device)
+
     target_dist = gains[valid_rows] / gain_sums[valid_rows].clamp_min(1e-9)
-    pred_log_probs = F.log_softmax(masked_logits[valid_rows], dim=1)
-    losses = -(target_dist * pred_log_probs).sum(dim=1)
-    if sample_weight is None:
-        return losses.mean()
-    weights = sample_weight[valid_rows].float()
-    weights = weights / weights.mean().clamp_min(1e-9)
-    return (losses * weights).mean()
+    pred_log_probs = torch.log_softmax(masked_logits[valid_rows], dim=1)
+    row_losses = -(target_dist * pred_log_probs).sum(dim=1)
+    return row_losses.mean()
 
 
 
