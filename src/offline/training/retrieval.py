@@ -188,8 +188,6 @@ def train_two_tower(context=None, warm_start: bool = True):
         rating_weight_scale=float(training_settings.get("rating_weight_scale", 0.25)),
         rating_weight_min=float(training_settings.get("rating_weight_min", 0.0)),
         rating_weight_max=float(training_settings.get("rating_weight_max", 1.0)),
-        short_history_length=int(two_tower_settings.get("short_history_length", 10)),
-        positive_rating_min=float(training_settings.get("positive_rating_min", 4.0)),
         multimodal_table=item_feature_arrays["multimodal_embedding"],
     ).to(device)
 
@@ -393,7 +391,7 @@ def train_sequence(context=None, warm_start: bool = True):
     sequence_settings = resolved_config["sequence_settings"]
     training_settings = resolved_config.get("sequence_training_settings", resolved_config["training_settings"])
 
-    train_data = context["sequence_train_data"]
+    train_data = context["train_data"]
     test_data = context["test_data"]
     feature_dict = context["feature_dict"]
     vocab_dict = context["vocab_dict"]
@@ -748,8 +746,6 @@ def evaluate_retrieval(route: str = "two_tower", topk: int | None = None):
             rating_weight_scale=float(training_settings.get("rating_weight_scale", 0.25)),
             rating_weight_min=float(training_settings.get("rating_weight_min", 0.0)),
             rating_weight_max=float(training_settings.get("rating_weight_max", 1.0)),
-            short_history_length=int(model_settings.get("short_history_length", 10)),
-            positive_rating_min=float(training_settings.get("positive_rating_min", 4.0)),
             multimodal_table=item_feature_arrays["multimodal_embedding"],
         ).to(device)
     else:
@@ -928,22 +924,26 @@ def _compute_sequence_loss(
         hist_movie_ids = batch_dict["hist_movie_id"][valid_mask]
         context_movie_ids = hist_movie_ids
         hist_recency_bucket = batch_dict.get("hist_recency_bucket")
-        hist_feedback = batch_dict.get("hist_feedback")
+        hist_rating = batch_dict.get("hist_rating")
         user_negative_ids = batch_dict["user_negative_movie_id"][valid_mask]
         if hist_recency_bucket is not None:
             hist_recency_bucket = hist_recency_bucket[valid_mask]
+        if hist_rating is not None:
+            hist_rating = hist_rating[valid_mask]
         if hist_feedback is not None:
             hist_feedback = hist_feedback[valid_mask]
     else:
         hist_movie_ids = batch_dict["hist_movie_id"]
         context_movie_ids = hist_movie_ids
         hist_recency_bucket = batch_dict.get("hist_recency_bucket")
+        hist_rating = batch_dict.get("hist_rating")
         hist_feedback = batch_dict.get("hist_feedback")
         user_negative_ids = batch_dict["user_negative_movie_id"]
 
-    hist_movie_ids, hist_recency_bucket, hist_feedback = filter_sequence_history(
+    hist_movie_ids, hist_recency_bucket, hist_rating, hist_feedback = filter_sequence_history(
         hist_movie_ids,
         hist_recency_bucket,
+        hist_rating,
         hist_feedback,
         history_feedback,
     )
@@ -951,6 +951,7 @@ def _compute_sequence_loss(
     hidden_states = sequence_model.encode_user(
         hist_movie_ids,
         hist_recency_bucket,
+        hist_rating,
         hist_feedback,
         {field: value for field, value in hist_item_features.items() if field != "movie_id"},
     )
@@ -1096,9 +1097,10 @@ def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, de
             }
             if route == "sequence":
                 batch["hist_feedback"] = torch.tensor(np.asarray(test_data["hist_feedback"][idx]).reshape(1, -1), dtype=torch.long, device=device)
-                hist_movie_ids, hist_recency_bucket, hist_feedback = filter_sequence_history(
+                hist_movie_ids, hist_recency_bucket, hist_rating, hist_feedback = filter_sequence_history(
                     batch["hist_movie_id"],
                     batch["hist_recency_bucket"],
+                    batch["hist_rating"],
                     batch["hist_feedback"],
                     sequence_history_feedback,
                 )
@@ -1106,6 +1108,7 @@ def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, de
                 user_embedding = model.encode_user(
                     hist_movie_ids,
                     hist_recency_bucket,
+                    hist_rating,
                     hist_feedback,
                     {field: value for field, value in hist_item_features.items() if field != "movie_id"},
                 ).cpu().numpy()[0]

@@ -5,9 +5,9 @@ import time
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
-from offline.evaluate.metrics import ranking_metrics, save_metrics
+from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, ranking_metrics, save_metrics
 from offline.evaluate.multi_recall import evaluate_final_candidates
 from offline.models.deepfm import DeepFMModel
 from offline.models.din import DINModel
@@ -46,7 +46,18 @@ logger = get_logger("offline.training.ranking")
 POINTWISE_RANKING_FIELDS = STATIC_USER_FIELDS + POINTWISE_ITEM_FIELDS
 _TORCH_RANKING_MODELS = {"deepfm", "din"}
 _RANKING_INFERENCE_BATCH_SIZE = 64
+_FULL_CATALOG_CANDIDATE_CHUNK_SIZE = 256
 _DEFAULT_MAX_VALIDATION_USERS = 6040
+
+
+
+def _resolve_torch_device(training_settings: dict | None = None) -> torch.device:
+    device_setting = str((training_settings or {}).get("device", "auto")).strip().lower()
+    if device_setting == "cpu":
+        return torch.device("cpu")
+    if device_setting.startswith("cuda"):
+        return torch.device(device_setting if torch.cuda.is_available() else "cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 
@@ -107,7 +118,7 @@ def evaluate_ranking_model(model_name: str) -> dict:
     model_settings = resolved_config["model_settings"]
     emb_dim = int(model_settings.get("embedding_dim", 16))
     final_topk = int(resolved_config["evaluation_settings"].get("final_topk", 20))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_torch_device(resolved_config.get("training_settings", {}))
     checkpoint = torch.load(get_ranking_model_path(normalized_model_name), map_location=device)
     model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim, item_features).to(device)
     model.load_state_dict(checkpoint["state_dict"])
@@ -141,7 +152,7 @@ def evaluate_final_ranking(model_name: str) -> dict:
     feature_dict = load_pickle(RANKING_FEATURE_DICT_PATH)
     model_settings = resolved_config["model_settings"]
     emb_dim = int(model_settings.get("embedding_dim", 16))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_torch_device(resolved_config.get("training_settings", {}))
     checkpoint = torch.load(get_ranking_model_path(normalized_model_name), map_location=device)
     model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim, item_features).to(device)
     model.load_state_dict(checkpoint["state_dict"])
@@ -166,16 +177,10 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     all_item_ids = get_all_item_ids(item_catalog)
 
     train_dataset = SequenceRankingDataset(ranking_samples["train"])
+    validation_data = ranking_samples.get("validation")
+    if validation_data is None:
+        raise ValueError("Ranking samples must contain an explicit validation split")
     fused_candidates_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
-    validation_samples_per_user = int(training_settings.get("validation_samples_per_user", 2))
-    validation_max_users = int(training_settings.get("validation_max_users", _DEFAULT_MAX_VALIDATION_USERS))
-    train_indices, val_indices = _split_latest_user_validation_indices(
-        ranking_samples["train"],
-        fused_candidates_by_user,
-        samples_per_user=validation_samples_per_user,
-        max_users=validation_max_users,
-    )
-    train_subset = Subset(train_dataset, train_indices) if val_indices else train_dataset
 
     batch_size = int(training_settings.get("batch_size", 256))
     epochs = int(training_settings.get("epochs", 3))
@@ -186,11 +191,10 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     min_delta = float(training_settings.get("min_delta", 1e-4))
     emb_dim = int(model_settings.get("embedding_dim", 16))
     train_negatives = int(training_settings.get("train_negatives", 7))
-    low_rating_negatives = int(training_settings.get("low_rating_negatives", 0))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_torch_device(resolved_config.get("training_settings", {}))
     train_loader = DataLoader(
-        train_subset,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         pin_memory=False,
@@ -198,7 +202,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             item_features=item_features,
             all_item_ids=all_item_ids,
             num_negatives=train_negatives,
-            low_rating_negatives=low_rating_negatives,
+            low_rating_negatives=int(training_settings.get("low_rating_negatives", 0)),
             seed=42,
         ),
     )
@@ -213,18 +217,18 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     logger.info(
-        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | val_samples=%s | val_users=%s | batch_size=%s | epochs=%s | train_negatives=%s | low_rating_negatives=%s | fused_validation=%s | warm_start=%s",
+        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | validation_samples=%s | validation_users=%s | batch_size=%s | epochs=%s | train_negatives=%s | low_rating_negatives=%s | validation_negatives=%s | warm_start=%s",
         model_name,
         ranking_samples.get("protocol", "unknown"),
         device,
-        len(train_indices),
-        len(val_indices),
-        len({int(ranking_samples["train"]["user_id"][idx]) for idx in val_indices}),
+        len(ranking_samples["train"]["user_id"]),
+        len(validation_data["user_id"]),
+        len(np.unique(np.asarray(validation_data["user_id"], dtype=np.int32))),
         batch_size,
         epochs,
         train_negatives,
-        low_rating_negatives,
-        bool(fused_candidates_by_user),
+        int(training_settings.get("low_rating_negatives", 0)),
+        int(training_settings.get("validation_negatives", 1000)),
         warm_start,
     )
 
@@ -273,19 +277,18 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
                 )
 
         train_loss = total_loss / max(seen_groups, 1)
-        val_metrics = None
-        if val_indices and fused_candidates_by_user:
-            val_metrics = _evaluate_fused_candidates_subset(
-                model,
-                ranking_samples["train"],
-                val_indices,
-                item_features,
-                all_item_ids,
-                device,
-                final_topk=int(evaluation_settings.get("final_topk", 20)),
-                fused_candidates_by_user=fused_candidates_by_user,
-            )
-        val_ndcg20 = float(val_metrics.get("ndcg@20", float("-inf"))) if val_metrics is not None else float("-inf")
+        val_metrics = _evaluate_hard_negative_validation(
+            model,
+            validation_data,
+            item_features,
+            all_item_ids,
+            device,
+            final_topk=int(evaluation_settings.get("final_topk", 20)),
+            negative_count=int(training_settings.get("validation_negatives", 1000)),
+            max_users=int(training_settings.get("validation_max_users", _DEFAULT_MAX_VALIDATION_USERS)),
+            fused_candidates_by_user=fused_candidates_by_user,
+        )
+        val_ndcg20 = float(val_metrics.get("ndcg@20", float("-inf")))
 
         logger.info(
             "Ranking epoch %s/%s done | model=%s | train_loss=%.4f | val_ndcg@20=%s | epoch_time=%s | elapsed=%s",
@@ -297,11 +300,6 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             format_eta(time.perf_counter() - epoch_start),
             format_eta(time.perf_counter() - training_start),
         )
-
-        if val_metrics is None:
-            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-            logger.info("Ranking validation skipped | model=%s | reason=missing_fused_candidates_or_val_subset", model_name)
-            break
 
         if val_ndcg20 > best_val_ndcg + min_delta:
             best_val_ndcg = val_ndcg20
@@ -372,37 +370,6 @@ def _resolve_ranking_user_candidate_pool(ranking_samples: dict) -> dict[int, np.
 
 
 
-def _split_latest_user_validation_indices(
-    split_data: dict,
-    fused_candidates_by_user: dict[int, np.ndarray] | None,
-    samples_per_user: int,
-    max_users: int,
-) -> tuple[list[int], list[int]]:
-    total_rows = int(len(split_data["user_id"]))
-    if samples_per_user <= 0 or total_rows <= 0:
-        return list(range(total_rows)), []
-
-    user_ids = np.asarray(split_data["user_id"], dtype=np.int32)
-    val_indices_by_user: dict[int, list[int]] = {}
-    for sample_idx in range(total_rows - 1, -1, -1):
-        user_id = int(user_ids[sample_idx])
-        if user_id in val_indices_by_user:
-            if len(val_indices_by_user[user_id]) >= samples_per_user:
-                continue
-        elif max_users > 0 and len(val_indices_by_user) >= max_users:
-            continue
-        if fused_candidates_by_user is not None:
-            candidates = fused_candidates_by_user.get(user_id)
-            if candidates is None or int(np.asarray(candidates).size) == 0:
-                continue
-        val_indices_by_user.setdefault(user_id, []).append(sample_idx)
-
-    val_index_set = {sample_idx for indices in val_indices_by_user.values() for sample_idx in indices}
-    train_indices = [sample_idx for sample_idx in range(total_rows) if sample_idx not in val_index_set]
-    val_indices = sorted(val_index_set)
-    return train_indices, val_indices
-
-
 
 def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_dim: int, item_features: dict[str, np.ndarray]):
     multimodal_table = item_features["multimodal_embedding"]
@@ -453,6 +420,127 @@ def _listwise_candidate_loss(
     return row_losses.mean()
 
 
+
+def _evaluate_hard_negative_validation(
+    model,
+    split_data: dict,
+    item_features: dict[str, np.ndarray],
+    all_item_ids: np.ndarray,
+    device: torch.device,
+    final_topk: int,
+    negative_count: int,
+    max_users: int,
+    fused_candidates_by_user: dict[int, np.ndarray] | None = None,
+) -> dict:
+    sample_count = int(len(split_data["user_id"]))
+    if max_users > 0:
+        sample_count = min(sample_count, int(max_users))
+    sample_indices = list(range(sample_count))
+    rng = np.random.default_rng(20260429)
+    candidate_user_ids: list[int] = []
+    candidate_ids: list[list[int]] = []
+    candidate_scores: list[list[float]] = []
+    candidate_labels: list[list[float]] = []
+    flat_user_ids: list[int] = []
+    flat_scores: list[float] = []
+    flat_labels: list[float] = []
+    candidate_pool_size = max(int(negative_count), final_topk) + 1
+
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(sample_indices), _RANKING_INFERENCE_BATCH_SIZE):
+            batch_indices = sample_indices[start : start + _RANKING_INFERENCE_BATCH_SIZE]
+            samples = []
+            candidate_pools = []
+            for sample_idx in batch_indices:
+                sample = extract_split_sample(split_data, sample_idx)
+                target = int(sample["target_movie_id"])
+                user_id = int(sample["user_id"])
+                seen_ids = set(int(item_id) for item_id in np.asarray(sample.get("context_movie_id", []), dtype=np.int32).reshape(-1).tolist() if int(item_id) > 0)
+                seen_ids.discard(target)
+                selected: list[int] = [target] if target > 0 else []
+                blocked = set(seen_ids)
+                blocked.update(selected)
+
+                hard_pool = None if fused_candidates_by_user is None else fused_candidates_by_user.get(user_id)
+                if hard_pool is not None:
+                    hard_candidates = [
+                        int(item_id)
+                        for item_id in np.asarray(hard_pool, dtype=np.int32).reshape(-1).tolist()
+                        if int(item_id) > 0 and int(item_id) not in blocked
+                    ]
+                    if hard_candidates:
+                        unique_hard = np.asarray(list(dict.fromkeys(hard_candidates)), dtype=np.int32)
+                        take = min(int(unique_hard.size), max(candidate_pool_size - len(selected), 0))
+                        selected.extend(unique_hard[:take].astype(int).tolist())
+                        blocked.update(selected)
+
+                remaining = candidate_pool_size - len(selected)
+                if remaining > 0:
+                    random_pool = all_item_ids[~np.isin(all_item_ids, np.asarray(list(blocked), dtype=np.int32))]
+                    if random_pool.size > 0:
+                        take = min(remaining, int(random_pool.size))
+                        chosen = rng.choice(random_pool, size=take, replace=False) if take < random_pool.size else random_pool[:take]
+                        selected.extend(chosen.astype(int).tolist())
+
+                if len(selected) <= 1:
+                    continue
+                samples.append(sample)
+                candidate_pools.append(np.asarray(selected, dtype=np.int32))
+
+            if not samples:
+                continue
+
+            batch, valid_candidates_by_sample, valid_indices = build_inference_batch(samples, candidate_pools, item_features)
+            if batch is None:
+                continue
+
+            batch = batch_to_device(batch, device)
+            batch_scores = model(batch).cpu().numpy()
+            for row_idx, valid_candidates in enumerate(valid_candidates_by_sample):
+                sample = samples[valid_indices[row_idx]]
+                scores = batch_scores[row_idx, : len(valid_candidates)]
+                candidates_array = np.asarray(valid_candidates, dtype=np.int32)
+                target = int(sample["target_movie_id"])
+                labels = (candidates_array == target).astype(float)
+                user_id = int(sample["user_id"])
+                take = min(final_topk, int(scores.shape[0]))
+                if take <= 0:
+                    continue
+                if take < scores.shape[0]:
+                    top_positions = np.argpartition(scores, -take)[-take:]
+                    top_positions = top_positions[np.argsort(scores[top_positions])[::-1]]
+                else:
+                    top_positions = np.argsort(scores)[::-1]
+                flat_user_ids.extend([user_id] * int(scores.shape[0]))
+                flat_scores.extend(scores.astype(float).tolist())
+                flat_labels.extend(labels.tolist())
+                candidate_user_ids.append(user_id)
+                candidate_ids.append(candidates_array[top_positions].astype(int).tolist())
+                candidate_scores.append(scores[top_positions].astype(float).tolist())
+                candidate_labels.append(labels[top_positions].astype(float).tolist())
+
+    metrics = evaluate_final_candidates(
+        np.asarray(candidate_user_ids, dtype=np.int32),
+        candidate_ids,
+        candidate_scores,
+        candidate_labels,
+        all_item_ids=all_item_ids,
+        output_path=None,
+    )
+    if flat_labels:
+        labels = np.asarray(flat_labels, dtype=np.float32)
+        scores = np.asarray(flat_scores, dtype=np.float32)
+        user_ids = np.asarray(flat_user_ids, dtype=np.int32)
+        metrics.update(ranking_metrics(labels, scores, user_ids))
+        for k in (10, 20):
+            metrics[f"hr@{k}"] = hit_rate_at_k(labels, scores, user_ids, k)
+            metrics[f"ndcg@{k}"] = ndcg_at_k(labels, scores, user_ids, k)
+    metrics["evaluated_users"] = int(len(candidate_user_ids))
+    metrics["validation_max_users"] = int(max_users)
+    metrics["validation_negatives"] = int(negative_count)
+    metrics["candidate_source"] = "hard_negative_validation"
+    return metrics
 
 def _evaluate_fused_candidates_subset(
     model,

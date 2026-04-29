@@ -24,8 +24,7 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.retrieval")
-_PREPROCESS_VERSION = 14
-_SEQUENCE_TRAIN_SCHEMA = "prefix_expanded_v1"
+_PREPROCESS_VERSION = 17
 _RECENCY_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
 _RECENCY_BUCKET_BOUNDARIES_SECONDS = np.asarray(_RECENCY_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
 _RECENCY_BUCKET_COUNT = len(_RECENCY_BUCKET_BOUNDARIES_DAYS) + 2
@@ -144,23 +143,21 @@ def _user_negative_pool(movie_sequence, rating_sequence, max_pool_size: int, neg
 
 
 
-def _count_sequence_prefix_samples(grouped_users, positive_rating_min: float) -> int:
-    sample_count = 0
-    threshold = float(positive_rating_min)
-    for _, grouped_feats in grouped_users:
-        history_length = len(grouped_feats)
-        if history_length < 3:
-            continue
-        rating_sequence = grouped_feats["rating"].to_numpy(dtype=np.float32, copy=False)
-        positive_targets = rating_sequence[1:-1] >= threshold
-        sample_count += int(np.count_nonzero(positive_targets))
-    return sample_count
+def _positive_target_indices(rating_sequence: np.ndarray, positive_rating_min: float) -> list[int]:
+    return [idx for idx in range(1, len(rating_sequence)) if float(rating_sequence[idx]) >= float(positive_rating_min)]
 
 
 
-def _build_sequence_train_split(grouped_users, user_columns, max_hist_seq_len: int, padding_value: int, positive_rating_min: float, negative_rating_max: float, negative_pool_size: int) -> dict[str, np.ndarray]:
-    sample_count = _count_sequence_prefix_samples(grouped_users, positive_rating_min)
-    sequence_train = {
+def _split_positive_targets(rating_sequence: np.ndarray, positive_rating_min: float) -> tuple[list[int], int | None, int | None]:
+    target_indices = _positive_target_indices(rating_sequence, positive_rating_min)
+    if len(target_indices) < 2:
+        return [], None, None
+    return target_indices[:-2], target_indices[-2], target_indices[-1]
+
+
+
+def _empty_retrieval_samples(sample_count: int, max_hist_seq_len: int, negative_pool_size: int) -> dict[str, np.ndarray]:
+    return {
         "user_id": np.zeros(sample_count, dtype=np.int32),
         "gender": np.zeros(sample_count, dtype=np.int32),
         "age": np.zeros(sample_count, dtype=np.int32),
@@ -170,56 +167,10 @@ def _build_sequence_train_split(grouped_users, user_columns, max_hist_seq_len: i
         "hist_recency_bucket": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_rating": np.zeros((sample_count, max_hist_seq_len), dtype=np.float32),
         "hist_feedback": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
+        "user_negative_movie_id": np.zeros((sample_count, negative_pool_size), dtype=np.int32),
         "movie_id": np.zeros(sample_count, dtype=np.int32),
         "rating": np.zeros(sample_count, dtype=np.float32),
-        "user_negative_movie_id": np.zeros((sample_count, negative_pool_size), dtype=np.int32),
     }
-    row_idx = 0
-    threshold = float(positive_rating_min)
-    for user_id_value, grouped_feats in grouped_users:
-        history_length = len(grouped_feats)
-        if history_length < 3:
-            continue
-        user_features = {col: np.int32(grouped_feats[col].iloc[0]) for col in user_columns}
-        movie_sequence = grouped_feats["movie_id"].to_numpy(dtype=np.int32, copy=False)
-        rating_sequence = grouped_feats["rating"].to_numpy(dtype=np.float32, copy=False)
-        timestamp_sequence = grouped_feats["timestamp"].to_numpy(dtype=np.int64, copy=False)
-
-        for target_idx in range(1, history_length - 1):
-            target_rating = float(rating_sequence[target_idx])
-            if target_rating < threshold:
-                continue
-            prefix_movie_sequence = movie_sequence[:target_idx]
-            prefix_rating_sequence = rating_sequence[:target_idx]
-            prefix_timestamp_sequence = timestamp_sequence[:target_idx]
-
-            sequence_train["user_id"][row_idx] = np.int32(user_id_value)
-            for col in user_columns:
-                sequence_train[col][row_idx] = user_features[col]
-            sequence_train["hist_movie_id"][row_idx] = _pad_sequence(prefix_movie_sequence, max_hist_seq_len, padding_value)
-            sequence_train["hist_recency_bucket"][row_idx] = _recency_buckets(
-                prefix_timestamp_sequence,
-                timestamp_sequence[target_idx],
-                max_hist_seq_len,
-                padding_value,
-            )
-            sequence_train["hist_rating"][row_idx] = _pad_sequence(prefix_rating_sequence, max_hist_seq_len, 0.0)
-            sequence_train["hist_feedback"][row_idx] = _feedback_tokens(
-                prefix_rating_sequence,
-                max_hist_seq_len,
-                positive_rating_min,
-                negative_rating_max,
-            )
-            sequence_train["movie_id"][row_idx] = np.int32(movie_sequence[target_idx])
-            sequence_train["rating"][row_idx] = np.float32(target_rating)
-            sequence_train["user_negative_movie_id"][row_idx] = _user_negative_pool(
-                prefix_movie_sequence,
-                prefix_rating_sequence,
-                negative_pool_size,
-                negative_rating_max,
-            )
-            row_idx += 1
-    return sequence_train
 
 
 
@@ -228,60 +179,39 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
     data_df = data_df.sort_values(["user_id", "timestamp"], kind="stable")
     grouped_users = list(data_df.groupby("user_id", sort=False))
     train_sample_count = 0
+    validation_sample_count = 0
     test_sample_count = 0
     max_user_history = 0
-    threshold = float(positive_rating_min)
     for _, grouped_feats in grouped_users:
         history_length = len(grouped_feats)
         max_user_history = max(max_user_history, history_length)
         if history_length < 2:
             continue
         rating_sequence = grouped_feats["rating"].to_numpy(dtype=np.float32, copy=False)
-        positive_target_indices = [idx for idx in range(1, history_length) if float(rating_sequence[idx]) >= threshold]
-        if not positive_target_indices:
+        target_indices, validation_target_idx, test_target_idx = _split_positive_targets(rating_sequence, positive_rating_min)
+        if validation_target_idx is None or test_target_idx is None:
             continue
-        train_sample_count += max(len(positive_target_indices) - 1, 0)
+        train_sample_count += len(target_indices)
+        validation_sample_count += 1
         test_sample_count += 1
     negative_pool_size = int(sequence_negative_pool_size or max_hist_seq_len)
-    sequence_train_sample_count = _count_sequence_prefix_samples(grouped_users, positive_rating_min)
 
     logger.info(
-        "Retrieval sample allocation | grouped_users=%s | train_samples=%s | test_samples=%s | sequence_train_samples=%s | max_hist_seq_len=%s | negative_pool_size=%s",
+        "Retrieval sample allocation | users=%s | train=%s | validation=%s | test=%s | max_hist_seq_len=%s | negative_pool_size=%s",
         len(grouped_users),
         train_sample_count,
+        validation_sample_count,
         test_sample_count,
-        sequence_train_sample_count,
         max_hist_seq_len,
         negative_pool_size,
     )
 
-    train_data_dict = {
-        "user_id": np.zeros(train_sample_count, dtype=np.int32),
-        "gender": np.zeros(train_sample_count, dtype=np.int32),
-        "age": np.zeros(train_sample_count, dtype=np.int32),
-        "occupation": np.zeros(train_sample_count, dtype=np.int32),
-        "zip_code": np.zeros(train_sample_count, dtype=np.int32),
-        "hist_movie_id": np.zeros((train_sample_count, max_hist_seq_len), dtype=np.int32),
-        "hist_recency_bucket": np.zeros((train_sample_count, max_hist_seq_len), dtype=np.int32),
-        "hist_rating": np.zeros((train_sample_count, max_hist_seq_len), dtype=np.float32),
-        "movie_id": np.zeros(train_sample_count, dtype=np.int32),
-        "rating": np.zeros(train_sample_count, dtype=np.float32),
-    }
-    test_data_dict = {
-        "user_id": np.zeros(test_sample_count, dtype=np.int32),
-        "gender": np.zeros(test_sample_count, dtype=np.int32),
-        "age": np.zeros(test_sample_count, dtype=np.int32),
-        "occupation": np.zeros(test_sample_count, dtype=np.int32),
-        "zip_code": np.zeros(test_sample_count, dtype=np.int32),
-        "hist_movie_id": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.int32),
-        "hist_recency_bucket": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.int32),
-        "hist_rating": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.float32),
-        "hist_feedback": np.zeros((test_sample_count, max_hist_seq_len), dtype=np.int32),
-        "movie_id": np.zeros(test_sample_count, dtype=np.int32),
-        "rating": np.zeros(test_sample_count, dtype=np.float32),
-    }
+    train_data_dict = _empty_retrieval_samples(train_sample_count, max_hist_seq_len, negative_pool_size)
+    validation_data_dict = _empty_retrieval_samples(validation_sample_count, max_hist_seq_len, negative_pool_size)
+    test_data_dict = _empty_retrieval_samples(test_sample_count, max_hist_seq_len, negative_pool_size)
 
     train_row = 0
+    validation_row = 0
     test_row = 0
     for user_id_value, grouped_feats in grouped_users:
         history_length = len(grouped_feats)
@@ -292,11 +222,32 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
         movie_sequence = grouped_feats["movie_id"].to_numpy(dtype=np.int32, copy=False)
         rating_sequence = grouped_feats["rating"].to_numpy(dtype=np.float32, copy=False)
         timestamp_sequence = grouped_feats["timestamp"].to_numpy(dtype=np.int64, copy=False)
-        positive_target_indices = [idx for idx in range(1, history_length) if float(rating_sequence[idx]) >= threshold]
-        if not positive_target_indices:
+        train_target_indices, validation_target_idx, test_target_idx = _split_positive_targets(rating_sequence, positive_rating_min)
+        if validation_target_idx is None or test_target_idx is None:
             continue
 
-        test_target_idx = positive_target_indices[-1]
+        validation_data_dict["user_id"][validation_row] = np.int32(user_id_value)
+        for col in user_columns:
+            validation_data_dict[col][validation_row] = user_features[col]
+        validation_data_dict["hist_movie_id"][validation_row] = _pad_sequence(movie_sequence[:validation_target_idx], max_hist_seq_len, padding_value)
+        validation_data_dict["hist_recency_bucket"][validation_row] = _recency_buckets(timestamp_sequence[:validation_target_idx], timestamp_sequence[validation_target_idx], max_hist_seq_len, padding_value)
+        validation_data_dict["hist_rating"][validation_row] = _pad_sequence(rating_sequence[:validation_target_idx], max_hist_seq_len, 0.0)
+        validation_data_dict["hist_feedback"][validation_row] = _feedback_tokens(
+            rating_sequence[:validation_target_idx],
+            max_hist_seq_len,
+            positive_rating_min,
+            negative_rating_max,
+        )
+        validation_data_dict["user_negative_movie_id"][validation_row] = _user_negative_pool(
+            movie_sequence[:validation_target_idx],
+            rating_sequence[:validation_target_idx],
+            negative_pool_size,
+            negative_rating_max,
+        )
+        validation_data_dict["movie_id"][validation_row] = np.int32(movie_sequence[validation_target_idx])
+        validation_data_dict["rating"][validation_row] = np.float32(rating_sequence[validation_target_idx])
+        validation_row += 1
+
         test_data_dict["user_id"][test_row] = np.int32(user_id_value)
         for col in user_columns:
             test_data_dict[col][test_row] = user_features[col]
@@ -309,35 +260,43 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
             positive_rating_min,
             negative_rating_max,
         )
+        test_data_dict["user_negative_movie_id"][test_row] = _user_negative_pool(
+            movie_sequence[:test_target_idx],
+            rating_sequence[:test_target_idx],
+            negative_pool_size,
+            negative_rating_max,
+        )
         test_data_dict["movie_id"][test_row] = np.int32(movie_sequence[test_target_idx])
         test_data_dict["rating"][test_row] = np.float32(rating_sequence[test_target_idx])
         test_row += 1
 
-        for i in positive_target_indices[:-1]:
+        for i in train_target_indices:
             train_data_dict["user_id"][train_row] = np.int32(user_id_value)
             for col in user_columns:
                 train_data_dict[col][train_row] = user_features[col]
             train_data_dict["hist_movie_id"][train_row] = _pad_sequence(movie_sequence[:i], max_hist_seq_len, padding_value)
             train_data_dict["hist_recency_bucket"][train_row] = _recency_buckets(timestamp_sequence[:i], timestamp_sequence[i], max_hist_seq_len, padding_value)
             train_data_dict["hist_rating"][train_row] = _pad_sequence(rating_sequence[:i], max_hist_seq_len, 0.0)
+            train_data_dict["hist_feedback"][train_row] = _feedback_tokens(
+                rating_sequence[:i],
+                max_hist_seq_len,
+                positive_rating_min,
+                negative_rating_max,
+            )
+            train_data_dict["user_negative_movie_id"][train_row] = _user_negative_pool(
+                movie_sequence[:i],
+                rating_sequence[:i],
+                negative_pool_size,
+                negative_rating_max,
+            )
             train_data_dict["movie_id"][train_row] = np.int32(movie_sequence[i])
             train_data_dict["rating"][train_row] = np.float32(rating_sequence[i])
             train_row += 1
 
-    sequence_train = _build_sequence_train_split(
-        grouped_users,
-        user_columns,
-        max_hist_seq_len=max_hist_seq_len,
-        padding_value=padding_value,
-        positive_rating_min=positive_rating_min,
-        negative_rating_max=negative_rating_max,
-        negative_pool_size=negative_pool_size,
-    )
-
     return {
         "train": train_data_dict,
+        "validation": validation_data_dict,
         "test": test_data_dict,
-        "sequence_train": sequence_train,
         "rating_semantics": {
             "positive_rating_min": float(positive_rating_min),
             "negative_rating_max": float(negative_rating_max),
@@ -356,7 +315,6 @@ def _multimodal_embedding_dim() -> int:
 def _build_preprocess_meta(max_seq_len: int, positive_rating_min: float, negative_rating_max: float, sequence_negative_pool_size: int, multimodal_embedding_dim: int) -> dict:
     return {
         "version": _PREPROCESS_VERSION,
-        "sequence_train_schema": _SEQUENCE_TRAIN_SCHEMA,
         "retrieval_max_seq_len": int(max_seq_len),
         "positive_rating_min": float(positive_rating_min),
         "negative_rating_max": float(negative_rating_max),
@@ -406,10 +364,10 @@ def run_retrieval_preprocessing():
         samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
         feature_dict = load_pickle(RETRIEVAL_FEATURE_DICT_PATH)
         logger.info(
-            "Retrieval preprocessing cache hit | max_seq_len=%s | train_samples=%s | sequence_train_samples=%s | test_samples=%s",
+            "Retrieval preprocessing cache hit | max_seq_len=%s | train=%s | validation=%s | test=%s",
             max_seq_len,
             len(samples["train"]["user_id"]),
-            len(samples.get("sequence_train", {}).get("user_id", [])),
+            len(samples["validation"]["user_id"]),
             len(samples["test"]["user_id"]),
         )
         return samples, feature_dict
@@ -458,9 +416,9 @@ def run_retrieval_preprocessing():
     )
     save_numpy(np.array(vocab_dict["movie_id"]), MOVIE_RAW_IDS_PATH)
     logger.info(
-        "Retrieval preprocessing done | train_samples=%s | sequence_train_samples=%s | test_samples=%s",
+        "Retrieval preprocessing done | train=%s | validation=%s | test=%s",
         len(samples["train"]["user_id"]),
-        len(samples["sequence_train"]["user_id"]),
+        len(samples["validation"]["user_id"]),
         len(samples["test"]["user_id"]),
     )
     return samples, feature_dict

@@ -2,9 +2,9 @@ default_model: din
 
 common:
   training:
+    early_stopping_patience: 2
     validation_samples_per_user: 1
     validation_max_users: 6040
-    early_stopping_patience: 2
     min_delta: 1.0e-4
     train_negatives: 15
     low_rating_negatives: 3

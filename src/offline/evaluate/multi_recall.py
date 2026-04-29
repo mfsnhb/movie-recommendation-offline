@@ -39,7 +39,7 @@ logger = get_logger("offline.evaluate.multi_recall")
 DEFAULT_ROUTE_ORDER = ["two_tower", "sequence", "item_cf", "multimodal", "item2item", "genre", "popular"]
 RRF_K = 60
 MIN_ROUTE_WEIGHT = 0.3
-MAX_ROUTE_WEIGHT = 2.0
+MAX_ROUTE_WEIGHT = 1.0
 
 
 
@@ -67,16 +67,11 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
         RRF_K,
     )
 
-    quota_data = _build_quota_learning_data(retrieval_samples)
-    if quota_data is not None:
-        quota_route_outputs, _ = build_route_outputs(topk=topk, routes=routes, split_data=quota_data)
-        quota_metrics, quota_route_recalls = evaluate_route_outputs(quota_route_outputs, quota_data, topk)
-        incremental_stats = _compute_incremental_route_recalls(route_order, quota_route_outputs, quota_data, topk, quota_route_recalls)
-        quota_source = "train_latest_prefix_validation"
-    else:
-        quota_metrics = {}
-        incremental_stats = _uniform_incremental_stats(route_order)
-        quota_source = "uniform_fallback"
+    validation_data = retrieval_samples["validation"]
+    validation_route_outputs, _ = build_route_outputs(topk=topk, routes=routes, split_name="validation")
+    validation_metrics, validation_route_recalls = evaluate_route_outputs(validation_route_outputs, validation_data, topk)
+    incremental_stats = _compute_incremental_route_recalls(route_order, validation_route_outputs, validation_data, topk, validation_route_recalls)
+    weight_source = "validation"
     route_weights, prioritized_routes = _allocate_route_weights(
         route_order,
         incremental_stats["route_incremental_recalls"],
@@ -84,8 +79,8 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
     )
     clipped_route_weights = _clip_route_weights(route_order, route_weights, incremental_stats["effective_routes"])
     logger.info(
-        "Multi-recall fusion setup | source=%s | method=rrf | rrf_k=%s | metric=incremental_recall@%s | prioritized_routes=%s | route_weights=%s | clipped_route_weights=%s | incremental_recalls=%s | effective_routes=%s",
-        quota_source,
+        "Multi-recall fusion setup | weight_source=%s | method=rrf | rrf_k=%s | metric=incremental_recall@%s | prioritized_routes=%s | route_weights=%s | clipped_route_weights=%s | incremental_recalls=%s | effective_routes=%s",
+        weight_source,
         RRF_K,
         allocation_k,
         prioritized_routes,
@@ -124,8 +119,8 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
         "route_single_recalls": incremental_stats["route_single_recalls"],
         "route_incremental_recalls": incremental_stats["route_incremental_recalls"],
         "effective_routes": incremental_stats["effective_routes"],
-        "quota_source": quota_source,
-        "quota_metrics": quota_metrics,
+        "weight_source": weight_source,
+        "validation_metrics": validation_metrics,
         "allocation_metric": f"incremental_recall@{allocation_k}",
         "fusion_method": "rrf",
         "rrf_k": RRF_K,
@@ -141,7 +136,7 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
         "route_single_recalls": incremental_stats["route_single_recalls"],
         "route_incremental_recalls": incremental_stats["route_incremental_recalls"],
         "effective_routes": incremental_stats["effective_routes"],
-        "quota_source": quota_source,
+        "weight_source": weight_source,
         "fusion_method": "rrf",
         "rrf_k": RRF_K,
         "route_weight_clip": {"min": MIN_ROUTE_WEIGHT, "max": MAX_ROUTE_WEIGHT},
@@ -159,21 +154,21 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
 
 
 
-def build_route_outputs(topk: int, routes: list[str] | None = None, split_name: str = "test", split_data: dict | None = None):
+def build_route_outputs(topk: int, routes: list[str] | None = None, split_name: str = "test"):
     retrieval_samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
     item_catalog = load_pickle(ITEM_CATALOG_PATH)
     settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
     resolved_config = resolve_retrieval_config(settings)
-    test = split_data if split_data is not None else retrieval_samples[split_name]
-    if "hist_movie_id" not in test and "context_movie_id" in test:
-        test = dict(test)
-        test["hist_movie_id"] = test["context_movie_id"]
-        test["hist_rating"] = test.get("context_rating", np.zeros_like(test["context_movie_id"], dtype=np.float32))
-        test["movie_id"] = test["target_movie_id"]
-    if "hist_feedback" not in test and "hist_rating" in test:
-        test = dict(test)
-        test["hist_feedback"] = _feedback_tokens_from_ratings(
-            test["hist_rating"],
+    split = retrieval_samples[split_name]
+    if "hist_movie_id" not in split and "context_movie_id" in split:
+        split = dict(split)
+        split["hist_movie_id"] = split["context_movie_id"]
+        split["hist_rating"] = split.get("context_rating", np.zeros_like(split["context_movie_id"], dtype=np.float32))
+        split["movie_id"] = split["target_movie_id"]
+    if "hist_feedback" not in split and "hist_rating" in split:
+        split = dict(split)
+        split["hist_feedback"] = _feedback_tokens_from_ratings(
+            split["hist_rating"],
             positive_rating_min=float(resolved_config["rating_semantics"].get("positive_rating_min", 4.0)),
             negative_rating_max=float(resolved_config["rating_semantics"].get("negative_rating_max", 2.0)),
         )
@@ -182,29 +177,29 @@ def build_route_outputs(topk: int, routes: list[str] | None = None, split_name: 
     route_order = list(routes or DEFAULT_ROUTE_ORDER)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     route_outputs: dict[str, dict[int, dict[int, float]]] = {}
-    route_topk = max(topk * 2, topk + int(np.asarray(test.get("hist_movie_id", np.zeros((0, 0)))).shape[1] if "hist_movie_id" in test else 0))
+    route_topk = max(topk * 2, topk + int(np.asarray(split.get("hist_movie_id", np.zeros((0, 0)))).shape[1] if "hist_movie_id" in split else 0))
 
     encoded_movie_ids = None
     if MOVIE_IDS_PATH.exists():
         encoded_movie_ids = np.load(MOVIE_IDS_PATH, mmap_mode="r").astype(np.int64)
 
     route_builders = {
-        "two_tower": lambda: _build_two_tower_output(test, encoded_movie_ids, item_features, device, route_topk),
-        "sequence": lambda: _build_sequence_output(test, encoded_movie_ids, item_features, device, route_topk),
-        "item2item": lambda: _build_item2item_output(test, route_topk),
-        "item_cf": lambda: _build_item_cf_output(test, route_topk),
-        "multimodal": lambda: _build_multimodal_output(test, all_item_ids, item_features, route_topk, resolved_config["rating_semantics"]),
-        "genre": lambda: _build_genre_output(test, all_item_ids, item_features, route_topk),
-        "popular": lambda: _build_popular_output(test, route_topk),
+        "two_tower": lambda: _build_two_tower_output(split, encoded_movie_ids, item_features, device, route_topk),
+        "sequence": lambda: _build_sequence_output(split, encoded_movie_ids, item_features, device, route_topk),
+        "item2item": lambda: _build_item2item_output(split, route_topk),
+        "item_cf": lambda: _build_item_cf_output(split, route_topk),
+        "multimodal": lambda: _build_multimodal_output(split, all_item_ids, item_features, route_topk, resolved_config["rating_semantics"]),
+        "genre": lambda: _build_genre_output(split, all_item_ids, item_features, route_topk),
+        "popular": lambda: _build_popular_output(split, route_topk),
     }
     for route_name in route_order:
         route_builder = route_builders.get(route_name)
         if route_builder is None:
             logger.warning("Multi-recall route skipped | route=%s | reason=unknown_route", route_name)
-            route_outputs[route_name] = _empty_route_output(test["user_id"])
+            route_outputs[route_name] = _empty_route_output(split["user_id"])
         else:
             route_outputs[route_name] = route_builder()
-    route_outputs = _filter_seen_route_outputs(route_outputs, test, topk)
+    route_outputs = _filter_seen_route_outputs(route_outputs, split, topk)
     return route_outputs, retrieval_samples
 
 
@@ -259,20 +254,6 @@ def evaluate_final_candidates(user_ids: np.ndarray, candidate_ids: list[list[int
 def _empty_route_output(test_user_ids) -> dict[int, dict[int, float]]:
     return {int(uid): {} for uid in np.asarray(test_user_ids).tolist()}
 
-
-
-def _build_quota_learning_data(retrieval_samples: dict) -> dict | None:
-    train = retrieval_samples.get("train")
-    if not train or len(train.get("user_id", [])) == 0:
-        return None
-    user_ids = np.asarray(train["user_id"], dtype=np.int32)
-    latest_indices: dict[int, int] = {}
-    for idx, user_id in enumerate(user_ids.tolist()):
-        latest_indices[int(user_id)] = idx
-    if not latest_indices:
-        return None
-    selected_indices = np.asarray(sorted(latest_indices.values()), dtype=np.int64)
-    return {field: np.asarray(values)[selected_indices] for field, values in train.items()}
 
 
 
@@ -344,8 +325,6 @@ def _build_two_tower_output(test_data: dict, encoded_movie_ids: np.ndarray | Non
         rating_weight_scale=float(training_settings.get("rating_weight_scale", 0.25)),
         rating_weight_min=float(training_settings.get("rating_weight_min", 0.0)),
         rating_weight_max=float(training_settings.get("rating_weight_max", 1.0)),
-        short_history_length=int(model_settings.get("short_history_length", 10)),
-        positive_rating_min=float(training_settings.get("positive_rating_min", 4.0)),
         multimodal_table=item_features["multimodal_embedding"],
     ).to(device)
     model.load_state_dict(retrieval_checkpoint["state_dict"])
@@ -469,10 +448,12 @@ def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, item_f
         for idx, user_id in enumerate(test_data["user_id"]):
             hist_movie_ids = torch.tensor(np.asarray(test_data["hist_movie_id"][idx]).reshape(1, -1), dtype=torch.long, device=device)
             hist_recency_bucket = torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device)
+            hist_rating = torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device)
             hist_feedback = torch.tensor(np.asarray(test_data["hist_feedback"][idx]).reshape(1, -1), dtype=torch.long, device=device)
-            hist_movie_ids, hist_recency_bucket, hist_feedback = filter_sequence_history(
+            hist_movie_ids, hist_recency_bucket, hist_rating, hist_feedback = filter_sequence_history(
                 hist_movie_ids,
                 hist_recency_bucket,
+                hist_rating,
                 hist_feedback,
                 history_feedback,
             )
@@ -480,6 +461,7 @@ def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, item_f
             user_embedding = model.encode_user(
                 hist_movie_ids,
                 hist_recency_bucket,
+                hist_rating,
                 hist_feedback,
                 {field: value for field, value in hist_item_features.items() if field != "movie_id"},
             ).cpu().numpy()[0]

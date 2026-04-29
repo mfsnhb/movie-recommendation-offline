@@ -19,8 +19,6 @@ class TwoTowerRetrievalModel(nn.Module):
         rating_weight_scale: float = 0.25,
         rating_weight_min: float = 0.0,
         rating_weight_max: float = 1.0,
-        short_history_length: int = 10,
-        positive_rating_min: float = 4.0,
         multimodal_table=None,
     ):
         super().__init__()
@@ -42,8 +40,6 @@ class TwoTowerRetrievalModel(nn.Module):
             rating_weight_scale=rating_weight_scale,
             rating_weight_min=rating_weight_min,
             rating_weight_max=rating_weight_max,
-            short_history_length=short_history_length,
-            positive_rating_min=positive_rating_min,
             output_norm=False,
         )
 

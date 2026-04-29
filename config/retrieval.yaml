@@ -39,7 +39,6 @@ models:
       embedding_dim: 32
       user_hidden_dims: [256, 128]
       item_hidden_dims: [256, 128]
-      short_history_length: 10
       dropout: 0.1
 
   sequence:
@@ -53,7 +52,7 @@ models:
       sequence_num_negatives: 32
       sequence_user_negative_ratio: 0.75
       sequence_loss: bce
-      sequence_history_feedback: positive
+      sequence_history_feedback: all
 
   item2item:
     enabled: false

@@ -78,21 +78,21 @@ def load_retrieval_context(settings: dict, config: dict) -> dict:
             f"Global item catalog is missing item feature fields: {missing_fields}. "
             f"Run ranking preprocessing to regenerate {ITEM_CATALOG_PATH.name}."
         )
-    sequence_train_data = train_eval_samples.get("sequence_train", train_eval_samples["train"])
-    required_sequence_fields = [
+    train_data = train_eval_samples["train"]
+    required_train_fields = [
         "user_id",
         "hist_movie_id",
         "hist_recency_bucket",
+        "hist_rating",
         "hist_feedback",
         "movie_id",
         "rating",
-        "user_negative_movie_id",
     ]
-    missing_sequence_fields = [field for field in required_sequence_fields if field not in sequence_train_data]
-    if missing_sequence_fields:
+    missing_train_fields = [field for field in required_train_fields if field not in train_data]
+    if missing_train_fields:
         raise ValueError(
-            "Sequence training artifacts use an outdated schema. "
-            f"Missing fields: {missing_sequence_fields}. Run retrieval preprocessing again."
+            "Retrieval training artifacts use an outdated schema. "
+            f"Missing fields: {missing_train_fields}. Run retrieval preprocessing again."
         )
     return {
         "settings": settings,
@@ -103,8 +103,8 @@ def load_retrieval_context(settings: dict, config: dict) -> dict:
         "item_catalog": item_catalog,
         "item_feature_arrays": item_feature_arrays,
         "all_item_ids": all_item_ids,
-        "train_data": train_eval_samples["train"],
-        "sequence_train_data": sequence_train_data,
+        "train_data": train_data,
+        "validation_data": train_eval_samples["validation"],
         "test_data": train_eval_samples["test"],
         "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     }

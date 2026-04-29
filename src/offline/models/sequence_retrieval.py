@@ -46,16 +46,18 @@ def _right_align_sequence_states(states: torch.Tensor, compact_mask: torch.Tenso
 def filter_sequence_history(
     hist_movie_ids: torch.Tensor,
     hist_recency_bucket: torch.Tensor | None = None,
+    hist_rating: torch.Tensor | None = None,
     hist_feedback: torch.Tensor | None = None,
     history_feedback: str = "positive",
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    if history_feedback != "positive" or hist_feedback is None:
-        return hist_movie_ids, hist_recency_bucket, hist_feedback
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if history_feedback == "all" or hist_feedback is None:
+        return hist_movie_ids, hist_recency_bucket, hist_rating, hist_feedback
     keep_mask = hist_movie_ids.gt(0) & hist_feedback.eq(3)
     filtered_movie_ids = right_align_by_mask(hist_movie_ids, keep_mask)
     filtered_recency = right_align_by_mask(hist_recency_bucket, keep_mask) if hist_recency_bucket is not None else None
+    filtered_rating = right_align_by_mask(hist_rating, keep_mask) if hist_rating is not None else None
     filtered_feedback = right_align_by_mask(hist_feedback, keep_mask)
-    return filtered_movie_ids, filtered_recency, filtered_feedback
+    return filtered_movie_ids, filtered_recency, filtered_rating, filtered_feedback
 
 
 class SequenceRetrievalModel(nn.Module):
@@ -73,6 +75,7 @@ class SequenceRetrievalModel(nn.Module):
         self.max_len = max_len
         self.hidden_dim = int(hidden_dim or emb_dim)
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
+        self.rating_projection = nn.Linear(1, emb_dim)
         self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(
             input_size=emb_dim,
@@ -88,13 +91,20 @@ class SequenceRetrievalModel(nn.Module):
         self,
         hist_movie_ids: torch.Tensor,
         hist_recency_bucket: torch.Tensor | None = None,
+        hist_rating: torch.Tensor | None = None,
         hist_feedback: torch.Tensor | None = None,
         hist_item_features: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
-        del hist_recency_bucket, hist_feedback
+        del hist_recency_bucket
         if hist_item_features is None:
             raise ValueError("hist_item_features is required for sequence encoding")
         hist_movie_ids = hist_movie_ids[:, -self.max_len :]
+        if hist_rating is None:
+            hist_rating = torch.zeros_like(hist_movie_ids, dtype=torch.float32)
+        else:
+            hist_rating = hist_rating[:, -self.max_len :].float()
+        if hist_feedback is not None:
+            hist_feedback = hist_feedback[:, -self.max_len :].long().clamp(min=0, max=3)
         hist_item_features = {field: value[:, -self.max_len :] for field, value in hist_item_features.items()}
         visible_mask = hist_movie_ids.gt(0)
         width = hist_movie_ids.size(1)
@@ -111,9 +121,13 @@ class SequenceRetrievalModel(nn.Module):
             "popularity": _left_align_by_order(hist_item_features["popularity"], order, counts),
             "averageRating": _left_align_by_order(hist_item_features["averageRating"], order, counts),
         }
+        compact_rating = _left_align_by_order(hist_rating, order, counts).unsqueeze(-1)
         compact_mask = compact_movie_ids.gt(0)
         lengths = compact_mask.sum(dim=1).cpu()
-        x = self.dropout(self.movie_encoder(compact_features))
+        x = self.movie_encoder(compact_features)
+        rating_embedding = self.rating_projection(compact_rating.clamp_min(0.0) / 5.0).masked_fill(~compact_mask.unsqueeze(-1), 0.0)
+        x = x + rating_embedding
+        x = self.dropout(x)
         compact_states = torch.zeros(hist_movie_ids.size(0), hist_movie_ids.size(1), self.hidden_dim, device=hist_movie_ids.device, dtype=x.dtype)
         non_empty = lengths.gt(0)
         if non_empty.any():
@@ -140,10 +154,11 @@ class SequenceRetrievalModel(nn.Module):
         self,
         hist_movie_ids: torch.Tensor,
         hist_recency_bucket: torch.Tensor | None = None,
+        hist_rating: torch.Tensor | None = None,
         hist_feedback: torch.Tensor | None = None,
         hist_item_features: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        sequence_outputs = self.encode_sequence(hist_movie_ids, hist_recency_bucket, hist_feedback, hist_item_features)
+        sequence_outputs = self.encode_sequence(hist_movie_ids, hist_recency_bucket, hist_rating, hist_feedback, hist_item_features)
         hidden_states = sequence_outputs["hidden_states"]
         visible_mask = sequence_outputs["visible_mask"]
         visible_counts = visible_mask.sum(dim=1)

@@ -19,7 +19,7 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.ranking")
-_SAMPLE_PROTOCOL = "prefix_positive_targets_v6"
+_SAMPLE_PROTOCOL = "prefix_positive_targets_v7"
 _ID_DTYPE = np.uint16
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
@@ -217,6 +217,7 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
     df_sorted = df_merged.sort_values(["user_id_original", "timestamp"], kind="stable")
 
     train_sample_count = 0
+    validation_sample_count = 0
     test_sample_count = 0
     positive_threshold = float(positive_rating_min)
     for _, user_rows in df_sorted.groupby("user_id_original", sort=False):
@@ -225,25 +226,29 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
             continue
         rating_sequence = [float(rating) for rating in user_rows["rating"].tolist()]
         positive_target_indices = [idx for idx in range(1, history_length) if rating_sequence[idx] >= positive_threshold]
-        if not positive_target_indices:
+        if len(positive_target_indices) < 2:
             continue
+        validation_sample_count += 1
         test_sample_count += 1
-        train_sample_count += max(len(positive_target_indices) - 1, 0)
+        train_sample_count += max(len(positive_target_indices) - 2, 0)
 
     logger.info(
-        "Ranking sample allocation | protocol=%s | train_samples=%s | test_samples=%s | max_seq_len=%s | positive_rating_min=%s",
+        "Ranking sample allocation | protocol=%s | train_samples=%s | validation_samples=%s | test_samples=%s | max_seq_len=%s | positive_rating_min=%s",
         _SAMPLE_PROTOCOL,
         train_sample_count,
+        validation_sample_count,
         test_sample_count,
         max_seq_len,
         positive_threshold,
     )
 
     train_store = _allocate_split_arrays(train_sample_count, max_seq_len)
+    validation_store = _allocate_split_arrays(validation_sample_count, max_seq_len)
     test_store = _allocate_split_arrays(test_sample_count, max_seq_len)
     item_popularity = np.zeros(total_item_count + 1, dtype=np.int64)
 
     train_row = 0
+    validation_row = 0
     test_row = 0
     for user_id_original, user_rows in df_sorted.groupby("user_id_original", sort=False):
         movie_sequence = [int(movie_id) for movie_id in user_rows["movie_id"].tolist()]
@@ -252,7 +257,7 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
         if history_length < 2:
             continue
         positive_target_indices = [idx for idx in range(1, history_length) if rating_sequence[idx] >= positive_threshold]
-        if not positive_target_indices:
+        if len(positive_target_indices) < 2:
             continue
 
         user_values = (
@@ -263,7 +268,21 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
             int(user_rows["zip_code"].iloc[0]),
         )
 
+        validation_target_idx = positive_target_indices[-2]
         test_target_idx = positive_target_indices[-1]
+        _write_sample_row(
+            validation_store,
+            row_idx=validation_row,
+            user_values=user_values,
+            user_id_original=int(user_id_original),
+            context_movies=movie_sequence[:validation_target_idx],
+            context_ratings=rating_sequence[:validation_target_idx],
+            target_movie_id=int(movie_sequence[validation_target_idx]),
+            target_rating=float(rating_sequence[validation_target_idx]),
+            negative_rating_max=negative_rating_max,
+        )
+        validation_row += 1
+
         _write_sample_row(
             test_store,
             row_idx=test_row,
@@ -277,7 +296,7 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
         )
         test_row += 1
 
-        for target_idx in positive_target_indices[:-1]:
+        for target_idx in positive_target_indices[:-2]:
             target_movie_id = int(movie_sequence[target_idx])
             _write_sample_row(
                 train_store,
@@ -296,6 +315,7 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
     return {
         "protocol": _SAMPLE_PROTOCOL,
         "train": train_store,
+        "validation": validation_store,
         "test": test_store,
         "all_item_ids": np.arange(1, total_item_count + 1, dtype=np.int32),
         "item_popularity": item_popularity,
@@ -363,9 +383,10 @@ def run_ranking_preprocessing():
     save_pickle(feature_dict, RANKING_FEATURE_DICT_PATH)
     save_pickle(vocab_dict, RANKING_VOCAB_DICT_PATH)
     logger.info(
-        "Ranking preprocessing done | protocol=%s | train_samples=%s | test_samples=%s | global_item_catalog=%s",
+        "Ranking preprocessing done | protocol=%s | train_samples=%s | validation_samples=%s | test_samples=%s | global_item_catalog=%s",
         _SAMPLE_PROTOCOL,
         len(samples["train"]["user_id"]),
+        len(samples["validation"]["user_id"]),
         len(samples["test"]["user_id"]),
         ITEM_CATALOG_PATH.name,
     )
