@@ -11,7 +11,7 @@ from torch import nn
 
 from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, precision_at_k, recall_at_k, save_metrics
 from offline.evaluate.multi_recall import build_multi_recall_artifacts
-from offline.features.item_batch import build_item_batch, item_feature_tensors as to_item_feature_tensors
+from offline.features.item_batch import ITEM_FEATURE_FIELDS, build_item_batch, item_feature_tensors as to_item_feature_tensors
 from offline.models.item2item import _first_occurrence_mask, _pack_candidate_ids, _valid_candidate_mask, train_item2item_embeddings
 from offline.models.sequence_retrieval import SequenceRetrievalModel, filter_sequence_history
 from offline.models.two_tower import TwoTowerRetrievalModel
@@ -376,7 +376,7 @@ def train_two_tower(context=None, warm_start: bool = True):
             "config_schema": "model_registry_v2" if "models" in settings else "legacy_v1",
             "model_settings": two_tower_settings,
             "training_settings": training_settings,
-            "item_feature_fields": list(_ITEM_FEATURE_FIELDS),
+            "item_feature_fields": list(ITEM_FEATURE_FIELDS),
         },
         RETRIEVAL_MODEL_PATH,
     )
@@ -577,7 +577,7 @@ def train_sequence(context=None, warm_start: bool = True):
             "config_schema": "model_registry_v2" if "models" in settings else "legacy_v1",
             "model_settings": sequence_settings,
             "training_settings": training_settings,
-            "item_feature_fields": list(_ITEM_FEATURE_FIELDS),
+            "item_feature_fields": list(ITEM_FEATURE_FIELDS),
         },
         SEQUENCE_MODEL_PATH,
     )
@@ -1012,8 +1012,8 @@ def _evaluate_loss(
     total_tt_examples, total_seq_examples = 0, 0
     eval_batches = batch_indices(eval_indices, batch_size, shuffle=False)
     with torch.no_grad():
-        for batch_idx, batch_indices in enumerate(eval_batches, start=1):
-            batch_dict = slice_train_batch(train_data, batch_indices, device)
+        for batch_idx, indices in enumerate(eval_batches, start=1):
+            batch_dict = slice_train_batch(train_data, indices, device)
             if evaluate_two_tower:
                 hist_item_batch = build_item_batch(batch_dict["hist_movie_id"], item_feature_arrays, device)
                 batch_dict.update({f"hist_{field}": value for field, value in hist_item_batch.items() if field != "movie_id"})
