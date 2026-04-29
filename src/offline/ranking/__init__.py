@@ -15,7 +15,6 @@ from .protocol import (
     get_all_item_ids,
     get_item_feature_arrays,
     get_seen_movie_ids,
-    sample_negative_ids,
 )
 
 __all__ = [
@@ -29,7 +28,6 @@ __all__ = [
     "SequenceRankingTrainCollator",
     "batch_to_device",
     "build_inference_batch",
-    "sample_negative_ids",
     "extract_split_sample",
     "get_all_item_ids",
     "get_item_feature_arrays",

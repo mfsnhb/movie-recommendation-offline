@@ -37,6 +37,9 @@ from offline.utils.logging import get_logger
 
 logger = get_logger("offline.evaluate.multi_recall")
 DEFAULT_ROUTE_ORDER = ["two_tower", "sequence", "item_cf", "multimodal", "item2item", "genre", "popular"]
+RRF_K = 60
+MIN_ROUTE_WEIGHT = 0.3
+MAX_ROUTE_WEIGHT = 2.0
 
 
 
@@ -50,43 +53,54 @@ def run_multi_recall_build(routes=None, topk: int | None = None):
 
 
 def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
-    route_outputs, retrieval_samples = build_route_outputs(topk=topk, routes=routes)
+    route_outputs, retrieval_samples = build_route_outputs(topk=topk, routes=routes, split_name="test")
     test = retrieval_samples["test"]
     route_order = list(routes or DEFAULT_ROUTE_ORDER)
     metric_ks = sorted({50, 100, min(200, topk)})
     allocation_k = min(200, topk)
 
     logger.info(
-        "Multi-recall artifact build start | users=%s | topk=%s | routes=%s | score_normalization=per_user_route_minmax_weighted_by_incremental_recall",
+        "Multi-recall artifact build start | users=%s | topk=%s | routes=%s | fusion_method=rrf | rrf_k=%s",
         len(test["user_id"]),
         topk,
         route_order,
+        RRF_K,
     )
 
-    per_route_metrics, route_recalls = evaluate_route_outputs(route_outputs, test, topk)
-    incremental_stats = _compute_incremental_route_recalls(route_order, route_outputs, test, topk, route_recalls)
-    route_quotas, route_weights, prioritized_routes = _allocate_route_quotas(
+    quota_data = _build_quota_learning_data(retrieval_samples)
+    if quota_data is not None:
+        quota_route_outputs, _ = build_route_outputs(topk=topk, routes=routes, split_data=quota_data)
+        quota_metrics, quota_route_recalls = evaluate_route_outputs(quota_route_outputs, quota_data, topk)
+        incremental_stats = _compute_incremental_route_recalls(route_order, quota_route_outputs, quota_data, topk, quota_route_recalls)
+        quota_source = "train_latest_prefix_validation"
+    else:
+        quota_metrics = {}
+        incremental_stats = _uniform_incremental_stats(route_order)
+        quota_source = "uniform_fallback"
+    route_weights, prioritized_routes = _allocate_route_weights(
         route_order,
         incremental_stats["route_incremental_recalls"],
-        topk,
         effective_routes=incremental_stats["effective_routes"],
     )
-    normalized_route_outputs = _normalize_route_scores(route_outputs, route_weights)
+    clipped_route_weights = _clip_route_weights(route_order, route_weights, incremental_stats["effective_routes"])
     logger.info(
-        "Multi-recall quota allocation | metric=incremental_recall@%s | prioritized_routes=%s | route_weights=%s | route_quotas=%s | incremental_recalls=%s | effective_routes=%s",
+        "Multi-recall fusion setup | source=%s | method=rrf | rrf_k=%s | metric=incremental_recall@%s | prioritized_routes=%s | route_weights=%s | clipped_route_weights=%s | incremental_recalls=%s | effective_routes=%s",
+        quota_source,
+        RRF_K,
         allocation_k,
         prioritized_routes,
         route_weights,
-        route_quotas,
+        clipped_route_weights,
         incremental_stats["route_incremental_recalls"],
         incremental_stats["effective_routes"],
     )
 
+    per_route_metrics, route_recalls = evaluate_route_outputs(route_outputs, test, topk)
     fused_candidates, fused_scores, labels, user_ids = [], [], [], []
     for idx, user_id in enumerate(test["user_id"]):
         target = int(np.asarray(test["movie_id"][idx]).reshape(-1)[0])
-        route_candidate_lists = {name: list(output.get(int(user_id), {}).items()) for name, output in normalized_route_outputs.items()}
-        ranked_items = _quota_candidates(route_candidate_lists, prioritized_routes, route_quotas, topk)
+        route_candidate_lists = {name: list(output.get(int(user_id), {}).items()) for name, output in route_outputs.items()}
+        ranked_items = _rrf_candidates(route_candidate_lists, prioritized_routes, clipped_route_weights, topk, RRF_K)
         candidates = [int(item) for item, _ in ranked_items]
         scores = [float(score) for _, score in ranked_items]
         fused_candidates.append(candidates)
@@ -106,23 +120,32 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
         "route_order": route_order,
         "prioritized_routes": prioritized_routes,
         "route_weights": route_weights,
-        "route_quotas": route_quotas,
+        "route_weights_clipped": clipped_route_weights,
         "route_single_recalls": incremental_stats["route_single_recalls"],
         "route_incremental_recalls": incremental_stats["route_incremental_recalls"],
         "effective_routes": incremental_stats["effective_routes"],
+        "quota_source": quota_source,
+        "quota_metrics": quota_metrics,
         "allocation_metric": f"incremental_recall@{allocation_k}",
-        "score_normalization": "per_user_route_minmax_weighted_by_incremental_recall",
+        "fusion_method": "rrf",
+        "rrf_k": RRF_K,
+        "route_weight_clip": {"min": MIN_ROUTE_WEIGHT, "max": MAX_ROUTE_WEIGHT},
+        "score_normalization": "rrf_rank_weighted_by_clipped_incremental_recall",
     }
     save_metrics(MULTI_RECALL_METRICS_PATH, metric_summary)
     artifacts = {
         "route_order": route_order,
         "prioritized_routes": prioritized_routes,
         "route_weights": route_weights,
-        "route_quotas": route_quotas,
+        "route_weights_clipped": clipped_route_weights,
         "route_single_recalls": incremental_stats["route_single_recalls"],
         "route_incremental_recalls": incremental_stats["route_incremental_recalls"],
         "effective_routes": incremental_stats["effective_routes"],
-        "score_normalization": "per_user_route_minmax_weighted_by_incremental_recall",
+        "quota_source": quota_source,
+        "fusion_method": "rrf",
+        "rrf_k": RRF_K,
+        "route_weight_clip": {"min": MIN_ROUTE_WEIGHT, "max": MAX_ROUTE_WEIGHT},
+        "score_normalization": "rrf_rank_weighted_by_clipped_incremental_recall",
         "route_outputs": route_outputs,
         "fused_candidates": fused_candidates,
         "fused_scores": fused_scores,
@@ -136,30 +159,43 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
 
 
 
-def build_route_outputs(topk: int, routes: list[str] | None = None):
+def build_route_outputs(topk: int, routes: list[str] | None = None, split_name: str = "test", split_data: dict | None = None):
     retrieval_samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
     item_catalog = load_pickle(ITEM_CATALOG_PATH)
     settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
     resolved_config = resolve_retrieval_config(settings)
-    test = retrieval_samples["test"]
+    test = split_data if split_data is not None else retrieval_samples[split_name]
+    if "hist_movie_id" not in test and "context_movie_id" in test:
+        test = dict(test)
+        test["hist_movie_id"] = test["context_movie_id"]
+        test["hist_rating"] = test.get("context_rating", np.zeros_like(test["context_movie_id"], dtype=np.float32))
+        test["movie_id"] = test["target_movie_id"]
+    if "hist_feedback" not in test and "hist_rating" in test:
+        test = dict(test)
+        test["hist_feedback"] = _feedback_tokens_from_ratings(
+            test["hist_rating"],
+            positive_rating_min=float(resolved_config["rating_semantics"].get("positive_rating_min", 4.0)),
+            negative_rating_max=float(resolved_config["rating_semantics"].get("negative_rating_max", 2.0)),
+        )
     item_features = get_item_feature_arrays(item_catalog)
     all_item_ids = get_all_item_ids(item_catalog)
     route_order = list(routes or DEFAULT_ROUTE_ORDER)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     route_outputs: dict[str, dict[int, dict[int, float]]] = {}
+    route_topk = max(topk * 2, topk + int(np.asarray(test.get("hist_movie_id", np.zeros((0, 0)))).shape[1] if "hist_movie_id" in test else 0))
 
     encoded_movie_ids = None
     if MOVIE_IDS_PATH.exists():
         encoded_movie_ids = np.load(MOVIE_IDS_PATH, mmap_mode="r").astype(np.int64)
 
     route_builders = {
-        "two_tower": lambda: _build_two_tower_output(test, encoded_movie_ids, item_features, device, topk),
-        "sequence": lambda: _build_sequence_output(test, encoded_movie_ids, item_features, device, topk),
-        "item2item": lambda: _build_item2item_output(test, topk),
-        "item_cf": lambda: _build_item_cf_output(test, topk),
-        "multimodal": lambda: _build_multimodal_output(test, all_item_ids, item_features, topk, resolved_config["rating_semantics"]),
-        "genre": lambda: _build_genre_output(test, all_item_ids, item_features, topk),
-        "popular": lambda: _build_popular_output(test, topk),
+        "two_tower": lambda: _build_two_tower_output(test, encoded_movie_ids, item_features, device, route_topk),
+        "sequence": lambda: _build_sequence_output(test, encoded_movie_ids, item_features, device, route_topk),
+        "item2item": lambda: _build_item2item_output(test, route_topk),
+        "item_cf": lambda: _build_item_cf_output(test, route_topk),
+        "multimodal": lambda: _build_multimodal_output(test, all_item_ids, item_features, route_topk, resolved_config["rating_semantics"]),
+        "genre": lambda: _build_genre_output(test, all_item_ids, item_features, route_topk),
+        "popular": lambda: _build_popular_output(test, route_topk),
     }
     for route_name in route_order:
         route_builder = route_builders.get(route_name)
@@ -168,6 +204,7 @@ def build_route_outputs(topk: int, routes: list[str] | None = None):
             route_outputs[route_name] = _empty_route_output(test["user_id"])
         else:
             route_outputs[route_name] = route_builder()
+    route_outputs = _filter_seen_route_outputs(route_outputs, test, topk)
     return route_outputs, retrieval_samples
 
 
@@ -221,6 +258,65 @@ def evaluate_final_candidates(user_ids: np.ndarray, candidate_ids: list[list[int
 
 def _empty_route_output(test_user_ids) -> dict[int, dict[int, float]]:
     return {int(uid): {} for uid in np.asarray(test_user_ids).tolist()}
+
+
+
+def _build_quota_learning_data(retrieval_samples: dict) -> dict | None:
+    train = retrieval_samples.get("train")
+    if not train or len(train.get("user_id", [])) == 0:
+        return None
+    user_ids = np.asarray(train["user_id"], dtype=np.int32)
+    latest_indices: dict[int, int] = {}
+    for idx, user_id in enumerate(user_ids.tolist()):
+        latest_indices[int(user_id)] = idx
+    if not latest_indices:
+        return None
+    selected_indices = np.asarray(sorted(latest_indices.values()), dtype=np.int64)
+    return {field: np.asarray(values)[selected_indices] for field, values in train.items()}
+
+
+
+def _uniform_incremental_stats(route_order: list[str]) -> dict:
+    if not route_order:
+        return {"route_single_recalls": {}, "route_incremental_recalls": {}, "effective_routes": []}
+    weight = round(1.0 / len(route_order), 6)
+    return {
+        "route_single_recalls": {route: weight for route in route_order},
+        "route_incremental_recalls": {route: weight for route in route_order},
+        "effective_routes": list(route_order),
+    }
+
+
+
+def _feedback_tokens_from_ratings(ratings, positive_rating_min: float, negative_rating_max: float) -> np.ndarray:
+    values = np.asarray(ratings, dtype=np.float32)
+    feedback = np.zeros(values.shape, dtype=np.int32)
+    valid = values > 0
+    feedback[valid] = 2
+    feedback[values >= positive_rating_min] = 3
+    feedback[(values > 0) & (values <= negative_rating_max)] = 1
+    return feedback
+
+
+
+def _filter_seen_route_outputs(route_outputs: dict[str, dict[int, dict[int, float]]], test_data: dict, topk: int):
+    seen_by_user = {
+        int(user_id): set(get_seen_movie_ids({"context_movie_id": test_data["hist_movie_id"][idx]}).tolist())
+        for idx, user_id in enumerate(test_data["user_id"])
+    }
+    filtered_outputs = {}
+    for route_name, user_outputs in route_outputs.items():
+        filtered_user_outputs = {}
+        for user_id, candidates in user_outputs.items():
+            seen_items = seen_by_user.get(int(user_id), set())
+            ranked = [
+                (int(item_id), float(score))
+                for item_id, score in candidates.items()
+                if int(item_id) > 0 and int(item_id) not in seen_items
+            ][:topk]
+            filtered_user_outputs[int(user_id)] = dict(ranked)
+        filtered_outputs[route_name] = filtered_user_outputs
+    return filtered_outputs
 
 
 
@@ -324,7 +420,7 @@ def _build_popular_output(test_data: dict, topk: int):
         logger.info("Multi-recall route skipped | route=popular | reason=missing_artifact")
         return _empty_route_output(test_data["user_id"])
     ranked = load_pickle(POPULAR_MODEL_PATH)
-    return _popular_candidates(test_data["user_id"], ranked, topk)
+    return _popular_candidates(test_data, ranked, topk)
 
 
 def _build_multimodal_output(test_data: dict, all_item_ids: np.ndarray, item_features: dict[str, np.ndarray], topk: int, rating_semantics: dict):
@@ -509,9 +605,14 @@ def _genre_candidates(test_data, genre_to_items: dict[int, list[int]], item_feat
 
 
 
-def _popular_candidates(test_user_ids, ranked_items: dict[int, float], topk: int):
-    limited = dict(list(ranked_items.items())[:topk])
-    return {int(uid): limited for uid in np.asarray(test_user_ids).tolist()}
+def _popular_candidates(test_data: dict, ranked_items: dict[int, float], topk: int):
+    ranked_pairs = [(int(item_id), float(score)) for item_id, score in ranked_items.items()]
+    outputs = {}
+    for idx, user_id in enumerate(test_data["user_id"]):
+        seen_items = set(get_seen_movie_ids({"context_movie_id": test_data["hist_movie_id"][idx]}).tolist())
+        candidates = [(item_id, score) for item_id, score in ranked_pairs if item_id not in seen_items][:topk]
+        outputs[int(user_id)] = dict(candidates)
+    return outputs
 
 
 def _normalize_route_scores(
@@ -602,10 +703,9 @@ def _compute_incremental_route_recalls(
 
 
 
-def _allocate_route_quotas(
+def _allocate_route_weights(
     route_order: list[str],
     route_recalls: dict[str, float],
-    topk: int,
     effective_routes: list[str] | None = None,
 ):
     route_rank = {route: idx for idx, route in enumerate(route_order)}
@@ -620,63 +720,77 @@ def _allocate_route_quotas(
         raw_weights = {route: 1.0 if route == fallback_route else 0.0 for route in available_routes}
         total_weight = 1.0
     normalized_weights = {route: (weight / total_weight if total_weight > 0 else 0.0) for route, weight in raw_weights.items()}
-
-    fractional_quotas = {route: normalized_weights[route] * topk for route in available_routes}
-    quotas = {route: int(np.floor(value)) for route, value in fractional_quotas.items()}
-    assigned = sum(quotas.values())
-    remainders = sorted(
-        ((fractional_quotas[route] - quotas[route], route_rank[route], route) for route in available_routes),
-        key=lambda x: (-x[0], x[1]),
-    )
-    for _, _, route in remainders[: max(topk - assigned, 0)]:
-        quotas[route] += 1
-
     prioritized_routes = sorted(
         available_routes,
         key=lambda route: (-normalized_weights[route], route_rank[route]),
     )
     rounded_weights = {route: round(normalized_weights[route], 6) for route in prioritized_routes}
-    ordered_quotas = {route: int(quotas.get(route, 0)) for route in prioritized_routes}
-    return ordered_quotas, rounded_weights, prioritized_routes
+    return rounded_weights, prioritized_routes
 
 
 
-def _quota_candidates(route_candidate_lists: dict[str, list[tuple[int, float]]], prioritized_routes: list[str], route_quotas: dict[str, int], topk: int):
-    selected = []
-    selected_items = set()
-    indices = {route: 0 for route in prioritized_routes}
+def _clip_route_weights(
+    route_order: list[str],
+    route_weights: dict[str, float],
+    effective_routes: list[str] | None = None,
+    min_weight: float = MIN_ROUTE_WEIGHT,
+    max_weight: float = MAX_ROUTE_WEIGHT,
+) -> dict[str, float]:
+    effective_set = set(effective_routes or route_order)
+    available_routes = [route for route in route_order if route in route_weights and route in effective_set]
+    if not available_routes:
+        available_routes = [route for route in route_order if route in route_weights]
+    if not available_routes:
+        return {}
+
+    positive_weights = [float(route_weights.get(route, 0.0)) for route in available_routes if float(route_weights.get(route, 0.0)) > 0]
+    if not positive_weights:
+        return {route: 1.0 for route in available_routes}
+
+    mean_weight = float(np.mean(positive_weights))
+    clipped = {}
+    for route in available_routes:
+        relative_weight = float(route_weights.get(route, 0.0)) / mean_weight if mean_weight > 0 else 1.0
+        clipped[route] = round(float(np.clip(relative_weight, min_weight, max_weight)), 6)
+    return clipped
+
+
+
+def _rrf_candidates(
+    route_candidate_lists: dict[str, list[tuple[int, float]]],
+    prioritized_routes: list[str],
+    route_weights: dict[str, float],
+    topk: int,
+    rrf_k: int = RRF_K,
+):
+    fusion_scores = Counter()
+    route_rank = {route: idx for idx, route in enumerate(prioritized_routes)}
+    best_rank = {}
+    best_route = {}
 
     for route in prioritized_routes:
-        quota = int(route_quotas.get(route, 0))
-        taken = 0
-        candidates = route_candidate_lists.get(route, [])
-        while taken < quota and indices[route] < len(candidates) and len(selected) < topk:
-            item_id, score = candidates[indices[route]]
-            indices[route] += 1
-            if int(item_id) in selected_items:
+        weight = float(route_weights.get(route, 0.0))
+        if weight <= 0:
+            continue
+        ranked = sorted(
+            ((int(item_id), float(score)) for item_id, score in route_candidate_lists.get(route, [])),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for rank, (item_id, _) in enumerate(ranked, start=1):
+            if item_id <= 0:
                 continue
-            selected.append((int(item_id), float(score)))
-            selected_items.add(int(item_id))
-            taken += 1
+            fusion_scores[item_id] += weight / float(rrf_k + rank)
+            current_best_rank = best_rank.get(item_id)
+            if current_best_rank is None or rank < current_best_rank:
+                best_rank[item_id] = rank
+                best_route[item_id] = route
 
-    while len(selected) < topk:
-        made_progress = False
-        for route in prioritized_routes:
-            candidates = route_candidate_lists.get(route, [])
-            while indices[route] < len(candidates):
-                item_id, score = candidates[indices[route]]
-                indices[route] += 1
-                if int(item_id) in selected_items:
-                    continue
-                selected.append((int(item_id), float(score)))
-                selected_items.add(int(item_id))
-                made_progress = True
-                break
-            if len(selected) >= topk:
-                break
-        if not made_progress:
-            break
-    return selected
+    ranked_items = sorted(
+        fusion_scores.items(),
+        key=lambda item: (-float(item[1]), best_rank.get(item[0], 0), route_rank.get(best_route.get(item[0], ""), len(route_rank)), item[0]),
+    )
+    return [(int(item_id), float(score)) for item_id, score in ranked_items[:topk]]
 
 
 

@@ -11,11 +11,12 @@ from torch import nn
 
 from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, precision_at_k, recall_at_k, save_metrics
 from offline.evaluate.multi_recall import build_multi_recall_artifacts
-from offline.features.item_batch import ITEM_FEATURE_FIELDS as _ITEM_FEATURE_FIELDS, build_item_batch, item_feature_tensors as to_item_feature_tensors
+from offline.features.item_batch import build_item_batch, item_feature_tensors as to_item_feature_tensors
 from offline.models.item2item import _first_occurrence_mask, _pack_candidate_ids, _valid_candidate_mask, train_item2item_embeddings
 from offline.models.sequence_retrieval import SequenceRetrievalModel, filter_sequence_history
 from offline.models.two_tower import TwoTowerRetrievalModel
-from offline.ranking.protocol import get_all_item_ids, get_item_feature_arrays
+from offline.ranking.protocol import get_item_feature_arrays
+from offline.training.retrieval_common import batch_indices, gradient_norm, load_retrieval_context, rating_weight, slice_train_batch
 from offline.utils.config import resolve_retrieval_config, resolve_retrieval_route_names
 from offline.utils.io import (
     CONFIG_DIR,
@@ -33,7 +34,6 @@ from offline.utils.io import (
     RETRIEVAL_METRICS_PATH,
     RETRIEVAL_MODEL_PATH,
     RETRIEVAL_SAMPLE_PATH,
-    RETRIEVAL_VOCAB_DICT_PATH,
     SEQUENCE_ITEM_EMBEDDINGS_PATH,
     SEQUENCE_MODEL_PATH,
     load_pickle,
@@ -93,76 +93,6 @@ class ItemMemoryQueue:
 
 
 
-def _index_batch_loader(indices, batch_size: int, *, shuffle: bool) -> list[np.ndarray]:
-    index_array = np.asarray(indices, dtype=np.int64)
-    if shuffle:
-        index_array = index_array[np.random.permutation(index_array.shape[0])]
-    return [index_array[start : start + batch_size] for start in range(0, index_array.shape[0], batch_size)]
-
-
-
-def _slice_train_batch(train_data: dict[str, np.ndarray], batch_indices: np.ndarray, device: torch.device) -> dict[str, torch.Tensor]:
-    tensor_specs: dict[str, torch.dtype] = {
-        "user_id": torch.long,
-        "age": torch.long,
-        "gender": torch.long,
-        "occupation": torch.long,
-        "zip_code": torch.long,
-        "hist_movie_id": torch.long,
-        "hist_recency_bucket": torch.long,
-        "hist_rating": torch.float32,
-        "hist_feedback": torch.long,
-        "movie_id": torch.long,
-        "rating": torch.float32,
-        "user_negative_movie_id": torch.long,
-    }
-    batch: dict[str, torch.Tensor] = {}
-    for field, dtype in tensor_specs.items():
-        if field not in train_data:
-            continue
-        batch[field] = torch.from_numpy(np.asarray(train_data[field])[batch_indices]).to(device=device, dtype=dtype)
-    return batch
-
-
-
-
-def _resolve_rating_weighting_settings(settings: dict | None) -> dict[str, float | bool]:
-    source = dict(settings or {})
-    return {
-        "enabled": bool(source.get("rating_weighting_enabled", False)),
-        "neutral": float(source.get("rating_weight_neutral", 3.0)),
-        "scale": float(source.get("rating_weight_scale", 0.25)),
-        "min": float(source.get("rating_weight_min", 0.0)),
-        "max": float(source.get("rating_weight_max", 1.0)),
-    }
-
-
-
-def _rating_weights(values, settings: dict | None) -> np.ndarray:
-    ratings = np.asarray(values, dtype=np.float32)
-    config = _resolve_rating_weighting_settings(settings)
-    if not bool(config["enabled"]):
-        return np.ones_like(ratings, dtype=np.float32)
-    weights = 1.0 + float(config["scale"]) * (ratings - float(config["neutral"]))
-    return np.clip(weights, float(config["min"]), float(config["max"])).astype(np.float32, copy=False)
-
-
-
-def _rating_weight(value: float, settings: dict | None) -> float:
-    return float(_rating_weights(np.asarray([value], dtype=np.float32), settings)[0])
-
-
-
-def _gradient_norm(parameters) -> float:
-    total = 0.0
-    for parameter in parameters:
-        if parameter.grad is None:
-            continue
-        grad_norm = float(parameter.grad.detach().data.norm(2).item())
-        total += grad_norm * grad_norm
-    return total ** 0.5
-
-
 
 def run_retrieval_training(routes=None, warm_start: bool = True, build_multi_recall: bool = False, evaluate: bool = False):
     settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
@@ -194,7 +124,7 @@ def train_retrieval_routes(routes=None, warm_start: bool = True):
     settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
     resolved_config = resolve_retrieval_config(settings)
     selected_routes = resolve_retrieval_route_names(settings, routes)
-    context = _load_retrieval_context(settings, resolved_config)
+    context = load_retrieval_context(settings, resolved_config)
     results: dict[str, dict] = {}
 
     if "two_tower" in selected_routes:
@@ -217,7 +147,7 @@ def train_retrieval_routes(routes=None, warm_start: bool = True):
 def train_two_tower(context=None, warm_start: bool = True):
     if context is None:
         settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
-        context = _load_retrieval_context(settings, resolve_retrieval_config(settings))
+        context = load_retrieval_context(settings, resolve_retrieval_config(settings))
     settings = context["settings"]
     resolved_config = context["resolved_config"]
     two_tower_settings = resolved_config["two_tower_settings"]
@@ -313,10 +243,10 @@ def train_two_tower(context=None, warm_start: bool = True):
         total_grad_norm = 0.0
         grad_norm_steps = 0
         epoch_start = time.perf_counter()
-        train_batches = _index_batch_loader(train_indices, batch_size, shuffle=True)
+        train_batches = batch_indices(train_indices, batch_size, shuffle=True)
 
-        for batch_idx, batch_indices in enumerate(train_batches, start=1):
-            batch_dict = _slice_train_batch(train_data, batch_indices, device)
+        for batch_idx, indices in enumerate(train_batches, start=1):
+            batch_dict = slice_train_batch(train_data, indices, device)
             hist_item_batch = build_item_batch(batch_dict["hist_movie_id"], item_feature_tensors, device)
             batch_dict.update({f"hist_{field}": value for field, value in hist_item_batch.items() if field != "movie_id"})
             batch_dict["item"] = build_item_batch(batch_dict["movie_id"], item_feature_tensors, device)
@@ -354,7 +284,7 @@ def train_two_tower(context=None, warm_start: bool = True):
             loss_tt = torch.nn.functional.cross_entropy(logits_tt, labels_tt)
             loss_tt.backward()
             should_log = batch_idx % log_every_n_batches == 0 or batch_idx == total_batches
-            grad_norm_tt = _gradient_norm(two_tower_model.parameters()) if should_log else 0.0
+            grad_norm_tt = gradient_norm(two_tower_model.parameters()) if should_log else 0.0
             two_tower_optimizer.step()
             tt_queue.push(batch_dict["movie_id"], item_repr_tt)
 
@@ -457,7 +387,7 @@ def train_two_tower(context=None, warm_start: bool = True):
 def train_sequence(context=None, warm_start: bool = True):
     if context is None:
         settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
-        context = _load_retrieval_context(settings, resolve_retrieval_config(settings))
+        context = load_retrieval_context(settings, resolve_retrieval_config(settings))
     settings = context["settings"]
     resolved_config = context["resolved_config"]
     sequence_settings = resolved_config["sequence_settings"]
@@ -539,10 +469,10 @@ def train_sequence(context=None, warm_start: bool = True):
         total_seq_loss = 0.0
         seen_positions = 0
         epoch_start = time.perf_counter()
-        train_batches = _index_batch_loader(train_indices, batch_size, shuffle=True) if train_size > 0 else []
+        train_batches = batch_indices(train_indices, batch_size, shuffle=True) if train_size > 0 else []
 
-        for batch_idx, batch_indices in enumerate(train_batches, start=1):
-            batch_dict = _slice_train_batch(train_data, batch_indices, device)
+        for batch_idx, indices in enumerate(train_batches, start=1):
+            batch_dict = slice_train_batch(train_data, indices, device)
             sequence_optimizer.zero_grad()
             loss_seq, supervised_positions = _compute_sequence_loss(
                 sequence_model,
@@ -658,7 +588,7 @@ def train_sequence(context=None, warm_start: bool = True):
 def train_item2item(context=None, warm_start: bool = True):
     if context is None:
         settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
-        context = _load_retrieval_context(settings, resolve_retrieval_config(settings))
+        context = load_retrieval_context(settings, resolve_retrieval_config(settings))
     resolved_config = context["resolved_config"]
     item2item_settings = resolved_config["item2item_settings"]
     if not bool(item2item_settings.get("enabled", True)):
@@ -698,27 +628,61 @@ def train_item2item(context=None, warm_start: bool = True):
 def train_item_cf(context=None):
     if context is None:
         settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
-        context = _load_retrieval_context(settings, resolve_retrieval_config(settings))
-    train_data = dict(context["train_data"])
-    train_data["rating_weighting_settings"] = context["resolved_config"].get("training_settings", {})
-    model = _build_item_cf_model(train_data)
-    save_pickle(model, ITEM_CF_MODEL_PATH)
-    return {"model_path": str(ITEM_CF_MODEL_PATH), "anchor_items": len(model)}
+        context = load_retrieval_context(settings, resolve_retrieval_config(settings))
+    test_data = context["test_data"]
+    logger.info("ItemCF build start | users=%s", len(test_data["user_id"]))
+    transitions = defaultdict(Counter)
+    rating_settings = context["resolved_config"].get("training_settings", {})
+    neutral_rating = float(rating_settings.get("rating_weight_neutral", 3.0))
+    rating_weighting_enabled = bool(rating_settings.get("rating_weighting_enabled", False))
+    hist_ratings = test_data.get("hist_rating")
+    for history, ratings in zip(test_data["hist_movie_id"], hist_ratings, strict=False):
+        valid_history = [int(x) for x in np.asarray(history).reshape(-1) if int(x) > 0]
+        valid_ratings = [float(x) for x in np.asarray(ratings).reshape(-1) if float(x) > 0]
+        if len(valid_history) < 2:
+            continue
+        if len(valid_ratings) < len(valid_history):
+            valid_ratings = [neutral_rating] * (len(valid_history) - len(valid_ratings)) + valid_ratings
+        window_size = 5
+        for target_pos in range(1, len(valid_history)):
+            target_id = int(valid_history[target_pos])
+            target_weight = rating_weight(float(valid_ratings[target_pos]), rating_settings)
+            start_pos = max(0, target_pos - window_size)
+            for source_pos in range(start_pos, target_pos):
+                source_id = int(valid_history[source_pos])
+                distance = target_pos - source_pos
+                source_weight = rating_weight(float(valid_ratings[source_pos]), rating_settings)
+                transitions[source_id][target_id] += float(source_weight * target_weight / max(distance, 1))
+    total_edges = sum(len(counter) for counter in transitions.values())
+    logger.info("ItemCF build done | anchor_items=%s | transition_edges=%s | rating_weighting=%s", len(transitions), total_edges, rating_weighting_enabled)
+    save_pickle(transitions, ITEM_CF_MODEL_PATH)
+    return {"model_path": str(ITEM_CF_MODEL_PATH), "anchor_items": len(transitions)}
 
 
 
 def train_genre(context=None):
     if context is None:
         settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
-        context = _load_retrieval_context(settings, resolve_retrieval_config(settings))
-    genre_to_items = defaultdict(list)
+        context = load_retrieval_context(settings, resolve_retrieval_config(settings))
+    genre_scores = defaultdict(Counter)
     item_features = context["item_feature_arrays"]
     genre_matrix = np.asarray(item_features["genres"], dtype=np.int32)
-    for item_id in context["all_item_ids"].tolist():
-        valid_genres = [int(idx + 1) for idx in np.flatnonzero(genre_matrix[item_id]).tolist()]
-        for genre_id in valid_genres:
-            genre_to_items[int(genre_id)].append(int(item_id))
-    save_pickle(dict(genre_to_items), GENRE_MODEL_PATH)
+    rating_settings = context["resolved_config"].get("training_settings", {})
+    positive_rating_min = float(context["resolved_config"].get("rating_semantics", {}).get("positive_rating_min", 4.0))
+    for history, ratings in zip(context["test_data"]["hist_movie_id"], context["test_data"]["hist_rating"], strict=False):
+        for movie_id, rating in zip(np.asarray(history).reshape(-1), np.asarray(ratings).reshape(-1), strict=False):
+            movie_id = int(movie_id)
+            rating = float(rating)
+            if movie_id <= 0 or movie_id >= genre_matrix.shape[0] or rating < positive_rating_min:
+                continue
+            item_weight = rating_weight(rating, rating_settings)
+            for genre_idx in np.flatnonzero(genre_matrix[movie_id]).tolist():
+                genre_scores[int(genre_idx) + 1][movie_id] += float(item_weight)
+    genre_to_items = {
+        genre_id: [int(item_id) for item_id, _ in counter.most_common()]
+        for genre_id, counter in genre_scores.items()
+    }
+    save_pickle(genre_to_items, GENRE_MODEL_PATH)
     return {"model_path": str(GENRE_MODEL_PATH), "genre_count": len(genre_to_items)}
 
 
@@ -726,8 +690,17 @@ def train_genre(context=None):
 def train_popular(context=None):
     if context is None:
         settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
-        context = _load_retrieval_context(settings, resolve_retrieval_config(settings))
-    popularity = Counter(int(np.asarray(movie_id).reshape(-1)[0]) for movie_id in context["train_data"]["movie_id"])
+        context = load_retrieval_context(settings, resolve_retrieval_config(settings))
+    popularity = Counter()
+    rating_settings = context["resolved_config"].get("training_settings", {})
+    positive_rating_min = float(context["resolved_config"].get("rating_semantics", {}).get("positive_rating_min", 4.0))
+    for history, ratings in zip(context["test_data"]["hist_movie_id"], context["test_data"]["hist_rating"], strict=False):
+        for movie_id, rating in zip(np.asarray(history).reshape(-1), np.asarray(ratings).reshape(-1), strict=False):
+            movie_id = int(movie_id)
+            rating = float(rating)
+            if movie_id <= 0 or rating < positive_rating_min:
+                continue
+            popularity[movie_id] += rating_weight(rating, rating_settings)
     ranked = dict(popularity.most_common(len(popularity)))
     save_pickle(ranked, POPULAR_MODEL_PATH)
     return {"model_path": str(POPULAR_MODEL_PATH), "item_count": len(ranked)}
@@ -805,52 +778,6 @@ def evaluate_retrieval(route: str = "two_tower", topk: int | None = None):
     save_metrics(RETRIEVAL_METRICS_PATH, all_metrics)
     logger.info("Retrieval metrics saved | route=%s | metrics=%s", normalized_route, metrics)
     return metrics
-
-
-
-def _load_retrieval_context(settings: dict, resolved_config: dict) -> dict:
-    train_eval_samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
-    feature_dict = load_pickle(RETRIEVAL_FEATURE_DICT_PATH)
-    vocab_dict = load_pickle(RETRIEVAL_VOCAB_DICT_PATH)
-    item_catalog = load_pickle(ITEM_CATALOG_PATH)
-    item_feature_arrays = get_item_feature_arrays(item_catalog)
-    all_item_ids = get_all_item_ids(item_catalog).astype(np.int64)
-    missing_fields = [field for field in _ITEM_FEATURE_FIELDS[1:] if field not in item_feature_arrays]
-    if missing_fields:
-        raise ValueError(
-            f"Global item catalog is missing item feature fields: {missing_fields}. "
-            f"Run ranking preprocessing to regenerate {ITEM_CATALOG_PATH.name}."
-        )
-    sequence_train_data = train_eval_samples.get("sequence_train", train_eval_samples["train"])
-    required_sequence_fields = [
-        "user_id",
-        "hist_movie_id",
-        "hist_recency_bucket",
-        "hist_feedback",
-        "movie_id",
-        "rating",
-        "user_negative_movie_id",
-    ]
-    missing_sequence_fields = [field for field in required_sequence_fields if field not in sequence_train_data]
-    if missing_sequence_fields:
-        raise ValueError(
-            "Sequence training artifacts use an outdated schema. "
-            f"Missing fields: {missing_sequence_fields}. Run retrieval preprocessing again."
-        )
-    return {
-        "settings": settings,
-        "resolved_config": resolved_config,
-        "train_eval_samples": train_eval_samples,
-        "feature_dict": feature_dict,
-        "vocab_dict": vocab_dict,
-        "item_catalog": item_catalog,
-        "item_feature_arrays": item_feature_arrays,
-        "all_item_ids": all_item_ids,
-        "train_data": train_eval_samples["train"],
-        "sequence_train_data": sequence_train_data,
-        "test_data": train_eval_samples["test"],
-        "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    }
 
 
 
@@ -1083,10 +1010,10 @@ def _evaluate_loss(
         sequence_model.eval()
     total_tt_loss, total_seq_loss = 0.0, 0.0
     total_tt_examples, total_seq_examples = 0, 0
-    eval_batches = _index_batch_loader(eval_indices, batch_size, shuffle=False)
+    eval_batches = batch_indices(eval_indices, batch_size, shuffle=False)
     with torch.no_grad():
         for batch_idx, batch_indices in enumerate(eval_batches, start=1):
-            batch_dict = _slice_train_batch(train_data, batch_indices, device)
+            batch_dict = slice_train_batch(train_data, batch_indices, device)
             if evaluate_two_tower:
                 hist_item_batch = build_item_batch(batch_dict["hist_movie_id"], item_feature_arrays, device)
                 batch_dict.update({f"hist_{field}": value for field, value in hist_item_batch.items() if field != "movie_id"})
@@ -1203,38 +1130,3 @@ def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, de
         metrics[f"hr@{k}"] = hit_rate_at_k(labels, scores, user_ids, k)
         metrics[f"ndcg@{k}"] = ndcg_at_k(labels, scores, user_ids, k)
     return metrics
-
-
-
-def _build_item_cf_model(train_data):
-    logger.info("ItemCF build start | train_samples=%s", len(train_data["movie_id"]))
-    transitions = defaultdict(Counter)
-    rating_settings = _resolve_rating_weighting_settings(train_data.get("rating_weighting_settings"))
-    hist_ratings = train_data.get("hist_rating")
-    target_ratings = train_data.get("rating")
-    hist_recency_buckets = train_data.get("hist_recency_bucket")
-    for idx, (history, target) in enumerate(zip(train_data["hist_movie_id"], train_data["movie_id"])):
-        target_id = int(np.asarray(target).reshape(-1)[0])
-        target_rating = float(np.asarray(target_ratings[idx]).reshape(-1)[0]) if target_ratings is not None else float(rating_settings["neutral"])
-        target_weight = _rating_weight(target_rating, rating_settings)
-        valid_history = [int(x) for x in np.asarray(history).reshape(-1) if int(x) > 0]
-        if not valid_history:
-            continue
-        history_tail = valid_history[-3:]
-        hist_rating_tail = []
-        hist_recency_tail = []
-        if hist_ratings is not None:
-            hist_rating_tail = [float(x) for x in np.asarray(hist_ratings[idx]).reshape(-1) if float(x) > 0][-len(history_tail):]
-        if hist_recency_buckets is not None:
-            hist_recency_tail = [int(x) for x in np.asarray(hist_recency_buckets[idx]).reshape(-1) if int(x) > 0][-len(history_tail):]
-        if len(hist_rating_tail) < len(history_tail):
-            hist_rating_tail = [float(rating_settings["neutral"])] * (len(history_tail) - len(hist_rating_tail)) + hist_rating_tail
-        if len(hist_recency_tail) < len(history_tail):
-            hist_recency_tail = [1] * (len(history_tail) - len(hist_recency_tail)) + hist_recency_tail
-        for movie_id, hist_rating, hist_bucket in zip(history_tail, hist_rating_tail, hist_recency_tail, strict=False):
-            recency_weight = 1.0 / max(int(hist_bucket), 1)
-            edge_weight = _rating_weight(hist_rating, rating_settings) * target_weight * recency_weight
-            transitions[movie_id][target_id] += float(edge_weight)
-    total_edges = sum(len(counter) for counter in transitions.values())
-    logger.info("ItemCF build done | anchor_items=%s | transition_edges=%s | rating_weighting=%s", len(transitions), total_edges, bool(rating_settings["enabled"]))
-    return transitions

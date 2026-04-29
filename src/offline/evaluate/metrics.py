@@ -9,7 +9,12 @@ import numpy as np
 def _binary_logloss(labels: np.ndarray, scores: np.ndarray) -> float:
     labels = np.asarray(labels, dtype=np.float64)
     scores = np.asarray(scores, dtype=np.float64)
-    clipped = np.clip(scores, 1e-6, 1 - 1e-6)
+    probabilities = np.empty_like(scores, dtype=np.float64)
+    positive_mask = scores >= 0
+    probabilities[positive_mask] = 1.0 / (1.0 + np.exp(-scores[positive_mask]))
+    exp_scores = np.exp(scores[~positive_mask])
+    probabilities[~positive_mask] = exp_scores / (1.0 + exp_scores)
+    clipped = np.clip(probabilities, 1e-6, 1 - 1e-6)
     losses = -(labels * np.log(clipped) + (1.0 - labels) * np.log(1.0 - clipped))
     return float(np.mean(losses)) if losses.size > 0 else 0.0
 

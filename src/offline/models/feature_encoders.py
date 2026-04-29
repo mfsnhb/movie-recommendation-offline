@@ -62,7 +62,7 @@ class MovieFeatureEncoder(nn.Module):
             raise ValueError(f"multimodal_table must have shape [num_items, {self.multimodal_dim}]")
         self.register_buffer("multimodal_table", table, persistent=False)
         self.multimodal_projection = build_mlp(self.multimodal_dim, [emb_dim * 2], emb_dim, dropout=dropout)
-        self.multimodal_gate = nn.Parameter(torch.tensor(-4.0))
+        self.multimodal_gate = nn.Parameter(torch.tensor(-2.0))
         self.projection = build_mlp(emb_dim * 6, hidden_dims or [emb_dim * 2], emb_dim, dropout=dropout)
 
     def forward(self, item_batch: dict[str, torch.Tensor]) -> torch.Tensor:

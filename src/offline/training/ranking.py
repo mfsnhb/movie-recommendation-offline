@@ -186,6 +186,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     min_delta = float(training_settings.get("min_delta", 1e-4))
     emb_dim = int(model_settings.get("embedding_dim", 16))
     train_negatives = int(training_settings.get("train_negatives", 7))
+    low_rating_negatives = int(training_settings.get("low_rating_negatives", 0))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader = DataLoader(
@@ -197,6 +198,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             item_features=item_features,
             all_item_ids=all_item_ids,
             num_negatives=train_negatives,
+            low_rating_negatives=low_rating_negatives,
             seed=42,
         ),
     )
@@ -211,7 +213,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     logger.info(
-        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | val_samples=%s | val_users=%s | batch_size=%s | epochs=%s | train_negatives=%s | fused_validation=%s | warm_start=%s",
+        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | val_samples=%s | val_users=%s | batch_size=%s | epochs=%s | train_negatives=%s | low_rating_negatives=%s | fused_validation=%s | warm_start=%s",
         model_name,
         ranking_samples.get("protocol", "unknown"),
         device,
@@ -221,6 +223,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
         batch_size,
         epochs,
         train_negatives,
+        low_rating_negatives,
         bool(fused_candidates_by_user),
         warm_start,
     )

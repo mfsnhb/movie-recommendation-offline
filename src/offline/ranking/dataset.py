@@ -71,6 +71,7 @@ class SequenceRankingTrainCollator:
     item_features: dict[str, np.ndarray]
     all_item_ids: np.ndarray
     num_negatives: int
+    low_rating_negatives: int = 0
     seed: int = 42
 
     def __post_init__(self) -> None:
@@ -95,17 +96,54 @@ class SequenceRankingTrainCollator:
             _fill_context_slots(batch, item_features=self.item_features, row_idx=row_idx)
             positive_ids[row_idx] = int(sample["target_movie_id"])
 
+        low_rating_negative_ids = _sample_low_rating_negative_ids(
+            context_movie_ids=batch["context_movie_id"],
+            context_low_rating_mask=batch["context_low_rating_mask"],
+            positive_ids=positive_ids,
+            count=min(max(int(self.low_rating_negatives), 0), self.num_negatives),
+            rng=self.rng,
+        )
+        random_negative_count = max(self.num_negatives - low_rating_negative_ids.shape[1], 0)
         negative_ids = _sample_batch_negative_ids(
             all_item_ids=self.all_item_ids,
             item_id_positions=self.item_id_positions,
             context_movie_ids=batch["context_movie_id"],
             positive_ids=positive_ids,
-            count=self.num_negatives,
+            count=random_negative_count,
             rng=self.rng,
+            extra_blocked_ids=low_rating_negative_ids,
         )
-        candidate_ids = np.concatenate([positive_ids.reshape(-1, 1), negative_ids], axis=1)
+        candidate_ids = np.concatenate([positive_ids.reshape(-1, 1), low_rating_negative_ids, negative_ids], axis=1)
         _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=self.item_features)
         return _numpy_batch_to_torch(batch)
+
+
+def _sample_low_rating_negative_ids(
+    context_movie_ids: np.ndarray,
+    context_low_rating_mask: np.ndarray,
+    positive_ids: np.ndarray,
+    count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    batch_size = int(positive_ids.shape[0])
+    if count <= 0:
+        return np.zeros((batch_size, 0), dtype=np.int32)
+
+    negatives = np.zeros((batch_size, count), dtype=np.int32)
+    for row_idx in range(batch_size):
+        candidates = context_movie_ids[row_idx][context_low_rating_mask[row_idx] > 0]
+        candidates = candidates[(candidates > 0) & (candidates != positive_ids[row_idx])]
+        if candidates.size == 0:
+            continue
+        unique_candidates = np.unique(candidates.astype(np.int32, copy=False))
+        take = min(count, int(unique_candidates.size))
+        if take < unique_candidates.size:
+            selected = rng.choice(unique_candidates, size=take, replace=False).astype(np.int32, copy=False)
+        else:
+            selected = unique_candidates[-take:]
+        negatives[row_idx, :take] = selected
+    return negatives
+
 
 
 def _sample_batch_negative_ids(
@@ -115,6 +153,7 @@ def _sample_batch_negative_ids(
     positive_ids: np.ndarray,
     count: int,
     rng: np.random.Generator,
+    extra_blocked_ids: np.ndarray | None = None,
 ) -> np.ndarray:
     batch_size = int(positive_ids.shape[0])
     if count <= 0:
@@ -124,6 +163,8 @@ def _sample_batch_negative_ids(
 
     scores = rng.random((batch_size, all_item_ids.size), dtype=np.float32)
     blocked_ids = np.concatenate([context_movie_ids.astype(np.int32, copy=False), positive_ids.reshape(-1, 1)], axis=1)
+    if extra_blocked_ids is not None and extra_blocked_ids.size > 0:
+        blocked_ids = np.concatenate([blocked_ids, extra_blocked_ids.astype(np.int32, copy=False)], axis=1)
     flat_blocked = blocked_ids.reshape(-1)
     flat_rows = np.repeat(np.arange(batch_size, dtype=np.int64), blocked_ids.shape[1])
     valid_blocked = (flat_blocked > 0) & (flat_blocked < item_id_positions.shape[0])
