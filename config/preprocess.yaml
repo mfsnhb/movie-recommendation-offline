@@ -9,3 +9,9 @@ ranking:
   max_seq_len: 100
   positive_rating_min: 4.0
   negative_rating_max: 2.0
+
+multimodal:
+  model_name: ViT-L-14
+  pretrained: openai
+  batch_size: 128
+  device: auto

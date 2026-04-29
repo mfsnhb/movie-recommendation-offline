@@ -1,7 +1,7 @@
 common:
   training:
     batch_size: 768
-    epochs: 5
+    epochs: 10
     learning_rate: 0.0005
     weight_decay: 1.0e-5
     log_every_n_batches: 100
@@ -25,12 +25,11 @@ common:
     topk: 200
   multi_recall:
     enabled: true
-    fusion_mode: item_cf_first
-    item_cf_min_quota_ratio: 0.6
     routes:
       - two_tower
       - sequence
       - item_cf
+      - multimodal
       - genre
       - popular
 

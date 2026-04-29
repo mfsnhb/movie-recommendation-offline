@@ -15,10 +15,11 @@ class DeepFMModel(nn.Module):
         dnn_hidden_dims: list[int] | None = None,
         dropout: float = 0.1,
         history_fields: list[str] | None = None,
+        multimodal_table=None,
     ):
         super().__init__()
         del fields, history_fields
-        self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
+        self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
         self.user_encoder = UserFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
         self.movie_linear = nn.Embedding(feature_dict["movie_id"], 1, padding_idx=0)
         self.dnn = build_mlp(emb_dim * 3, dnn_hidden_dims or [128, 64], 1, dropout=dropout)
@@ -32,6 +33,7 @@ class DeepFMModel(nn.Module):
             "isAdult": batch["candidate_isAdult"],
             "startYear": batch["candidate_startYear"],
             "popularity": batch["candidate_popularity"],
+            "averageRating": batch["candidate_averageRating"],
         })
         context_movie = self.movie_encoder({
             "movie_id": batch["context_movie_id"],
@@ -39,6 +41,7 @@ class DeepFMModel(nn.Module):
             "isAdult": batch["context_isAdult"],
             "startYear": batch["context_startYear"],
             "popularity": batch["context_popularity"],
+            "averageRating": batch["context_averageRating"],
         })
         history_mask = batch["context_movie_id"].gt(0)
         if "context_low_rating_mask" in batch:

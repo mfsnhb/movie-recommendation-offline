@@ -67,11 +67,12 @@ class SequenceRetrievalModel(nn.Module):
         num_layers: int = 1,
         max_len: int = 10,
         dropout: float = 0.1,
+        multimodal_table=None,
     ):
         super().__init__()
         self.max_len = max_len
         self.hidden_dim = int(hidden_dim or emb_dim)
-        self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
+        self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
         self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(
             input_size=emb_dim,
@@ -108,6 +109,7 @@ class SequenceRetrievalModel(nn.Module):
             "isAdult": _left_align_by_order(hist_item_features["isAdult"], order, counts),
             "startYear": _left_align_by_order(hist_item_features["startYear"], order, counts),
             "popularity": _left_align_by_order(hist_item_features["popularity"], order, counts),
+            "averageRating": _left_align_by_order(hist_item_features["averageRating"], order, counts),
         }
         compact_mask = compact_movie_ids.gt(0)
         lengths = compact_mask.sum(dim=1).cpu()

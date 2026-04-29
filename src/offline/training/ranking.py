@@ -109,8 +109,8 @@ def evaluate_ranking_model(model_name: str) -> dict:
     final_topk = int(resolved_config["evaluation_settings"].get("final_topk", 20))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(get_ranking_model_path(normalized_model_name), map_location=device)
-    model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim).to(device)
-    model.load_state_dict(checkpoint["state_dict"], strict=False)
+    model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim, item_features).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
     metrics = _evaluate_fused_candidates_subset(
         model,
         ranking_samples["test"],
@@ -143,8 +143,8 @@ def evaluate_final_ranking(model_name: str) -> dict:
     emb_dim = int(model_settings.get("embedding_dim", 16))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(get_ranking_model_path(normalized_model_name), map_location=device)
-    model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim).to(device)
-    model.load_state_dict(checkpoint["state_dict"], strict=False)
+    model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim, item_features).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
     final_metrics = _evaluate_final_candidates(model, ranking_samples, item_features, all_item_ids, device, final_topk)
 
     save_metrics(final_metrics_path, final_metrics)
@@ -192,7 +192,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
         train_subset,
         batch_size=batch_size,
         shuffle=True,
-        pin_memory=device.type == "cuda",
+        pin_memory=False,
         collate_fn=SequenceRankingTrainCollator(
             item_features=item_features,
             all_item_ids=all_item_ids,
@@ -201,12 +201,12 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
         ),
     )
 
-    model = _build_model(model_name, feature_dict, model_settings, emb_dim).to(device)
+    model = _build_model(model_name, feature_dict, model_settings, emb_dim, item_features).to(device)
     ranking_model_path = get_ranking_model_path(model_name)
     ranking_model_config_path = get_ranking_model_config_path(model_name)
     if warm_start and ranking_model_path.exists():
         checkpoint = torch.load(ranking_model_path, map_location=device)
-        model.load_state_dict(checkpoint["state_dict"], strict=False)
+        model.load_state_dict(checkpoint["state_dict"])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
@@ -401,7 +401,8 @@ def _split_latest_user_validation_indices(
 
 
 
-def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_dim: int):
+def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_dim: int, item_features: dict[str, np.ndarray]):
+    multimodal_table = item_features["multimodal_embedding"]
     if model_name == "deepfm":
         scorer = DeepFMModel(
             feature_dict,
@@ -410,6 +411,7 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
             dnn_hidden_dims=model_settings.get("dnn_hidden_dims"),
             dropout=float(model_settings.get("dropout", 0.1)),
             history_fields=POINTWISE_SEQUENCE_FIELDS,
+            multimodal_table=multimodal_table,
         )
         return scorer
 
@@ -421,6 +423,7 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
             dnn_hidden_dims=model_settings.get("dnn_hidden_dims"),
             attention_hidden_dims=model_settings.get("attention_hidden_dims"),
             dropout=float(model_settings.get("dropout", 0.1)),
+            multimodal_table=multimodal_table,
         )
         return scorer
 

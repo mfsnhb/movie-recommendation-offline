@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, Counter
+import json
 import time
 
 import numpy as np
@@ -10,6 +11,7 @@ from torch import nn
 
 from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, precision_at_k, recall_at_k, save_metrics
 from offline.evaluate.multi_recall import build_multi_recall_artifacts
+from offline.features.item_batch import ITEM_FEATURE_FIELDS as _ITEM_FEATURE_FIELDS, build_item_batch, item_feature_tensors as to_item_feature_tensors
 from offline.models.item2item import _first_occurrence_mask, _pack_candidate_ids, _valid_candidate_mask, train_item2item_embeddings
 from offline.models.sequence_retrieval import SequenceRetrievalModel, filter_sequence_history
 from offline.models.two_tower import TwoTowerRetrievalModel
@@ -42,7 +44,6 @@ from offline.utils.logging import format_eta, get_logger
 
 
 logger = get_logger("offline.training.retrieval")
-_ITEM_FEATURE_FIELDS = ["movie_id", "genres", "isAdult", "startYear", "popularity"]
 
 
 
@@ -124,23 +125,6 @@ def _slice_train_batch(train_data: dict[str, np.ndarray], batch_indices: np.ndar
 
 
 
-def _load_compatible_state_dict(model: nn.Module, state_dict: dict, *, model_name: str) -> None:
-    current_state = model.state_dict()
-    compatible_state = {
-        key: value
-        for key, value in state_dict.items()
-        if key in current_state and tuple(current_state[key].shape) == tuple(value.shape)
-    }
-    skipped_keys = sorted(set(state_dict) - set(compatible_state))
-    if skipped_keys:
-        logger.info(
-            "%s warm start skipped incompatible params | skipped=%s",
-            model_name,
-            skipped_keys,
-        )
-    model.load_state_dict(compatible_state, strict=False)
-
-
 
 def _resolve_rating_weighting_settings(settings: dict | None) -> dict[str, float | bool]:
     source = dict(settings or {})
@@ -187,7 +171,11 @@ def run_retrieval_training(routes=None, warm_start: bool = True, build_multi_rec
     result: dict[str, object] = {"trained_routes": selected_routes, "artifacts": artifacts}
 
     if evaluate and any(route in selected_routes for route in ("two_tower", "sequence")):
-        metrics = evaluate_retrieval()
+        metrics = {
+            route: evaluate_retrieval(route=route)
+            for route in selected_routes
+            if route in {"two_tower", "sequence"}
+        }
         result["retrieval"] = metrics
 
     if build_multi_recall:
@@ -257,7 +245,7 @@ def train_two_tower(context=None, warm_start: bool = True):
     two_tower_temperature = float(training_settings.get("two_tower_temperature", 0.05))
 
     device = context["device"]
-    item_feature_tensors = _item_feature_tensors(item_feature_arrays, device)
+    item_feature_tensors = to_item_feature_tensors(item_feature_arrays, device)
     all_item_id_tensor = torch.as_tensor(all_item_ids, dtype=torch.long, device=device)
     two_tower_model = TwoTowerRetrievalModel(
         feature_dict,
@@ -272,11 +260,12 @@ def train_two_tower(context=None, warm_start: bool = True):
         rating_weight_max=float(training_settings.get("rating_weight_max", 1.0)),
         short_history_length=int(two_tower_settings.get("short_history_length", 10)),
         positive_rating_min=float(training_settings.get("positive_rating_min", 4.0)),
+        multimodal_table=item_feature_arrays["multimodal_embedding"],
     ).to(device)
 
     if warm_start and RETRIEVAL_MODEL_PATH.exists():
         retrieval_checkpoint = torch.load(RETRIEVAL_MODEL_PATH, map_location=device)
-        _load_compatible_state_dict(two_tower_model, retrieval_checkpoint["state_dict"], model_name="TwoTowerRetrievalModel")
+        two_tower_model.load_state_dict(retrieval_checkpoint["state_dict"])
 
     two_tower_optimizer = torch.optim.Adam(two_tower_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
@@ -328,9 +317,9 @@ def train_two_tower(context=None, warm_start: bool = True):
 
         for batch_idx, batch_indices in enumerate(train_batches, start=1):
             batch_dict = _slice_train_batch(train_data, batch_indices, device)
-            hist_item_batch = _build_item_batch(batch_dict["hist_movie_id"], item_feature_tensors, device)
+            hist_item_batch = build_item_batch(batch_dict["hist_movie_id"], item_feature_tensors, device)
             batch_dict.update({f"hist_{field}": value for field, value in hist_item_batch.items() if field != "movie_id"})
-            batch_dict["item"] = _build_item_batch(batch_dict["movie_id"], item_feature_tensors, device)
+            batch_dict["item"] = build_item_batch(batch_dict["movie_id"], item_feature_tensors, device)
 
             two_tower_optimizer.zero_grad()
             user_repr_tt = two_tower_model.encode_user(batch_dict)
@@ -344,7 +333,7 @@ def train_two_tower(context=None, warm_start: bool = True):
                     all_item_ids=all_item_id_tensor,
                     num_negatives=two_tower_num_sampled_negatives,
                 )
-                sampled_negative_batch = _build_item_batch(sampled_negative_ids.reshape(-1), item_feature_tensors, device)
+                sampled_negative_batch = build_item_batch(sampled_negative_ids.reshape(-1), item_feature_tensors, device)
                 sampled_negative_repr = two_tower_model.encode_item(sampled_negative_batch).reshape(
                     sampled_negative_ids.size(0),
                     sampled_negative_ids.size(1),
@@ -495,7 +484,7 @@ def train_sequence(context=None, warm_start: bool = True):
     sequence_history_feedback = str(training_settings.get("sequence_history_feedback", "positive")).strip().lower()
 
     device = context["device"]
-    item_feature_tensors = _item_feature_tensors(item_feature_arrays, device)
+    item_feature_tensors = to_item_feature_tensors(item_feature_arrays, device)
     all_item_id_tensor = torch.as_tensor(all_item_ids, dtype=torch.long, device=device)
     sequence_model = SequenceRetrievalModel(
         feature_dict,
@@ -504,11 +493,12 @@ def train_sequence(context=None, warm_start: bool = True):
         num_layers=int(sequence_settings.get("num_layers", 1)),
         max_len=int(sequence_settings.get("max_len", 10)),
         dropout=float(sequence_settings.get("dropout", 0.1)),
+        multimodal_table=item_feature_arrays["multimodal_embedding"],
     ).to(device)
 
     if warm_start and SEQUENCE_MODEL_PATH.exists():
         sequence_checkpoint = torch.load(SEQUENCE_MODEL_PATH, map_location=device)
-        _load_compatible_state_dict(sequence_model, sequence_checkpoint["state_dict"], model_name="SequenceRetrievalModel")
+        sequence_model.load_state_dict(sequence_checkpoint["state_dict"])
 
     sequence_optimizer = torch.optim.Adam(sequence_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
@@ -771,6 +761,8 @@ def evaluate_retrieval(route: str = "two_tower", topk: int | None = None):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model_settings = checkpoint.get("model_settings", {})
     training_settings = checkpoint.get("training_settings", {})
+    item_catalog = load_pickle(ITEM_CATALOG_PATH)
+    item_feature_arrays = get_item_feature_arrays(item_catalog)
     if normalized_route == "two_tower":
         model = model_cls(
             feature_dict,
@@ -785,6 +777,7 @@ def evaluate_retrieval(route: str = "two_tower", topk: int | None = None):
             rating_weight_max=float(training_settings.get("rating_weight_max", 1.0)),
             short_history_length=int(model_settings.get("short_history_length", 10)),
             positive_rating_min=float(training_settings.get("positive_rating_min", 4.0)),
+            multimodal_table=item_feature_arrays["multimodal_embedding"],
         ).to(device)
     else:
         model = model_cls(
@@ -794,17 +787,22 @@ def evaluate_retrieval(route: str = "two_tower", topk: int | None = None):
             num_layers=int(model_settings.get("num_layers", 1)),
             max_len=int(model_settings.get("max_len", model_settings.get("sequence_max_len", 10))),
             dropout=float(model_settings.get("dropout", model_settings.get("sequence_dropout", 0.1))),
+            multimodal_table=item_feature_arrays["multimodal_embedding"],
         ).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
     encoded_movie_ids = np.load(MOVIE_IDS_PATH, mmap_mode="r").astype(np.int64)
     item_embeddings = np.load(embedding_path, mmap_mode="r")
-    item_catalog = load_pickle(ITEM_CATALOG_PATH)
-    item_feature_arrays = get_item_feature_arrays(item_catalog)
     history_feedback = str(training_settings.get("sequence_history_feedback", "positive")).strip().lower()
     metrics = _evaluate_retrieval(model, train_eval_samples["test"], encoded_movie_ids, item_embeddings, device, resolved_topk, route=normalized_route, sequence_history_feedback=history_feedback, item_feature_arrays=item_feature_arrays)
-    save_metrics(RETRIEVAL_METRICS_PATH, metrics)
+    all_metrics = {}
+    if RETRIEVAL_METRICS_PATH.exists():
+        all_metrics = json.loads(RETRIEVAL_METRICS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(all_metrics, dict):
+        all_metrics = {}
+    all_metrics[normalized_route] = metrics
+    save_metrics(RETRIEVAL_METRICS_PATH, all_metrics)
     logger.info("Retrieval metrics saved | route=%s | metrics=%s", normalized_route, metrics)
     return metrics
 
@@ -856,32 +854,6 @@ def _load_retrieval_context(settings: dict, resolved_config: dict) -> dict:
 
 
 
-def _item_feature_tensors(item_feature_arrays: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
-    return {field: torch.as_tensor(item_feature_arrays[field], dtype=torch.long, device=device) for field in _ITEM_FEATURE_FIELDS[1:]}
-
-
-
-def _build_item_batch(item_ids: torch.Tensor, item_features: dict[str, torch.Tensor] | dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
-    item_ids = item_ids.to(device=device, dtype=torch.long)
-    if isinstance(next(iter(item_features.values())), torch.Tensor):
-        return {
-            "movie_id": item_ids,
-            "genres": item_features["genres"][item_ids],
-            "isAdult": item_features["isAdult"][item_ids],
-            "startYear": item_features["startYear"][item_ids],
-            "popularity": item_features["popularity"][item_ids],
-        }
-    movie_ids = item_ids.detach().cpu().numpy().astype(np.int64, copy=False)
-    return {
-        "movie_id": item_ids,
-        "genres": torch.as_tensor(item_features["genres"][movie_ids], dtype=torch.long, device=device),
-        "isAdult": torch.as_tensor(item_features["isAdult"][movie_ids], dtype=torch.long, device=device),
-        "startYear": torch.as_tensor(item_features["startYear"][movie_ids], dtype=torch.long, device=device),
-        "popularity": torch.as_tensor(item_features["popularity"][movie_ids], dtype=torch.long, device=device),
-    }
-
-
-
 def _export_item_embeddings(
     two_tower_model,
     sequence_model,
@@ -898,7 +870,7 @@ def _export_item_embeddings(
         for start in range(0, len(encoded_movie_ids), max(export_batch_size, 1)):
             batch_ids_np = encoded_movie_ids[start : start + max(export_batch_size, 1)]
             batch_ids = torch.as_tensor(batch_ids_np, dtype=torch.long, device=device)
-            item_batch = _build_item_batch(batch_ids, item_feature_arrays, device)
+            item_batch = build_item_batch(batch_ids, item_feature_arrays, device)
             if export_two_tower:
                 two_tower_chunks.append(two_tower_model.encode_item(item_batch).cpu().numpy())
             if export_sequence:
@@ -1048,7 +1020,7 @@ def _compute_sequence_loss(
         hist_feedback,
         history_feedback,
     )
-    hist_item_features = _build_item_batch(hist_movie_ids, item_feature_tensors, hist_movie_ids.device)
+    hist_item_features = build_item_batch(hist_movie_ids, item_feature_tensors, hist_movie_ids.device)
     hidden_states = sequence_model.encode_user(
         hist_movie_ids,
         hist_recency_bucket,
@@ -1063,8 +1035,8 @@ def _compute_sequence_loss(
         candidate_pools=user_negative_ids,
         candidate_pool_ratio=user_negative_ratio,
     )
-    positive_emb = sequence_model.encode_item(_build_item_batch(positive_ids, item_feature_tensors, positive_ids.device))
-    negative_emb = sequence_model.encode_item(_build_item_batch(negative_ids.reshape(-1), item_feature_tensors, negative_ids.device)).reshape(negative_ids.size(0), negative_ids.size(1), -1)
+    positive_emb = sequence_model.encode_item(build_item_batch(positive_ids, item_feature_tensors, positive_ids.device))
+    negative_emb = sequence_model.encode_item(build_item_batch(negative_ids.reshape(-1), item_feature_tensors, negative_ids.device)).reshape(negative_ids.size(0), negative_ids.size(1), -1)
     positive_logits = (hidden_states * positive_emb).sum(dim=1)
     negative_logits = torch.einsum("bd,bnd->bn", hidden_states, negative_emb)
     negative_mask = negative_ids.gt(0)
@@ -1116,9 +1088,9 @@ def _evaluate_loss(
         for batch_idx, batch_indices in enumerate(eval_batches, start=1):
             batch_dict = _slice_train_batch(train_data, batch_indices, device)
             if evaluate_two_tower:
-                hist_item_batch = _build_item_batch(batch_dict["hist_movie_id"], item_feature_arrays, device)
+                hist_item_batch = build_item_batch(batch_dict["hist_movie_id"], item_feature_arrays, device)
                 batch_dict.update({f"hist_{field}": value for field, value in hist_item_batch.items() if field != "movie_id"})
-                batch_dict["item"] = _build_item_batch(batch_dict["movie_id"], item_feature_arrays, device)
+                batch_dict["item"] = build_item_batch(batch_dict["movie_id"], item_feature_arrays, device)
             loss_tt = torch.tensor(0.0, device=device)
             loss_seq = torch.tensor(0.0, device=device)
             if evaluate_two_tower:
@@ -1182,7 +1154,7 @@ def _evaluate_loss(
 def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, device: torch.device, topk: int, route: str = "two_tower", sequence_history_feedback: str = "positive", item_feature_arrays: dict[str, np.ndarray] | None = None) -> dict:
     labels, scores, user_ids = [], [], []
     item_embeddings = np.asarray(item_embeddings)
-    item_feature_tensors = _item_feature_tensors(item_feature_arrays, device) if item_feature_arrays is not None else None
+    item_feature_tensors = to_item_feature_tensors(item_feature_arrays, device) if item_feature_arrays is not None else None
     with torch.no_grad():
         for idx, user_id in enumerate(test_data["user_id"]):
             batch = {
@@ -1203,7 +1175,7 @@ def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, de
                     batch["hist_feedback"],
                     sequence_history_feedback,
                 )
-                hist_item_features = _build_item_batch(hist_movie_ids, item_feature_tensors, device)
+                hist_item_features = build_item_batch(hist_movie_ids, item_feature_tensors, device)
                 user_embedding = model.encode_user(
                     hist_movie_ids,
                     hist_recency_bucket,
@@ -1211,7 +1183,7 @@ def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, de
                     {field: value for field, value in hist_item_features.items() if field != "movie_id"},
                 ).cpu().numpy()[0]
             else:
-                hist_item_batch = _build_item_batch(batch["hist_movie_id"], item_feature_tensors, device)
+                hist_item_batch = build_item_batch(batch["hist_movie_id"], item_feature_tensors, device)
                 batch.update({f"hist_{field}": value for field, value in hist_item_batch.items() if field != "movie_id"})
                 user_embedding = model.encode_user(batch).cpu().numpy()[0]
             candidate_scores = item_embeddings @ user_embedding

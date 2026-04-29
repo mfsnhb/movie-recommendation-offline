@@ -4,12 +4,14 @@ import numpy as np
 
 
 STATIC_USER_FIELDS = ["user_id", "gender", "age", "occupation", "zip_code"]
-POINTWISE_ITEM_FIELDS = ["movie_id", "genres", "isAdult", "startYear", "popularity"]
+POINTWISE_ITEM_FIELDS = ["movie_id", "genres", "isAdult", "startYear", "popularity", "averageRating"]
 POINTWISE_SEQUENCE_FIELDS = ["context_movie_id"]
 
 CONTEXT_FIELDS = ["context_movie_id", "context_rating", "context_low_rating_mask", "context_length"]
-CANDIDATE_FIELDS = ["candidate_movie_id", "candidate_genres", "candidate_isAdult", "candidate_startYear", "candidate_popularity"]
-ITEM_FEATURE_FIELDS = ["genres", "isAdult", "startYear", "popularity"]
+CANDIDATE_FIELDS = ["candidate_movie_id", "candidate_genres", "candidate_isAdult", "candidate_startYear", "candidate_popularity", "candidate_averageRating"]
+SPARSE_ITEM_FEATURE_FIELDS = ["genres", "isAdult", "startYear", "popularity", "averageRating"]
+DENSE_ITEM_FEATURE_FIELDS = ["multimodal_embedding"]
+ITEM_FEATURE_FIELDS = SPARSE_ITEM_FEATURE_FIELDS + DENSE_ITEM_FEATURE_FIELDS
 
 
 def _as_int_array(value) -> np.ndarray:
@@ -20,36 +22,19 @@ def _as_int_array(value) -> np.ndarray:
 
 def get_item_feature_arrays(source: dict) -> dict[str, np.ndarray]:
     if all(field in source for field in ITEM_FEATURE_FIELDS):
-        return {field: np.asarray(source[field], dtype=np.int32) for field in ITEM_FEATURE_FIELDS}
+        result = {field: np.asarray(source[field], dtype=np.int32) for field in SPARSE_ITEM_FEATURE_FIELDS}
+        result.update({field: np.asarray(source[field], dtype=np.float32) for field in DENSE_ITEM_FEATURE_FIELDS})
+        return result
 
     item_features = source.get("item_features")
-    if item_features is not None:
-        return {field: np.asarray(item_features[field], dtype=np.int32) for field in ITEM_FEATURE_FIELDS}
-
-    item_lookup = {}
-    for split_name in ("train", "test"):
-        split = source.get(split_name, {})
-        if "target_movie_id" not in split:
-            continue
-        for idx, movie_id in enumerate(np.asarray(split["target_movie_id"]).tolist()):
-            encoded_movie_id = int(movie_id)
-            if encoded_movie_id <= 0 or encoded_movie_id in item_lookup:
-                continue
-            item_lookup[encoded_movie_id] = {
-                "genres": np.zeros(1, dtype=np.int32),
-                "isAdult": 0,
-                "startYear": 0,
-                "popularity": 0,
-            }
-
-    max_movie_id = max(item_lookup) if item_lookup else 0
-    arrays = {
-        "genres": np.zeros((max_movie_id + 1, 1), dtype=np.int32),
-        "isAdult": np.zeros(max_movie_id + 1, dtype=np.int32),
-        "startYear": np.zeros(max_movie_id + 1, dtype=np.int32),
-        "popularity": np.zeros(max_movie_id + 1, dtype=np.int32),
-    }
-    return arrays
+    if item_features is None:
+        raise ValueError("Item catalog must contain item_features")
+    missing_fields = [field for field in ITEM_FEATURE_FIELDS if field not in item_features]
+    if missing_fields:
+        raise ValueError(f"Item catalog is missing item feature fields: {missing_fields}")
+    result = {field: np.asarray(item_features[field], dtype=np.int32) for field in SPARSE_ITEM_FEATURE_FIELDS}
+    result.update({field: np.asarray(item_features[field], dtype=np.float32) for field in DENSE_ITEM_FEATURE_FIELDS})
+    return result
 
 
 def get_all_item_ids(source: dict) -> np.ndarray:

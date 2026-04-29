@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 
-RETRIEVAL_ROUTE_NAMES = ("two_tower", "sequence", "item2item", "item_cf", "genre", "popular")
+RETRIEVAL_ROUTE_NAMES = ("two_tower", "sequence", "item2item", "item_cf", "multimodal", "genre", "popular")
 RANKING_MODEL_NAMES = ("deepfm", "din")
 
 

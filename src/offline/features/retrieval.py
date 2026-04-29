@@ -10,6 +10,7 @@ from offline.data.loaders import load_raw_data
 from offline.utils.io import (
     CONFIG_DIR,
     MOVIE_RAW_IDS_PATH,
+    OPENCLIP_PREPROCESS_META_PATH,
     RETRIEVAL_FEATURE_DICT_PATH,
     RETRIEVAL_PREPROCESS_META_PATH,
     RETRIEVAL_SAMPLE_PATH,
@@ -23,18 +24,19 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.retrieval")
-_PREPROCESS_VERSION = 11
+_PREPROCESS_VERSION = 14
 _SEQUENCE_TRAIN_SCHEMA = "prefix_expanded_v1"
 _RECENCY_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
 _RECENCY_BUCKET_BOUNDARIES_SECONDS = np.asarray(_RECENCY_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
 _RECENCY_BUCKET_COUNT = len(_RECENCY_BUCKET_BOUNDARIES_DAYS) + 2
 _POPULARITY_BUCKET_COUNT = 10
+_AVERAGE_RATING_BUCKET_COUNT = 5
 
 
 
 def process_features(df_movies, df_ratings, df_users):
     user_columns = ["user_id", "gender", "age", "occupation", "zip_code"]
-    movie_columns = ["movie_id", "genres", "isAdult", "startYear"]
+    movie_columns = ["movie_id", "genres", "isAdult", "startYear", "averageRating"]
     ratings_columns = ["user_id", "movie_id", "rating", "timestamp"]
 
     df_users = df_users[user_columns]
@@ -42,6 +44,9 @@ def process_features(df_movies, df_ratings, df_users):
     df_movies["genres"] = df_movies["genres"].str.split("|")
     df_movies["isAdult"] = df_movies["isAdult"].fillna(False).astype(str)
     df_movies["startYear"] = df_movies["startYear"].replace("\\N", 0).fillna(0).astype(str)
+    average_rating_raw = df_movies["averageRating"].astype(float).fillna(0).clip(0, 10)
+    df_movies["averageRating"] = np.ceil(average_rating_raw / 2.0).astype(np.int32)
+    df_movies["averageRating"] = df_movies["averageRating"].astype(str)
     df_ratings = df_ratings[ratings_columns].copy()
     df_ratings["rating"] = df_ratings["rating"].astype(np.float32)
 
@@ -65,10 +70,14 @@ def process_features(df_movies, df_ratings, df_users):
             new_movie_feature_df[feat_name] = new_movie_feature_df[feat_name].apply(
                 lambda values: (label_encoder.transform(values) + 1).astype(np.int32)
             )
+            movie_vocab[feat_name] = label_encoder.classes_
+        elif feat_name == "averageRating":
+            new_movie_feature_df[feat_name + "_encode"] = new_movie_feature_df[feat_name].astype(np.int32)
+            movie_vocab[feat_name] = np.arange(1, _AVERAGE_RATING_BUCKET_COUNT + 1, dtype=np.int32)
         else:
             encoded = label_encoder.fit_transform(new_movie_feature_df[feat_name]) + 1
             new_movie_feature_df[feat_name + "_encode"] = encoded.astype(np.int32)
-        movie_vocab[feat_name] = label_encoder.classes_
+            movie_vocab[feat_name] = label_encoder.classes_
 
     df_merged = df_ratings.merge(new_user_feature_df, on="user_id", how="left")
     df_merged = df_merged.merge(new_movie_feature_df, on="movie_id", how="left")
@@ -339,7 +348,12 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
 
 
 
-def _build_preprocess_meta(max_seq_len: int, positive_rating_min: float, negative_rating_max: float, sequence_negative_pool_size: int) -> dict:
+def _multimodal_embedding_dim() -> int:
+    meta = yaml.safe_load(OPENCLIP_PREPROCESS_META_PATH.read_text(encoding="utf-8")) or {}
+    return int(meta["embedding_dim"])
+
+
+def _build_preprocess_meta(max_seq_len: int, positive_rating_min: float, negative_rating_max: float, sequence_negative_pool_size: int, multimodal_embedding_dim: int) -> dict:
     return {
         "version": _PREPROCESS_VERSION,
         "sequence_train_schema": _SEQUENCE_TRAIN_SCHEMA,
@@ -347,13 +361,15 @@ def _build_preprocess_meta(max_seq_len: int, positive_rating_min: float, negativ
         "positive_rating_min": float(positive_rating_min),
         "negative_rating_max": float(negative_rating_max),
         "sequence_negative_pool_size": int(sequence_negative_pool_size),
+        "rating_scale": "five_point",
         "recency_bucket_boundaries_days": list(_RECENCY_BUCKET_BOUNDARIES_DAYS),
         "recency_bucket_count": int(_RECENCY_BUCKET_COUNT),
+        "multimodal_embedding_dim": int(multimodal_embedding_dim),
     }
 
 
 
-def _can_reuse_cache(max_seq_len: int, positive_rating_min: float, negative_rating_max: float, sequence_negative_pool_size: int) -> bool:
+def _can_reuse_cache(max_seq_len: int, positive_rating_min: float, negative_rating_max: float, sequence_negative_pool_size: int, multimodal_embedding_dim: int) -> bool:
     if not RETRIEVAL_PREPROCESS_META_PATH.exists():
         return False
     if not RETRIEVAL_SAMPLE_PATH.exists() or not RETRIEVAL_FEATURE_DICT_PATH.exists() or not RETRIEVAL_VOCAB_DICT_PATH.exists():
@@ -367,6 +383,7 @@ def _can_reuse_cache(max_seq_len: int, positive_rating_min: float, negative_rati
         positive_rating_min,
         negative_rating_max,
         sequence_negative_pool_size,
+        multimodal_embedding_dim,
     )
 
 
@@ -378,11 +395,13 @@ def run_retrieval_preprocessing():
     positive_rating_min = float(retrieval_settings.get("positive_rating_min", 4.0))
     negative_rating_max = float(retrieval_settings.get("negative_rating_max", 2.0))
     sequence_negative_pool_size = int(retrieval_settings.get("sequence_negative_pool_size", max_seq_len))
+    multimodal_embedding_dim = _multimodal_embedding_dim()
     if _can_reuse_cache(
         max_seq_len,
         positive_rating_min,
         negative_rating_max,
         sequence_negative_pool_size,
+        multimodal_embedding_dim,
     ):
         samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
         feature_dict = load_pickle(RETRIEVAL_FEATURE_DICT_PATH)
@@ -423,6 +442,7 @@ def run_retrieval_preprocessing():
     feature_dict = {k: len(v) + 1 for k, v in vocab_dict.items()}
     feature_dict["hist_recency_bucket"] = _RECENCY_BUCKET_COUNT
     feature_dict["popularity"] = _POPULARITY_BUCKET_COUNT + 1
+    feature_dict["multimodal_embedding_dim"] = multimodal_embedding_dim
     save_pickle(samples, RETRIEVAL_SAMPLE_PATH)
     save_pickle(vocab_dict, RETRIEVAL_VOCAB_DICT_PATH)
     save_pickle(feature_dict, RETRIEVAL_FEATURE_DICT_PATH)
@@ -432,6 +452,7 @@ def run_retrieval_preprocessing():
             positive_rating_min,
             negative_rating_max,
             sequence_negative_pool_size,
+            multimodal_embedding_dim,
         ),
         RETRIEVAL_PREPROCESS_META_PATH,
     )

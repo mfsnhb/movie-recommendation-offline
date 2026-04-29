@@ -37,10 +37,11 @@ class DINModel(nn.Module):
         dnn_hidden_dims: list[int] | None = None,
         attention_hidden_dims: list[int] | None = None,
         dropout: float = 0.1,
+        multimodal_table=None,
     ):
         super().__init__()
         del fields
-        self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
+        self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
         self.user_encoder = UserFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
         self.attention = AttentionPooling(emb_dim, attention_hidden_dims, dropout)
         self.interaction = build_mlp(emb_dim * 4, [emb_dim * 2], emb_dim, dropout=dropout)
@@ -55,6 +56,7 @@ class DINModel(nn.Module):
             "isAdult": batch["candidate_isAdult"],
             "startYear": batch["candidate_startYear"],
             "popularity": batch["candidate_popularity"],
+            "averageRating": batch["candidate_averageRating"],
         })
         context_movie_id = batch["context_movie_id"]
         context_movie = self.movie_encoder({
@@ -63,6 +65,7 @@ class DINModel(nn.Module):
             "isAdult": batch["context_isAdult"],
             "startYear": batch["context_startYear"],
             "popularity": batch["context_popularity"],
+            "averageRating": batch["context_averageRating"],
         })
         history_mask = context_movie_id.gt(0)
         if "context_low_rating_mask" in batch:

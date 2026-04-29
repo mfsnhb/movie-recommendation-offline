@@ -4,17 +4,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-try:
-    import torch
-    from torch.utils.data import Dataset
-except ModuleNotFoundError:  # pragma: no cover - preprocessing can run without torch installed
-    torch = None
+import torch
+from torch.utils.data import Dataset
 
-    class Dataset:  # type: ignore[override]
-        pass
-
-
-from offline.ranking.protocol import CANDIDATE_FIELDS, CONTEXT_FIELDS, ITEM_FEATURE_FIELDS, STATIC_USER_FIELDS, extract_split_sample
+from offline.ranking.protocol import CANDIDATE_FIELDS, CONTEXT_FIELDS, SPARSE_ITEM_FEATURE_FIELDS, STATIC_USER_FIELDS, extract_split_sample
 
 
 class SequenceRankingDataset(Dataset):
@@ -30,8 +23,6 @@ class SequenceRankingDataset(Dataset):
 
 
 def batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
-    if torch is None:
-        raise ModuleNotFoundError("torch is required for ranking training")
     return {field: value.to(device, non_blocking=True) for field, value in batch.items()}
 
 
@@ -40,9 +31,6 @@ def build_inference_batch(
     candidate_movie_ids: list[np.ndarray | list[int]],
     item_features: dict[str, np.ndarray],
 ) -> tuple[dict[str, torch.Tensor] | None, list[list[int]], list[int]]:
-    if torch is None:
-        raise ModuleNotFoundError("torch is required for ranking inference")
-
     valid_samples: list[dict] = []
     valid_candidates_by_sample: list[list[int]] = []
     valid_indices: list[int] = []
@@ -87,7 +75,7 @@ class SequenceRankingTrainCollator:
 
     def __post_init__(self) -> None:
         self.all_item_ids = np.asarray(self.all_item_ids, dtype=np.int32)
-        self.item_features = {field: np.asarray(values, dtype=np.int32) for field, values in self.item_features.items()}
+        self.item_features = {field: np.asarray(self.item_features[field], dtype=np.int32) for field in SPARSE_ITEM_FEATURE_FIELDS}
         max_item_id = int(self.all_item_ids.max()) if self.all_item_ids.size else 0
         self.item_id_positions = np.full(max_item_id + 1, -1, dtype=np.int32)
         if self.all_item_ids.size:
@@ -165,14 +153,15 @@ def _init_batch_arrays(batch_size: int, context_width: int, candidate_size: int,
         else:
             batch[field] = np.zeros((batch_size, context_width), dtype=np.int32)
     batch["context_genres"] = np.zeros((batch_size, context_width, genre_count), dtype=np.int32)
-    for field in ITEM_FEATURE_FIELDS:
+    for field in SPARSE_ITEM_FEATURE_FIELDS:
         if field != "genres":
             batch[f"context_{field}"] = np.zeros((batch_size, context_width), dtype=np.int32)
     batch["target_index"] = np.zeros(batch_size, dtype=np.int64)
     batch["target_rating"] = np.zeros(batch_size, dtype=np.float32)
     batch["candidate_mask"] = np.zeros((batch_size, candidate_size), dtype=bool)
     for field in CANDIDATE_FIELDS:
-        if field == "candidate_genres":
+        source_field = field.removeprefix("candidate_")
+        if source_field == "genres":
             batch[field] = np.zeros((batch_size, candidate_size, genre_count), dtype=np.int32)
         else:
             batch[field] = np.zeros((batch_size, candidate_size), dtype=np.int32)
@@ -196,9 +185,9 @@ def _fill_context_slots(batch: dict[str, np.ndarray], item_features: dict[str, n
     valid_mask = (context_ids > 0) & (context_ids < item_features["genres"].shape[0])
     safe_context_ids = np.where(valid_mask, context_ids, 0).astype(np.int32, copy=False)
     batch["context_genres"][row_idx] = item_features["genres"][safe_context_ids]
-    batch["context_isAdult"][row_idx] = item_features["isAdult"][safe_context_ids]
-    batch["context_startYear"][row_idx] = item_features["startYear"][safe_context_ids]
-    batch["context_popularity"][row_idx] = item_features["popularity"][safe_context_ids]
+    for field in SPARSE_ITEM_FEATURE_FIELDS:
+        if field != "genres":
+            batch[f"context_{field}"][row_idx] = item_features[field][safe_context_ids]
 
 
 def _fill_candidate_slots(
@@ -215,16 +204,14 @@ def _fill_candidate_slots(
     batch["candidate_mask"][:, :candidate_size] = valid_mask
     batch["candidate_movie_id"][:, :candidate_size] = safe_candidate_ids
     batch["candidate_genres"][:, :candidate_size] = item_features["genres"][safe_candidate_ids]
-    batch["candidate_isAdult"][:, :candidate_size] = item_features["isAdult"][safe_candidate_ids]
-    batch["candidate_startYear"][:, :candidate_size] = item_features["startYear"][safe_candidate_ids]
-    batch["candidate_popularity"][:, :candidate_size] = item_features["popularity"][safe_candidate_ids]
+    for field in SPARSE_ITEM_FEATURE_FIELDS:
+        if field != "genres":
+            batch[f"candidate_{field}"][:, :candidate_size] = item_features[field][safe_candidate_ids]
     batch["candidate_relevance"][:, :candidate_size] = 0.0
     batch["candidate_relevance"][:, 0] = batch["target_rating"]
 
 
 def _numpy_batch_to_torch(batch: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
-    if torch is None:
-        raise ModuleNotFoundError("torch is required for ranking training")
     result = {}
     for field, values in batch.items():
         if field == "candidate_mask":

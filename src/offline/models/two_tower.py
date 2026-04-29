@@ -21,6 +21,7 @@ class TwoTowerRetrievalModel(nn.Module):
         rating_weight_max: float = 1.0,
         short_history_length: int = 10,
         positive_rating_min: float = 4.0,
+        multimodal_table=None,
     ):
         super().__init__()
         self.movie_encoder = MovieFeatureEncoder(
@@ -29,6 +30,7 @@ class TwoTowerRetrievalModel(nn.Module):
             hidden_dims=item_hidden_dims,
             dropout=dropout,
             output_norm=False,
+            multimodal_table=multimodal_table,
         )
         self.user_encoder = UserFeatureEncoder(
             feature_dict,
@@ -52,6 +54,7 @@ class TwoTowerRetrievalModel(nn.Module):
             "isAdult": batch["hist_isAdult"],
             "startYear": batch["hist_startYear"],
             "popularity": batch["hist_popularity"],
+            "averageRating": batch["hist_averageRating"],
         })
         history_mask = batch["hist_movie_id"].gt(0)
         user_repr = self.user_encoder(batch, history_movie_embeddings, history_mask)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -42,6 +43,7 @@ class MovieFeatureEncoder(nn.Module):
         hidden_dims: list[int] | None = None,
         dropout: float = 0.1,
         output_norm: bool = False,
+        multimodal_table: np.ndarray | torch.Tensor | None = None,
     ):
         super().__init__()
         self.output_norm = bool(output_norm)
@@ -50,17 +52,31 @@ class MovieFeatureEncoder(nn.Module):
         self.is_adult_emb = nn.Embedding(feature_dict["isAdult"], emb_dim, padding_idx=0)
         self.start_year_emb = nn.Embedding(feature_dict["startYear"], emb_dim, padding_idx=0)
         self.popularity_emb = nn.Embedding(feature_dict["popularity"], emb_dim, padding_idx=0)
-        self.projection = build_mlp(emb_dim * 5, hidden_dims or [emb_dim * 2], emb_dim, dropout=dropout)
+        self.average_rating_emb = nn.Embedding(feature_dict["averageRating"], emb_dim, padding_idx=0)
+        self.multimodal_dim = int(feature_dict["multimodal_embedding_dim"])
+        if multimodal_table is None:
+            table = torch.zeros((int(feature_dict["movie_id"]), self.multimodal_dim), dtype=torch.float32)
+        else:
+            table = torch.as_tensor(multimodal_table, dtype=torch.float32)
+        if table.ndim != 2 or table.size(1) != self.multimodal_dim:
+            raise ValueError(f"multimodal_table must have shape [num_items, {self.multimodal_dim}]")
+        self.register_buffer("multimodal_table", table, persistent=False)
+        self.multimodal_projection = build_mlp(self.multimodal_dim, [emb_dim * 2], emb_dim, dropout=dropout)
+        self.multimodal_gate = nn.Parameter(torch.tensor(-4.0))
+        self.projection = build_mlp(emb_dim * 6, hidden_dims or [emb_dim * 2], emb_dim, dropout=dropout)
 
     def forward(self, item_batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        parts = [
+        structured_parts = [
             self.movie_emb(item_batch["movie_id"].long()),
             self.genre_pool(item_batch["genres"].long()),
             self.is_adult_emb(item_batch["isAdult"].long()),
             self.start_year_emb(item_batch["startYear"].long()),
             self.popularity_emb(item_batch["popularity"].long()),
+            self.average_rating_emb(item_batch["averageRating"].long()),
         ]
-        output = self.projection(torch.cat(parts, dim=-1))
+        output = self.projection(torch.cat(structured_parts, dim=-1))
+        multimodal = self.multimodal_table[item_batch["movie_id"].long().clamp(min=0, max=self.multimodal_table.size(0) - 1)]
+        output = output + torch.sigmoid(self.multimodal_gate) * self.multimodal_projection(multimodal)
         if self.output_norm:
             output = torch.nn.functional.normalize(output, dim=-1)
         return output

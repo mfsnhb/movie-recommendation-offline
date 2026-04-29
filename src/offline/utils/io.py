@@ -13,11 +13,12 @@ DATA_DIR = PROJECT_ROOT / "data"
 RAW_DATA_DIR = DATA_DIR / "raw" / "funrec-movielens-1m"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 PROCESSED_DIR = OUTPUTS_DIR / "processed"
+MULTIMODAL_DIR = PROCESSED_DIR / "multimodal"
 MODELS_DIR = OUTPUTS_DIR / "models"
 METRICS_DIR = OUTPUTS_DIR / "metrics"
 LOGS_DIR = OUTPUTS_DIR / "logs"
 
-for path in (PROCESSED_DIR, MODELS_DIR, METRICS_DIR, LOGS_DIR):
+for path in (PROCESSED_DIR, MULTIMODAL_DIR, MODELS_DIR, METRICS_DIR, LOGS_DIR):
     path.mkdir(parents=True, exist_ok=True)
 
 
@@ -31,6 +32,9 @@ MOVIE_IDS_PATH = PROCESSED_DIR / "movie_ids.npy"
 MOVIE_RAW_IDS_PATH = PROCESSED_DIR / "movie_raw_ids.npy"
 MULTI_RECALL_ARTIFACTS_PATH = PROCESSED_DIR / "multi_recall_artifacts.pkl"
 ITEM_CATALOG_PATH = PROCESSED_DIR / "item_catalog.pkl"
+OPENCLIP_ITEM_EMBEDDINGS_PATH = MULTIMODAL_DIR / "openclip_vit_l14_item_embeddings.npy"
+OPENCLIP_MOVIE_IDS_PATH = MULTIMODAL_DIR / "openclip_vit_l14_movie_ids.npy"
+OPENCLIP_PREPROCESS_META_PATH = MULTIMODAL_DIR / "openclip_vit_l14_meta.json"
 ITEM2ITEM_ITEM_EMBEDDINGS_PATH = PROCESSED_DIR / "item2item_item_embeddings.npy"
 ITEM2ITEM_MOVIE_IDS_PATH = PROCESSED_DIR / "item2item_movie_ids.npy"
 ITEM_CF_MODEL_PATH = MODELS_DIR / "item_cf_model.pkl"

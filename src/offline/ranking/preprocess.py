@@ -6,6 +6,7 @@ import yaml
 from sklearn.preprocessing import LabelEncoder
 
 from offline.data.loaders import load_raw_data
+from offline.features.multimodal import build_or_load_multimodal_embeddings, resolve_multimodal_settings
 from offline.utils.io import (
     CONFIG_DIR,
     ITEM_CATALOG_PATH,
@@ -18,9 +19,10 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.ranking")
-_SAMPLE_PROTOCOL = "prefix_positive_targets_v5"
+_SAMPLE_PROTOCOL = "prefix_positive_targets_v6"
 _ID_DTYPE = np.uint16
 _POPULARITY_BUCKET_COUNT = 10
+_AVERAGE_RATING_BUCKET_COUNT = 5
 
 
 def process_features_for_ranking(df_movies, df_ratings, df_users):
@@ -28,12 +30,14 @@ def process_features_for_ranking(df_movies, df_ratings, df_users):
     ratings_columns = ["user_id", "movie_id", "rating", "timestamp"]
 
     df_users = df_users[user_columns].copy()
-    df_movies = df_movies[["movie_id", "genres", "isAdult", "startYear"]].copy()
+    df_movies = df_movies[["movie_id", "genres", "isAdult", "startYear", "averageRating"]].copy()
     df_movies["genres_raw"] = df_movies["genres"].fillna("unknown").astype(str)
     df_movies["genre_tokens"] = df_movies["genres_raw"].str.split("|")
     df_movies["isAdult"] = df_movies["isAdult"].fillna(False)
     df_movies["startYear_raw"] = pd.to_numeric(df_movies["startYear"], errors="coerce").fillna(0).astype(np.float32)
     df_movies["startYear"] = df_movies["startYear_raw"].astype(np.int32)
+    df_movies["averageRating_raw"] = pd.to_numeric(df_movies["averageRating"], errors="coerce").fillna(0).clip(0, 10).astype(np.float32)
+    df_movies["averageRating"] = np.ceil(df_movies["averageRating_raw"] / 2.0).astype(np.int32)
     df_ratings = df_ratings[ratings_columns].copy()
     df_ratings["timestamp"] = df_ratings["timestamp"].astype(np.int64)
 
@@ -57,6 +61,8 @@ def process_features_for_ranking(df_movies, df_ratings, df_users):
     genre_token_map = exploded_genres.groupby("movie_id", sort=False)["genre_token_encoded"].apply(list).to_dict()
     df_movies["genre_tokens_encoded"] = df_movies["movie_id"].map(lambda movie_id: genre_token_map.get(movie_id, [])).apply(lambda values: [int(v) for v in values])
     movie_vocab["genres"] = genre_token_encoder.classes_
+    df_movies["averageRating_encoded"] = df_movies["averageRating"].astype(np.int32)
+    movie_vocab["averageRating"] = np.arange(1, _AVERAGE_RATING_BUCKET_COUNT + 1, dtype=np.int32)
 
     df_merged = df_ratings.merge(
         df_users[["user_id", "user_id_encoded", "gender_encoded", "age_encoded", "occupation_encoded", "zip_code_encoded"]],
@@ -64,7 +70,7 @@ def process_features_for_ranking(df_movies, df_ratings, df_users):
         how="left",
     )
     df_merged = df_merged.merge(
-        df_movies[["movie_id", "movie_id_encoded", "isAdult_encoded", "startYear_encoded", "startYear_raw", "genre_tokens_encoded"]],
+        df_movies[["movie_id", "movie_id_encoded", "isAdult_encoded", "startYear_encoded", "averageRating_encoded", "startYear_raw", "averageRating_raw", "genre_tokens_encoded"]],
         on="movie_id",
         how="left",
     )
@@ -78,12 +84,14 @@ def process_features_for_ranking(df_movies, df_ratings, df_users):
             "movie_id_encoded": "movie_id_enc",
             "isAdult_encoded": "isAdult",
             "startYear_encoded": "startYear",
+            "averageRating_encoded": "averageRating",
         }
     )
     df_merged["user_id_original"] = df_merged["user_id"].astype(np.int32)
     df_merged["user_id"] = df_merged["user_id_enc"].astype(np.int32)
     df_merged["movie_id"] = df_merged["movie_id_enc"].astype(np.int32)
     df_merged["startYear_raw"] = df_merged["startYear_raw"].astype(np.float32)
+    df_merged["averageRating_raw"] = df_merged["averageRating_raw"].astype(np.float32)
     return df_merged, user_vocab, movie_vocab
 
 
@@ -187,9 +195,11 @@ def _build_item_feature_arrays(df_merged: pd.DataFrame, total_item_count: int, i
         "isAdult": np.zeros(total_item_count + 1, dtype=np.int32),
         "startYear": np.zeros(total_item_count + 1, dtype=np.int32),
         "startYear_raw": np.zeros(total_item_count + 1, dtype=np.float32),
+        "averageRating": np.zeros(total_item_count + 1, dtype=np.int32),
+        "averageRating_raw": np.zeros(total_item_count + 1, dtype=np.float32),
         "popularity": _popularity_buckets(np.zeros(total_item_count + 1, dtype=np.int64) if item_popularity is None else item_popularity),
     }
-    deduped = df_merged[["movie_id", "isAdult", "startYear", "startYear_raw", "genre_tokens_encoded"]].drop_duplicates(subset=["movie_id"])
+    deduped = df_merged[["movie_id", "isAdult", "startYear", "startYear_raw", "averageRating", "averageRating_raw", "genre_tokens_encoded"]].drop_duplicates(subset=["movie_id"])
     for row in deduped.itertuples(index=False):
         movie_id = int(row.movie_id)
         genre_tokens = np.asarray(list(row.genre_tokens_encoded) if row.genre_tokens_encoded is not None else [], dtype=np.int32)
@@ -198,6 +208,8 @@ def _build_item_feature_arrays(df_merged: pd.DataFrame, total_item_count: int, i
         item_features["isAdult"][movie_id] = int(row.isAdult)
         item_features["startYear"][movie_id] = int(row.startYear)
         item_features["startYear_raw"][movie_id] = np.float32(row.startYear_raw)
+        item_features["averageRating"][movie_id] = int(row.averageRating)
+        item_features["averageRating_raw"][movie_id] = np.float32(row.averageRating_raw)
     return item_features
 
 
@@ -290,10 +302,16 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
     }
 
 
-def build_item_catalog(df_merged: pd.DataFrame, total_item_count: int, item_popularity: np.ndarray) -> dict:
+def build_item_catalog(
+    df_merged: pd.DataFrame,
+    total_item_count: int,
+    item_popularity: np.ndarray,
+    multimodal_embedding: np.ndarray,
+) -> dict:
     item_features = _build_item_feature_arrays(df_merged, total_item_count=total_item_count, item_popularity=item_popularity)
+    item_features["multimodal_embedding"] = np.asarray(multimodal_embedding, dtype=np.float32)
     return {
-        "protocol": "item_catalog_v3",
+        "protocol": "item_catalog_v4",
         "all_item_ids": np.arange(1, total_item_count + 1, dtype=np.int32),
         "item_features": item_features,
     }
@@ -302,6 +320,7 @@ def build_item_catalog(df_merged: pd.DataFrame, total_item_count: int, item_popu
 def run_ranking_preprocessing():
     settings = yaml.safe_load((CONFIG_DIR / "preprocess.yaml").read_text(encoding="utf-8")) or {}
     ranking_settings = settings.get("ranking", {})
+    multimodal_settings = resolve_multimodal_settings(settings.get("multimodal", {}))
     max_seq_len = int(ranking_settings.get("max_seq_len", settings.get("retrieval", {}).get("max_seq_len", 10)))
     negative_rating_max = float(ranking_settings.get("negative_rating_max", settings.get("retrieval", {}).get("negative_rating_max", 2.0)))
     positive_rating_min = float(ranking_settings.get("positive_rating_min", settings.get("retrieval", {}).get("positive_rating_min", 4.0)))
@@ -319,6 +338,7 @@ def run_ranking_preprocessing():
     logger.info("Ranking feature processing done | merged_rows=%s", len(df_merged))
 
     total_item_count = len(movie_vocab["movie_id"])
+    multimodal_artifacts = build_or_load_multimodal_embeddings(df_movies, movie_vocab, multimodal_settings)
     samples = build_prefix_train_eval_samples(
         df_merged,
         total_item_count=total_item_count,
@@ -326,11 +346,17 @@ def run_ranking_preprocessing():
         negative_rating_max=negative_rating_max,
         positive_rating_min=positive_rating_min,
     )
-    item_catalog = build_item_catalog(df_merged, total_item_count=total_item_count, item_popularity=samples["item_popularity"])
+    item_catalog = build_item_catalog(
+        df_merged,
+        total_item_count=total_item_count,
+        item_popularity=samples["item_popularity"],
+        multimodal_embedding=multimodal_artifacts.embeddings,
+    )
 
     vocab_dict = {**user_vocab, **movie_vocab}
     vocab_dict["popularity"] = np.arange(_POPULARITY_BUCKET_COUNT, dtype=np.int32)
     feature_dict = {key: len(values) + 1 for key, values in vocab_dict.items()}
+    feature_dict["multimodal_embedding_dim"] = int(multimodal_artifacts.embeddings.shape[1])
 
     save_pickle(samples, RANKING_SAMPLE_PATH)
     save_pickle(item_catalog, ITEM_CATALOG_PATH)

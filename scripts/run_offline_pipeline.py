@@ -63,8 +63,8 @@ if __name__ == "__main__":
     steps = [step.strip() for step in args.steps.split(",") if step.strip()]
     if "all" in steps:
         steps = [
-            "retrieval_preprocess",
             "ranking_preprocess",
+            "retrieval_preprocess",
             "retrieval_train",
             "retrieval_evaluate",
             "multi_recall_build",
