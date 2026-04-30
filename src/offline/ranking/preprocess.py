@@ -23,6 +23,7 @@ _SAMPLE_PROTOCOL = "prefix_positive_targets_v7"
 _ID_DTYPE = np.uint16
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
+_RECENCY_BUCKET_COUNT = 20
 
 
 def process_features_for_ranking(df_movies, df_ratings, df_users):
@@ -106,6 +107,7 @@ def _allocate_split_arrays(sample_count: int, max_seq_len: int) -> dict[str, np.
         "context_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "context_rating": np.zeros((sample_count, max_seq_len), dtype=np.float32),
         "context_low_rating_mask": np.zeros((sample_count, max_seq_len), dtype=np.float32),
+        "context_recency_bucket": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "context_length": np.zeros(sample_count, dtype=_ID_DTYPE),
         "target_movie_id": np.zeros(sample_count, dtype=_ID_DTYPE),
         "target_rating": np.zeros(sample_count, dtype=np.float32),
@@ -136,6 +138,12 @@ def _build_low_rating_mask(values: list[float], width: int, negative_rating_max:
     return mask
 
 
+def _build_recency_buckets(values: list[int], width: int) -> np.ndarray:
+    length = min(len(values), width)
+    buckets = np.zeros(width, dtype=_ID_DTYPE)
+    if length > 0:
+        buckets[-length:] = np.minimum(np.arange(length, 0, -1, dtype=np.int32), _RECENCY_BUCKET_COUNT).astype(_ID_DTYPE)
+    return buckets
 
 def _write_sample_row(
     store: dict[str, np.ndarray],
@@ -158,9 +166,11 @@ def _write_sample_row(
     store["context_movie_id"][row_idx].fill(0)
     store["context_rating"][row_idx].fill(0.0)
     store["context_low_rating_mask"][row_idx].fill(0.0)
+    store["context_recency_bucket"][row_idx].fill(0)
     context_length = _fill_padded_row(store["context_movie_id"][row_idx], context_movies)
     _fill_padded_float_row(store["context_rating"][row_idx], context_ratings)
     store["context_low_rating_mask"][row_idx] = _build_low_rating_mask(context_ratings, store["context_low_rating_mask"][row_idx].shape[0], negative_rating_max)
+    store["context_recency_bucket"][row_idx] = _build_recency_buckets(context_movies, store["context_recency_bucket"][row_idx].shape[0])
     store["context_length"][row_idx] = context_length
     store["target_movie_id"][row_idx] = target_movie_id
     store["target_rating"][row_idx] = np.float32(target_rating)
@@ -375,6 +385,7 @@ def run_ranking_preprocessing():
 
     vocab_dict = {**user_vocab, **movie_vocab}
     vocab_dict["popularity"] = np.arange(_POPULARITY_BUCKET_COUNT, dtype=np.int32)
+    vocab_dict["recency_bucket"] = np.arange(1, _RECENCY_BUCKET_COUNT + 1, dtype=np.int32)
     feature_dict = {key: len(values) + 1 for key, values in vocab_dict.items()}
     feature_dict["multimodal_embedding_dim"] = int(multimodal_artifacts.embeddings.shape[1])
 

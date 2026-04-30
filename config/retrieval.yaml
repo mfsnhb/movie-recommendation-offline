@@ -10,9 +10,7 @@ common:
     negative_sampling: mixed
     hard_negative_queue_size: 4096
     hard_negative_topk: 32
-    two_tower_num_sampled_negatives: 64
     export_batch_size: 4096
-    two_tower_temperature: 0.05
     rating_weighting_enabled: false
     rating_weight_neutral: 3.0
     rating_weight_scale: 0.25
@@ -40,6 +38,10 @@ models:
       user_hidden_dims: [256, 128]
       item_hidden_dims: [256, 128]
       dropout: 0.1
+      recent_history_length: 20
+    training:
+      two_tower_num_sampled_negatives: 64
+      two_tower_temperature: 0.05
 
   sequence:
     architecture:

@@ -110,7 +110,8 @@ def evaluate_ranking_model(model_name: str) -> dict:
     item_catalog = load_pickle(ITEM_CATALOG_PATH)
     item_features = get_item_feature_arrays(item_catalog)
     all_item_ids = get_all_item_ids(item_catalog)
-    fused_candidates_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
+    fused_candidates_by_user, fused_scores_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
+    del fused_scores_by_user
     if not fused_candidates_by_user:
         raise FileNotFoundError("Missing fused multi-recall candidates for ranking evaluation")
 
@@ -180,7 +181,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     validation_data = ranking_samples.get("validation")
     if validation_data is None:
         raise ValueError("Ranking samples must contain an explicit validation split")
-    fused_candidates_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
+    fused_candidates_by_user, fused_scores_by_user = _resolve_ranking_user_candidate_pool(ranking_samples)
 
     batch_size = int(training_settings.get("batch_size", 256))
     epochs = int(training_settings.get("epochs", 3))
@@ -202,7 +203,11 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             item_features=item_features,
             all_item_ids=all_item_ids,
             num_negatives=train_negatives,
-            low_rating_negatives=int(training_settings.get("low_rating_negatives", 0)),
+            low_rating_negatives=int(training_settings.get("low_rating_negatives", 5)),
+            recall_hard_negatives=int(training_settings.get("recall_hard_negatives", 10)),
+            random_negatives=int(training_settings.get("random_negatives", max(train_negatives - int(training_settings.get("low_rating_negatives", 5)) - int(training_settings.get("recall_hard_negatives", 10)), 0))),
+            fused_candidates_by_user=fused_candidates_by_user,
+            fused_scores_by_user=fused_scores_by_user,
             seed=42,
         ),
     )
@@ -217,7 +222,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     logger.info(
-        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | validation_samples=%s | validation_users=%s | batch_size=%s | epochs=%s | train_negatives=%s | low_rating_negatives=%s | validation_negatives=%s | warm_start=%s",
+        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | validation_samples=%s | validation_users=%s | batch_size=%s | epochs=%s | train_negatives=%s | low_rating_negatives=%s | recall_hard_negatives=%s | random_negatives=%s | validation_negatives=%s | warm_start=%s",
         model_name,
         ranking_samples.get("protocol", "unknown"),
         device,
@@ -227,7 +232,9 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
         batch_size,
         epochs,
         train_negatives,
-        int(training_settings.get("low_rating_negatives", 0)),
+        int(training_settings.get("low_rating_negatives", 5)),
+        int(training_settings.get("recall_hard_negatives", 10)),
+        int(training_settings.get("random_negatives", max(train_negatives - int(training_settings.get("low_rating_negatives", 5)) - int(training_settings.get("recall_hard_negatives", 10)), 0))),
         int(training_settings.get("validation_negatives", 1000)),
         warm_start,
     )
@@ -287,6 +294,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             negative_count=int(training_settings.get("validation_negatives", 1000)),
             max_users=int(training_settings.get("validation_max_users", _DEFAULT_MAX_VALIDATION_USERS)),
             fused_candidates_by_user=fused_candidates_by_user,
+            fused_scores_by_user=fused_scores_by_user,
         )
         val_ndcg20 = float(val_metrics.get("ndcg@20", float("-inf")))
 
@@ -349,22 +357,28 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
 
 
 
-def _build_fused_candidates_by_user() -> dict[int, np.ndarray] | None:
+def _build_fused_candidates_by_user() -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]] | tuple[None, None]:
     if not MULTI_RECALL_ARTIFACTS_PATH.exists():
-        return None
+        return None, None
     artifacts = load_pickle(MULTI_RECALL_ARTIFACTS_PATH)
     user_ids = np.asarray(artifacts.get("user_ids", []), dtype=np.int32)
     fused_candidates = artifacts.get("fused_candidates", []) or []
+    fused_scores = artifacts.get("fused_scores", []) or []
     if user_ids.size == 0 or not fused_candidates:
-        return None
-    return {
+        return None, None
+    candidates_by_user = {
         int(user_id): np.asarray(candidate_ids, dtype=np.int32)
         for user_id, candidate_ids in zip(user_ids.tolist(), fused_candidates, strict=False)
     }
+    scores_by_user = {
+        int(user_id): np.asarray(scores, dtype=np.float32)
+        for user_id, scores in zip(user_ids.tolist(), fused_scores, strict=False)
+    }
+    return candidates_by_user, scores_by_user
 
 
 
-def _resolve_ranking_user_candidate_pool(ranking_samples: dict) -> dict[int, np.ndarray] | None:
+def _resolve_ranking_user_candidate_pool(ranking_samples: dict) -> tuple[dict[int, np.ndarray] | None, dict[int, np.ndarray] | None]:
     del ranking_samples
     return _build_fused_candidates_by_user()
 
@@ -394,6 +408,8 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
             attention_hidden_dims=model_settings.get("attention_hidden_dims"),
             dropout=float(model_settings.get("dropout", 0.1)),
             multimodal_table=multimodal_table,
+            positive_rating_min=float(model_settings.get("positive_rating_min", 4.0)),
+            negative_rating_max=float(model_settings.get("negative_rating_max", 2.0)),
         )
         return scorer
 
@@ -431,6 +447,7 @@ def _evaluate_hard_negative_validation(
     negative_count: int,
     max_users: int,
     fused_candidates_by_user: dict[int, np.ndarray] | None = None,
+    fused_scores_by_user: dict[int, np.ndarray] | None = None,
 ) -> dict:
     sample_count = int(len(split_data["user_id"]))
     if max_users > 0:
@@ -452,6 +469,8 @@ def _evaluate_hard_negative_validation(
             batch_indices = sample_indices[start : start + _RANKING_INFERENCE_BATCH_SIZE]
             samples = []
             candidate_pools = []
+            candidate_rank_pools = []
+            candidate_score_pools = []
             for sample_idx in batch_indices:
                 sample = extract_split_sample(split_data, sample_idx)
                 target = int(sample["target_movie_id"])
@@ -459,21 +478,24 @@ def _evaluate_hard_negative_validation(
                 seen_ids = set(int(item_id) for item_id in np.asarray(sample.get("context_movie_id", []), dtype=np.int32).reshape(-1).tolist() if int(item_id) > 0)
                 seen_ids.discard(target)
                 selected: list[int] = [target] if target > 0 else []
+                selected_ranks: list[float] = [0.0] if target > 0 else []
+                selected_scores: list[float] = [0.0] if target > 0 else []
                 blocked = set(seen_ids)
                 blocked.update(selected)
 
                 hard_pool = None if fused_candidates_by_user is None else fused_candidates_by_user.get(user_id)
+                hard_scores = None if fused_scores_by_user is None else fused_scores_by_user.get(user_id)
                 if hard_pool is not None:
-                    hard_candidates = [
-                        int(item_id)
-                        for item_id in np.asarray(hard_pool, dtype=np.int32).reshape(-1).tolist()
-                        if int(item_id) > 0 and int(item_id) not in blocked
-                    ]
-                    if hard_candidates:
-                        unique_hard = np.asarray(list(dict.fromkeys(hard_candidates)), dtype=np.int32)
-                        take = min(int(unique_hard.size), max(candidate_pool_size - len(selected), 0))
-                        selected.extend(unique_hard[:take].astype(int).tolist())
-                        blocked.update(selected)
+                    for rank_idx, item_id in enumerate(np.asarray(hard_pool, dtype=np.int32).reshape(-1).tolist(), start=1):
+                        item_id = int(item_id)
+                        if item_id <= 0 or item_id in blocked:
+                            continue
+                        selected.append(item_id)
+                        selected_ranks.append(float(rank_idx))
+                        selected_scores.append(float(hard_scores[rank_idx - 1]) if hard_scores is not None and rank_idx - 1 < len(hard_scores) else 0.0)
+                        blocked.add(item_id)
+                        if len(selected) >= candidate_pool_size:
+                            break
 
                 remaining = candidate_pool_size - len(selected)
                 if remaining > 0:
@@ -482,16 +504,26 @@ def _evaluate_hard_negative_validation(
                         take = min(remaining, int(random_pool.size))
                         chosen = rng.choice(random_pool, size=take, replace=False) if take < random_pool.size else random_pool[:take]
                         selected.extend(chosen.astype(int).tolist())
+                        selected_ranks.extend([0.0] * take)
+                        selected_scores.extend([0.0] * take)
 
                 if len(selected) <= 1:
                     continue
                 samples.append(sample)
                 candidate_pools.append(np.asarray(selected, dtype=np.int32))
+                candidate_rank_pools.append(np.asarray(selected_ranks, dtype=np.float32))
+                candidate_score_pools.append(np.asarray(selected_scores, dtype=np.float32))
 
             if not samples:
                 continue
 
-            batch, valid_candidates_by_sample, valid_indices = build_inference_batch(samples, candidate_pools, item_features)
+            batch, valid_candidates_by_sample, valid_indices = build_inference_batch(
+                samples,
+                candidate_pools,
+                item_features,
+                candidate_recall_ranks=candidate_rank_pools,
+                candidate_recall_scores=candidate_score_pools,
+            )
             if batch is None:
                 continue
 
@@ -568,6 +600,8 @@ def _evaluate_fused_candidates_subset(
             batch_indices = sample_indices[start : start + inference_batch_size]
             samples = []
             candidate_pools = []
+            candidate_rank_pools = []
+            candidate_score_pools = []
             for sample_idx in batch_indices:
                 sample = extract_split_sample(split_data, sample_idx)
                 user_id = int(sample["user_id"])
@@ -575,13 +609,24 @@ def _evaluate_fused_candidates_subset(
                 if candidates is None or int(np.asarray(candidates).size) == 0:
                     skipped_missing_candidates += 1
                     continue
+                candidate_array = np.asarray(candidates, dtype=np.int32)
+                scores_array = np.zeros(candidate_array.reshape(-1).shape[0], dtype=np.float32)
+                ranks_array = np.arange(1, scores_array.size + 1, dtype=np.float32)
                 samples.append(sample)
-                candidate_pools.append(np.asarray(candidates, dtype=np.int32))
+                candidate_pools.append(candidate_array)
+                candidate_rank_pools.append(ranks_array)
+                candidate_score_pools.append(scores_array)
 
             if not samples:
                 continue
 
-            batch, valid_candidates_by_sample, valid_indices = build_inference_batch(samples, candidate_pools, item_features)
+            batch, valid_candidates_by_sample, valid_indices = build_inference_batch(
+                samples,
+                candidate_pools,
+                item_features,
+                candidate_recall_ranks=candidate_rank_pools,
+                candidate_recall_scores=candidate_score_pools,
+            )
             if batch is None:
                 continue
 
@@ -643,7 +688,8 @@ def _evaluate_final_candidates(
     device: torch.device,
     final_topk: int,
 ) -> dict:
-    fused_candidates_by_user = _build_fused_candidates_by_user()
+    fused_candidates_by_user, fused_scores_by_user = _build_fused_candidates_by_user()
+    del fused_scores_by_user
     if not fused_candidates_by_user:
         raise FileNotFoundError("Missing fused multi-recall candidates for final evaluation")
     ranking_test = ranking_samples["test"]

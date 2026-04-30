@@ -8,6 +8,11 @@ common:
     min_delta: 1.0e-4
     train_negatives: 15
     low_rating_negatives: 3
+    recall_hard_negatives: 10
+    random_negatives: 2
+    validation_negatives: 500
+    positive_rating_min: 4.0
+    negative_rating_max: 2.0
     rating_weighting_enabled: true
     rating_weight_neutral: 3.0
     rating_weight_scale: 0.25
@@ -41,6 +46,8 @@ models:
       dnn_hidden_dims: [256, 128]
       attention_hidden_dims: [128, 64]
       dropout: 0.1
+      positive_rating_min: 4.0
+      negative_rating_max: 2.0
     training:
       batch_size: 512
       epochs: 10

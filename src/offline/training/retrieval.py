@@ -189,6 +189,8 @@ def train_two_tower(context=None, warm_start: bool = True):
         rating_weight_min=float(training_settings.get("rating_weight_min", 0.0)),
         rating_weight_max=float(training_settings.get("rating_weight_max", 1.0)),
         multimodal_table=item_feature_arrays["multimodal_embedding"],
+        recent_history_length=int(two_tower_settings.get("recent_history_length", 20)),
+        positive_rating_min=float(training_settings.get("positive_rating_min", 4.0)),
     ).to(device)
 
     if warm_start and RETRIEVAL_MODEL_PATH.exists():
@@ -627,16 +629,21 @@ def train_item_cf(context=None):
     if context is None:
         settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
         context = load_retrieval_context(settings, resolve_retrieval_config(settings))
-    test_data = context["test_data"]
-    logger.info("ItemCF build start | users=%s", len(test_data["user_id"]))
+    train_data = context["train_data"]
+    logger.info("ItemCF build start | samples=%s", len(train_data["user_id"]))
     transitions = defaultdict(Counter)
     rating_settings = context["resolved_config"].get("training_settings", {})
     neutral_rating = float(rating_settings.get("rating_weight_neutral", 3.0))
     rating_weighting_enabled = bool(rating_settings.get("rating_weighting_enabled", False))
-    hist_ratings = test_data.get("hist_rating")
-    for history, ratings in zip(test_data["hist_movie_id"], hist_ratings, strict=False):
+    hist_ratings = train_data.get("hist_rating")
+    for history, ratings, target_id, target_rating in zip(train_data["hist_movie_id"], hist_ratings, train_data["movie_id"], train_data["rating"], strict=False):
         valid_history = [int(x) for x in np.asarray(history).reshape(-1) if int(x) > 0]
         valid_ratings = [float(x) for x in np.asarray(ratings).reshape(-1) if float(x) > 0]
+        target_id = int(target_id)
+        if target_id <= 0:
+            continue
+        valid_history.append(target_id)
+        valid_ratings.append(float(target_rating))
         if len(valid_history) < 2:
             continue
         if len(valid_ratings) < len(valid_history):
@@ -667,8 +674,10 @@ def train_genre(context=None):
     genre_matrix = np.asarray(item_features["genres"], dtype=np.int32)
     rating_settings = context["resolved_config"].get("training_settings", {})
     positive_rating_min = float(context["resolved_config"].get("rating_semantics", {}).get("positive_rating_min", 4.0))
-    for history, ratings in zip(context["test_data"]["hist_movie_id"], context["test_data"]["hist_rating"], strict=False):
-        for movie_id, rating in zip(np.asarray(history).reshape(-1), np.asarray(ratings).reshape(-1), strict=False):
+    for history, ratings, target_id, target_rating in zip(context["train_data"]["hist_movie_id"], context["train_data"]["hist_rating"], context["train_data"]["movie_id"], context["train_data"]["rating"], strict=False):
+        history_ids = np.concatenate([np.asarray(history).reshape(-1), np.asarray([target_id])])
+        history_ratings = np.concatenate([np.asarray(ratings).reshape(-1), np.asarray([target_rating])])
+        for movie_id, rating in zip(history_ids, history_ratings, strict=False):
             movie_id = int(movie_id)
             rating = float(rating)
             if movie_id <= 0 or movie_id >= genre_matrix.shape[0] or rating < positive_rating_min:
@@ -692,8 +701,10 @@ def train_popular(context=None):
     popularity = Counter()
     rating_settings = context["resolved_config"].get("training_settings", {})
     positive_rating_min = float(context["resolved_config"].get("rating_semantics", {}).get("positive_rating_min", 4.0))
-    for history, ratings in zip(context["test_data"]["hist_movie_id"], context["test_data"]["hist_rating"], strict=False):
-        for movie_id, rating in zip(np.asarray(history).reshape(-1), np.asarray(ratings).reshape(-1), strict=False):
+    for history, ratings, target_id, target_rating in zip(context["train_data"]["hist_movie_id"], context["train_data"]["hist_rating"], context["train_data"]["movie_id"], context["train_data"]["rating"], strict=False):
+        history_ids = np.concatenate([np.asarray(history).reshape(-1), np.asarray([target_id])])
+        history_ratings = np.concatenate([np.asarray(ratings).reshape(-1), np.asarray([target_rating])])
+        for movie_id, rating in zip(history_ids, history_ratings, strict=False):
             movie_id = int(movie_id)
             rating = float(rating)
             if movie_id <= 0 or rating < positive_rating_min:

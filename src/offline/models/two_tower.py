@@ -20,6 +20,8 @@ class TwoTowerRetrievalModel(nn.Module):
         rating_weight_min: float = 0.0,
         rating_weight_max: float = 1.0,
         multimodal_table=None,
+        recent_history_length: int = 20,
+        positive_rating_min: float = 4.0,
     ):
         super().__init__()
         self.movie_encoder = MovieFeatureEncoder(
@@ -41,6 +43,9 @@ class TwoTowerRetrievalModel(nn.Module):
             rating_weight_min=rating_weight_min,
             rating_weight_max=rating_weight_max,
             output_norm=False,
+            use_recent_positive_pooling=True,
+            recent_history_length=recent_history_length,
+            positive_rating_min=positive_rating_min,
         )
 
     def encode_user(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:

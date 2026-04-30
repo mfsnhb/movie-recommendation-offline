@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from offline.ranking.protocol import CANDIDATE_FIELDS, CONTEXT_FIELDS, SPARSE_ITEM_FEATURE_FIELDS, STATIC_USER_FIELDS, extract_split_sample
+from offline.ranking.protocol import CANDIDATE_FIELDS, CANDIDATE_RECALL_FEATURE_FIELDS, CONTEXT_FIELDS, SPARSE_ITEM_FEATURE_FIELDS, STATIC_USER_FIELDS, extract_split_sample
 
 
 class SequenceRankingDataset(Dataset):
@@ -30,21 +30,31 @@ def build_inference_batch(
     samples: list[dict],
     candidate_movie_ids: list[np.ndarray | list[int]],
     item_features: dict[str, np.ndarray],
+    candidate_recall_ranks: list[np.ndarray | list[int]] | None = None,
+    candidate_recall_scores: list[np.ndarray | list[float]] | None = None,
 ) -> tuple[dict[str, torch.Tensor] | None, list[list[int]], list[int]]:
     valid_samples: list[dict] = []
     valid_candidates_by_sample: list[list[int]] = []
+    valid_ranks_by_sample: list[np.ndarray] = []
+    valid_scores_by_sample: list[np.ndarray] = []
     valid_indices: list[int] = []
     max_candidate_size = 0
     for sample_idx, (sample, raw_candidates) in enumerate(zip(samples, candidate_movie_ids, strict=False)):
-        valid_candidates = [
-            int(movie_id)
-            for movie_id in np.asarray(raw_candidates, dtype=np.int32).reshape(-1).tolist()
+        raw_candidate_array = np.asarray(raw_candidates, dtype=np.int32).reshape(-1)
+        raw_rank_array = _metadata_array(candidate_recall_ranks, sample_idx, raw_candidate_array.size, dtype=np.float32)
+        raw_score_array = _metadata_array(candidate_recall_scores, sample_idx, raw_candidate_array.size, dtype=np.float32)
+        valid_positions = [
+            pos
+            for pos, movie_id in enumerate(raw_candidate_array.tolist())
             if 0 < int(movie_id) < item_features["genres"].shape[0]
         ]
-        if not valid_candidates:
+        if not valid_positions:
             continue
+        valid_candidates = raw_candidate_array[valid_positions].astype(np.int32, copy=False).tolist()
         valid_samples.append(sample)
         valid_candidates_by_sample.append(valid_candidates)
+        valid_ranks_by_sample.append(raw_rank_array[valid_positions])
+        valid_scores_by_sample.append(raw_score_array[valid_positions])
         valid_indices.append(sample_idx)
         max_candidate_size = max(max_candidate_size, len(valid_candidates))
 
@@ -58,12 +68,25 @@ def build_inference_batch(
         genre_count=int(item_features["genres"].shape[1]),
     )
     candidate_ids = np.zeros((len(valid_samples), max_candidate_size), dtype=np.int32)
+    candidate_ranks = np.zeros((len(valid_samples), max_candidate_size), dtype=np.float32)
+    candidate_scores = np.zeros((len(valid_samples), max_candidate_size), dtype=np.float32)
     for row_idx, (sample, valid_candidates) in enumerate(zip(valid_samples, valid_candidates_by_sample, strict=True)):
         _fill_base_fields(batch, sample, row_idx=row_idx)
         _fill_context_slots(batch, item_features=item_features, row_idx=row_idx)
         candidate_ids[row_idx, : len(valid_candidates)] = np.asarray(valid_candidates, dtype=np.int32)
-    _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=item_features)
+        candidate_ranks[row_idx, : len(valid_candidates)] = valid_ranks_by_sample[row_idx]
+        candidate_scores[row_idx, : len(valid_candidates)] = valid_scores_by_sample[row_idx]
+    _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=item_features, candidate_recall_ranks=candidate_ranks, candidate_recall_scores=candidate_scores)
     return _numpy_batch_to_torch(batch), valid_candidates_by_sample, valid_indices
+
+
+def _metadata_array(values: list[np.ndarray | list] | None, sample_idx: int, width: int, dtype) -> np.ndarray:
+    if values is None or sample_idx >= len(values):
+        return np.zeros(width, dtype=dtype)
+    array = np.asarray(values[sample_idx], dtype=dtype).reshape(-1)
+    result = np.zeros(width, dtype=dtype)
+    result[: min(width, array.size)] = array[:width]
+    return result
 
 
 @dataclass
@@ -71,7 +94,11 @@ class SequenceRankingTrainCollator:
     item_features: dict[str, np.ndarray]
     all_item_ids: np.ndarray
     num_negatives: int
-    low_rating_negatives: int = 0
+    low_rating_negatives: int = 5
+    recall_hard_negatives: int = 10
+    random_negatives: int = 5
+    fused_candidates_by_user: dict[int, np.ndarray] | None = None
+    fused_scores_by_user: dict[int, np.ndarray] | None = None
     seed: int = 42
 
     def __post_init__(self) -> None:
@@ -96,25 +123,42 @@ class SequenceRankingTrainCollator:
             _fill_context_slots(batch, item_features=self.item_features, row_idx=row_idx)
             positive_ids[row_idx] = int(sample["target_movie_id"])
 
+        low_rating_count = min(max(int(self.low_rating_negatives), 0), self.num_negatives)
+        hard_count = min(max(int(self.recall_hard_negatives), 0), max(self.num_negatives - low_rating_count, 0))
+        random_count = min(max(int(self.random_negatives), 0), max(self.num_negatives - low_rating_count - hard_count, 0))
+        random_count += max(self.num_negatives - low_rating_count - hard_count - random_count, 0)
         low_rating_negative_ids = _sample_low_rating_negative_ids(
             context_movie_ids=batch["context_movie_id"],
             context_low_rating_mask=batch["context_low_rating_mask"],
             positive_ids=positive_ids,
-            count=min(max(int(self.low_rating_negatives), 0), self.num_negatives),
+            count=low_rating_count,
             rng=self.rng,
         )
-        random_negative_count = max(self.num_negatives - low_rating_negative_ids.shape[1], 0)
+        hard_negative_ids, hard_negative_ranks, hard_negative_scores = _sample_recall_hard_negative_ids(
+            samples=samples,
+            context_movie_ids=batch["context_movie_id"],
+            positive_ids=positive_ids,
+            count=hard_count,
+            fused_candidates_by_user=self.fused_candidates_by_user,
+            fused_scores_by_user=self.fused_scores_by_user,
+            extra_blocked_ids=low_rating_negative_ids,
+        )
         negative_ids = _sample_batch_negative_ids(
             all_item_ids=self.all_item_ids,
             item_id_positions=self.item_id_positions,
             context_movie_ids=batch["context_movie_id"],
             positive_ids=positive_ids,
-            count=random_negative_count,
+            count=random_count,
             rng=self.rng,
-            extra_blocked_ids=low_rating_negative_ids,
+            extra_blocked_ids=np.concatenate([low_rating_negative_ids, hard_negative_ids], axis=1),
         )
-        candidate_ids = np.concatenate([positive_ids.reshape(-1, 1), low_rating_negative_ids, negative_ids], axis=1)
-        _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=self.item_features)
+        candidate_ids = np.concatenate([positive_ids.reshape(-1, 1), low_rating_negative_ids, hard_negative_ids, negative_ids], axis=1)
+        candidate_ranks = np.zeros(candidate_ids.shape, dtype=np.float32)
+        candidate_scores = np.zeros(candidate_ids.shape, dtype=np.float32)
+        hard_start = 1 + low_rating_negative_ids.shape[1]
+        candidate_ranks[:, hard_start : hard_start + hard_negative_ids.shape[1]] = hard_negative_ranks
+        candidate_scores[:, hard_start : hard_start + hard_negative_ids.shape[1]] = hard_negative_scores
+        _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=self.item_features, candidate_recall_ranks=candidate_ranks, candidate_recall_scores=candidate_scores)
         return _numpy_batch_to_torch(batch)
 
 
@@ -145,6 +189,60 @@ def _sample_low_rating_negative_ids(
     return negatives
 
 
+def _sample_recall_hard_negative_ids(
+    samples: list[dict],
+    context_movie_ids: np.ndarray,
+    positive_ids: np.ndarray,
+    count: int,
+    fused_candidates_by_user: dict[int, np.ndarray] | None,
+    fused_scores_by_user: dict[int, np.ndarray] | None,
+    extra_blocked_ids: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    batch_size = int(positive_ids.shape[0])
+    negatives = np.zeros((batch_size, count), dtype=np.int32)
+    ranks = np.zeros((batch_size, count), dtype=np.float32)
+    scores = np.zeros((batch_size, count), dtype=np.float32)
+    if count <= 0 or not fused_candidates_by_user:
+        return negatives, ranks, scores
+
+    for row_idx, sample in enumerate(samples):
+        user_id = int(sample.get("user_id_original", sample["user_id"]))
+        candidates = fused_candidates_by_user.get(user_id)
+        if candidates is None:
+            candidates = fused_candidates_by_user.get(int(sample["user_id"]))
+        if candidates is None:
+            continue
+        candidate_array = np.asarray(candidates, dtype=np.int32).reshape(-1)
+        score_array = None
+        if fused_scores_by_user:
+            score_values = fused_scores_by_user.get(user_id)
+            if score_values is None:
+                score_values = fused_scores_by_user.get(int(sample["user_id"]))
+            if score_values is not None:
+                score_array = np.asarray(score_values, dtype=np.float32).reshape(-1)
+        blocked = set(int(item_id) for item_id in context_movie_ids[row_idx].tolist() if int(item_id) > 0)
+        blocked.add(int(positive_ids[row_idx]))
+        if extra_blocked_ids is not None and extra_blocked_ids.size > 0:
+            blocked.update(int(item_id) for item_id in extra_blocked_ids[row_idx].tolist() if int(item_id) > 0)
+        selected = []
+        selected_ranks = []
+        selected_scores = []
+        for rank_idx, item_id in enumerate(candidate_array.tolist(), start=1):
+            item_id = int(item_id)
+            if item_id <= 0 or item_id in blocked:
+                continue
+            selected.append(item_id)
+            selected_ranks.append(float(rank_idx))
+            selected_scores.append(float(score_array[rank_idx - 1]) if score_array is not None and rank_idx - 1 < score_array.size else 0.0)
+            blocked.add(item_id)
+            if len(selected) >= count:
+                break
+        take = len(selected)
+        if take > 0:
+            negatives[row_idx, :take] = np.asarray(selected, dtype=np.int32)
+            ranks[row_idx, :take] = np.asarray(selected_ranks, dtype=np.float32)
+            scores[row_idx, :take] = np.asarray(selected_scores, dtype=np.float32)
+    return negatives, ranks, scores
 
 def _sample_batch_negative_ids(
     all_item_ids: np.ndarray,
@@ -206,6 +304,8 @@ def _init_batch_arrays(batch_size: int, context_width: int, candidate_size: int,
             batch[field] = np.zeros((batch_size, candidate_size, genre_count), dtype=np.int32)
         else:
             batch[field] = np.zeros((batch_size, candidate_size), dtype=np.int32)
+    for field in CANDIDATE_RECALL_FEATURE_FIELDS:
+        batch[field] = np.zeros((batch_size, candidate_size), dtype=np.float32)
     batch["candidate_relevance"] = np.zeros((batch_size, candidate_size), dtype=np.float32)
     return batch
 
@@ -217,6 +317,7 @@ def _fill_base_fields(batch: dict[str, np.ndarray], sample: dict, row_idx: int) 
     batch["context_movie_id"][row_idx] = np.asarray(sample["context_movie_id"], dtype=np.int32)
     batch["context_rating"][row_idx] = np.asarray(sample.get("context_rating", np.zeros_like(sample["context_movie_id"], dtype=np.float32)), dtype=np.float32)
     batch["context_low_rating_mask"][row_idx] = np.asarray(sample.get("context_low_rating_mask", np.zeros_like(sample["context_movie_id"], dtype=np.float32)), dtype=np.float32)
+    batch["context_recency_bucket"][row_idx] = np.asarray(sample.get("context_recency_bucket", np.zeros_like(sample["context_movie_id"], dtype=np.int32)), dtype=np.int32)
     batch["context_length"][row_idx] = int(sample["context_length"])
     batch["target_rating"][row_idx] = float(sample.get("target_rating", 0.0))
 
@@ -235,6 +336,8 @@ def _fill_candidate_slots(
     batch: dict[str, np.ndarray],
     candidate_ids: np.ndarray,
     item_features: dict[str, np.ndarray],
+    candidate_recall_ranks: np.ndarray | None = None,
+    candidate_recall_scores: np.ndarray | None = None,
 ) -> None:
     candidate_ids = np.asarray(candidate_ids, dtype=np.int32)
     candidate_size = min(candidate_ids.shape[1], batch["candidate_movie_id"].shape[1])
@@ -248,6 +351,10 @@ def _fill_candidate_slots(
     for field in SPARSE_ITEM_FEATURE_FIELDS:
         if field != "genres":
             batch[f"candidate_{field}"][:, :candidate_size] = item_features[field][safe_candidate_ids]
+    if candidate_recall_ranks is not None:
+        batch["candidate_recall_rank"][:, :candidate_size] = np.asarray(candidate_recall_ranks[:, :candidate_size], dtype=np.float32) * valid_mask.astype(np.float32)
+    if candidate_recall_scores is not None:
+        batch["candidate_recall_score"][:, :candidate_size] = np.asarray(candidate_recall_scores[:, :candidate_size], dtype=np.float32) * valid_mask.astype(np.float32)
     batch["candidate_relevance"][:, :candidate_size] = 0.0
     batch["candidate_relevance"][:, 0] = batch["target_rating"]
 
@@ -259,7 +366,7 @@ def _numpy_batch_to_torch(batch: dict[str, np.ndarray]) -> dict[str, torch.Tenso
             result[field] = torch.as_tensor(values, dtype=torch.bool)
         elif field == "target_index":
             result[field] = torch.as_tensor(values, dtype=torch.long)
-        elif field in {"context_rating", "context_low_rating_mask", "target_rating", "candidate_relevance"}:
+        elif field in {"context_rating", "context_low_rating_mask", "target_rating", "candidate_relevance", "candidate_recall_rank", "candidate_recall_score"}:
             result[field] = torch.as_tensor(values, dtype=torch.float32)
         else:
             result[field] = torch.as_tensor(values, dtype=torch.long)

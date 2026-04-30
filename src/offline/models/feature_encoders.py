@@ -95,6 +95,9 @@ class UserFeatureEncoder(nn.Module):
         rating_weight_min: float = 0.0,
         rating_weight_max: float = 1.0,
         output_norm: bool = False,
+        use_recent_positive_pooling: bool = False,
+        recent_history_length: int = 20,
+        positive_rating_min: float = 4.0,
     ):
         super().__init__()
         self.rating_weighting_enabled = bool(rating_weighting_enabled)
@@ -103,9 +106,14 @@ class UserFeatureEncoder(nn.Module):
         self.rating_weight_min = float(rating_weight_min)
         self.rating_weight_max = float(rating_weight_max)
         self.output_norm = bool(output_norm)
+        self.use_recent_positive_pooling = bool(use_recent_positive_pooling)
+        self.recent_history_length = int(recent_history_length)
+        self.positive_rating_min = float(positive_rating_min)
         self.static_embeddings = nn.ModuleDict({field: nn.Embedding(feature_dict[field], emb_dim, padding_idx=0) for field in STATIC_USER_FIELDS})
-        self.recency_emb = nn.Embedding(feature_dict.get("hist_recency_bucket", 2), emb_dim, padding_idx=0)
-        self.projection = build_mlp(emb_dim * 7, hidden_dims or [emb_dim * 4, emb_dim * 2], emb_dim, dropout=dropout)
+        self.static_projection = build_mlp(emb_dim * len(STATIC_USER_FIELDS), [emb_dim * 2], emb_dim, dropout=dropout)
+        self.recency_emb = nn.Embedding(feature_dict.get("hist_recency_bucket", feature_dict.get("recency_bucket", 2)), emb_dim, padding_idx=0)
+        projection_width = 5 if self.use_recent_positive_pooling else 3
+        self.projection = build_mlp(emb_dim * projection_width, hidden_dims or [emb_dim * 4, emb_dim * 2], emb_dim, dropout=dropout)
 
     def forward(
         self,
@@ -114,7 +122,7 @@ class UserFeatureEncoder(nn.Module):
         history_mask: torch.Tensor,
     ) -> torch.Tensor:
         hist_movie_id = batch["hist_movie_id"] if "hist_movie_id" in batch else batch["context_movie_id"]
-        hist_recency_bucket = batch.get("hist_recency_bucket")
+        hist_recency_bucket = batch.get("hist_recency_bucket", batch.get("context_recency_bucket"))
         if hist_recency_bucket is None:
             hist_recency_bucket = torch.ones_like(hist_movie_id)
         hist_rating = batch.get("hist_rating", batch.get("context_rating"))
@@ -126,16 +134,20 @@ class UserFeatureEncoder(nn.Module):
         pooled_history = self._weighted_pool(history_movie_embeddings, combined_weights, history_mask)
         recency_embeddings = self.recency_emb(hist_recency_bucket.long())
         pooled_recency = self._weighted_pool(recency_embeddings, combined_weights, history_mask)
-
-        output = self.projection(torch.cat([
-            self.static_embeddings["user_id"](batch["user_id"].long()),
-            self.static_embeddings["gender"](batch["gender"].long()),
-            self.static_embeddings["age"](batch["age"].long()),
-            self.static_embeddings["occupation"](batch["occupation"].long()),
-            self.static_embeddings["zip_code"](batch["zip_code"].long()),
-            pooled_history,
-            pooled_recency,
+        static_user = self.static_projection(torch.cat([
+            self.static_embeddings[field](batch[field].long())
+            for field in STATIC_USER_FIELDS
         ], dim=-1))
+        user_parts = [static_user, pooled_history, pooled_recency]
+        if self.use_recent_positive_pooling:
+            recent_mask = self._recent_mask(hist_movie_id, history_mask, self.recent_history_length)
+            positive_mask = history_mask & hist_rating.float().ge(self.positive_rating_min) if hist_rating is not None else history_mask.new_zeros(history_mask.shape)
+            user_parts.extend([
+                self._weighted_pool(history_movie_embeddings, combined_weights, recent_mask),
+                self._weighted_pool(history_movie_embeddings, combined_weights, positive_mask),
+            ])
+
+        output = self.projection(torch.cat(user_parts, dim=-1))
         if self.output_norm:
             output = torch.nn.functional.normalize(output, dim=-1)
         return output
@@ -150,6 +162,14 @@ class UserFeatureEncoder(nn.Module):
     @staticmethod
     def _recency_weights(hist_recency_bucket: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
         return (1.0 / hist_recency_bucket.clamp_min(1).float()) * history_mask.float()
+
+    @staticmethod
+    def _recent_mask(hist_movie_id: torch.Tensor, history_mask: torch.Tensor, recent_history_length: int) -> torch.Tensor:
+        if recent_history_length <= 0:
+            return history_mask.new_zeros(history_mask.shape)
+        valid_seen = history_mask.long().cumsum(dim=1)
+        valid_count = history_mask.long().sum(dim=1, keepdim=True)
+        return hist_movie_id.gt(0) & history_mask & valid_seen.gt((valid_count - int(recent_history_length)).clamp_min(0))
 
     @staticmethod
     def _weighted_pool(embeddings: torch.Tensor, weights: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
