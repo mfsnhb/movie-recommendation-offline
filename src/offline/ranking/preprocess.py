@@ -19,7 +19,7 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.ranking")
-_SAMPLE_PROTOCOL = "prefix_positive_targets_v7"
+_SAMPLE_PROTOCOL = "prefix_positive_targets_v8"
 _ID_DTYPE = np.uint16
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
@@ -103,12 +103,12 @@ def _allocate_split_arrays(sample_count: int, max_seq_len: int) -> dict[str, np.
         "age": np.zeros(sample_count, dtype=_ID_DTYPE),
         "occupation": np.zeros(sample_count, dtype=_ID_DTYPE),
         "zip_code": np.zeros(sample_count, dtype=_ID_DTYPE),
-        "user_id_original": np.zeros(sample_count, dtype=_ID_DTYPE),
+        "user_id_raw": np.zeros(sample_count, dtype=np.int32),
         "context_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "context_rating": np.zeros((sample_count, max_seq_len), dtype=np.float32),
-        "context_low_rating_mask": np.zeros((sample_count, max_seq_len), dtype=np.float32),
         "context_recency_bucket": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "context_length": np.zeros(sample_count, dtype=_ID_DTYPE),
+        "low_rating_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "target_movie_id": np.zeros(sample_count, dtype=_ID_DTYPE),
         "target_rating": np.zeros(sample_count, dtype=np.float32),
     }
@@ -130,14 +130,6 @@ def _fill_padded_float_row(target: np.ndarray, values: list[float]) -> None:
 
 
 
-def _build_low_rating_mask(values: list[float], width: int, negative_rating_max: float) -> np.ndarray:
-    clipped = np.asarray(values[-width:], dtype=np.float32)
-    mask = np.zeros(width, dtype=np.float32)
-    if clipped.size > 0:
-        mask[-clipped.size :] = (clipped <= float(negative_rating_max)).astype(np.float32, copy=False)
-    return mask
-
-
 def _build_recency_buckets(values: list[int], width: int) -> np.ndarray:
     length = min(len(values), width)
     buckets = np.zeros(width, dtype=_ID_DTYPE)
@@ -145,16 +137,37 @@ def _build_recency_buckets(values: list[int], width: int) -> np.ndarray:
         buckets[-length:] = np.minimum(np.arange(length, 0, -1, dtype=np.int32), _RECENCY_BUCKET_COUNT).astype(_ID_DTYPE)
     return buckets
 
+
+def _split_history_by_rating(
+    movie_sequence: list[int],
+    rating_sequence: list[float],
+    target_idx: int,
+    interest_rating_min: float,
+    negative_rating_max: float,
+) -> tuple[list[int], list[float], list[int]]:
+    context_movies: list[int] = []
+    context_ratings: list[float] = []
+    low_rating_movies: list[int] = []
+    for movie_id, rating in zip(movie_sequence[:target_idx], rating_sequence[:target_idx], strict=True):
+        rating_value = float(rating)
+        if rating_value >= float(interest_rating_min):
+            context_movies.append(int(movie_id))
+            context_ratings.append(rating_value)
+        elif rating_value <= float(negative_rating_max):
+            low_rating_movies.append(int(movie_id))
+    return context_movies, context_ratings, low_rating_movies
+
+
 def _write_sample_row(
     store: dict[str, np.ndarray],
     row_idx: int,
     user_values: tuple[int, int, int, int, int],
-    user_id_original: int,
+    user_id_raw: int,
     context_movies: list[int],
     context_ratings: list[float],
+    low_rating_movies: list[int],
     target_movie_id: int,
     target_rating: float,
-    negative_rating_max: float,
 ) -> None:
     user_id, gender, age, occupation, zip_code = user_values
     store["user_id"][row_idx] = user_id
@@ -162,18 +175,49 @@ def _write_sample_row(
     store["age"][row_idx] = age
     store["occupation"][row_idx] = occupation
     store["zip_code"][row_idx] = zip_code
-    store["user_id_original"][row_idx] = user_id_original
+    store["user_id_raw"][row_idx] = user_id_raw
     store["context_movie_id"][row_idx].fill(0)
     store["context_rating"][row_idx].fill(0.0)
-    store["context_low_rating_mask"][row_idx].fill(0.0)
     store["context_recency_bucket"][row_idx].fill(0)
+    store["low_rating_movie_id"][row_idx].fill(0)
     context_length = _fill_padded_row(store["context_movie_id"][row_idx], context_movies)
     _fill_padded_float_row(store["context_rating"][row_idx], context_ratings)
-    store["context_low_rating_mask"][row_idx] = _build_low_rating_mask(context_ratings, store["context_low_rating_mask"][row_idx].shape[0], negative_rating_max)
     store["context_recency_bucket"][row_idx] = _build_recency_buckets(context_movies, store["context_recency_bucket"][row_idx].shape[0])
     store["context_length"][row_idx] = context_length
+    _fill_padded_row(store["low_rating_movie_id"][row_idx], low_rating_movies)
     store["target_movie_id"][row_idx] = target_movie_id
     store["target_rating"][row_idx] = np.float32(target_rating)
+
+
+def _write_target_sample(
+    store: dict[str, np.ndarray],
+    row_idx: int,
+    user_values: tuple[int, int, int, int, int],
+    user_id_raw: int,
+    movie_sequence: list[int],
+    rating_sequence: list[float],
+    target_idx: int,
+    interest_rating_min: float,
+    negative_rating_max: float,
+) -> None:
+    context_movies, context_ratings, low_rating_movies = _split_history_by_rating(
+        movie_sequence,
+        rating_sequence,
+        target_idx,
+        interest_rating_min,
+        negative_rating_max,
+    )
+    _write_sample_row(
+        store,
+        row_idx=row_idx,
+        user_values=user_values,
+        user_id_raw=user_id_raw,
+        context_movies=context_movies,
+        context_ratings=context_ratings,
+        low_rating_movies=low_rating_movies,
+        target_movie_id=int(movie_sequence[target_idx]),
+        target_rating=float(rating_sequence[target_idx]),
+    )
 
 
 def _popularity_buckets(item_popularity: np.ndarray) -> np.ndarray:
@@ -223,14 +267,21 @@ def _build_item_feature_arrays(df_merged: pd.DataFrame, total_item_count: int, i
     return item_features
 
 
-def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: int, max_seq_len: int, negative_rating_max: float, positive_rating_min: float) -> dict:
-    df_sorted = df_merged.sort_values(["user_id_original", "timestamp"], kind="stable")
+def build_prefix_train_eval_samples(
+    df_merged: pd.DataFrame,
+    total_item_count: int,
+    max_seq_len: int,
+    negative_rating_max: float,
+    positive_rating_min: float,
+    interest_rating_min: float,
+) -> dict:
+    df_sorted = df_merged.sort_values(["user_id", "timestamp"], kind="stable")
 
     train_sample_count = 0
     validation_sample_count = 0
     test_sample_count = 0
     positive_threshold = float(positive_rating_min)
-    for _, user_rows in df_sorted.groupby("user_id_original", sort=False):
+    for _, user_rows in df_sorted.groupby("user_id", sort=False):
         history_length = len(user_rows)
         if history_length < 2:
             continue
@@ -243,13 +294,14 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
         train_sample_count += max(len(positive_target_indices) - 2, 0)
 
     logger.info(
-        "Ranking sample allocation | protocol=%s | train_samples=%s | validation_samples=%s | test_samples=%s | max_seq_len=%s | positive_rating_min=%s",
+        "Ranking sample allocation | protocol=%s | train_samples=%s | validation_samples=%s | test_samples=%s | max_seq_len=%s | positive_rating_min=%s | interest_rating_min=%s",
         _SAMPLE_PROTOCOL,
         train_sample_count,
         validation_sample_count,
         test_sample_count,
         max_seq_len,
         positive_threshold,
+        interest_rating_min,
     )
 
     train_store = _allocate_split_arrays(train_sample_count, max_seq_len)
@@ -260,7 +312,7 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
     train_row = 0
     validation_row = 0
     test_row = 0
-    for user_id_original, user_rows in df_sorted.groupby("user_id_original", sort=False):
+    for _, user_rows in df_sorted.groupby("user_id", sort=False):
         movie_sequence = [int(movie_id) for movie_id in user_rows["movie_id"].tolist()]
         rating_sequence = [float(rating) for rating in user_rows["rating"].tolist()]
         history_length = len(movie_sequence)
@@ -270,6 +322,7 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
         if len(positive_target_indices) < 2:
             continue
 
+        user_id_raw = int(user_rows["user_id_original"].iloc[0])
         user_values = (
             int(user_rows["user_id"].iloc[0]),
             int(user_rows["gender"].iloc[0]),
@@ -280,43 +333,43 @@ def build_prefix_train_eval_samples(df_merged: pd.DataFrame, total_item_count: i
 
         validation_target_idx = positive_target_indices[-2]
         test_target_idx = positive_target_indices[-1]
-        _write_sample_row(
+        _write_target_sample(
             validation_store,
             row_idx=validation_row,
             user_values=user_values,
-            user_id_original=int(user_id_original),
-            context_movies=movie_sequence[:validation_target_idx],
-            context_ratings=rating_sequence[:validation_target_idx],
-            target_movie_id=int(movie_sequence[validation_target_idx]),
-            target_rating=float(rating_sequence[validation_target_idx]),
+            user_id_raw=user_id_raw,
+            movie_sequence=movie_sequence,
+            rating_sequence=rating_sequence,
+            target_idx=validation_target_idx,
+            interest_rating_min=interest_rating_min,
             negative_rating_max=negative_rating_max,
         )
         validation_row += 1
 
-        _write_sample_row(
+        _write_target_sample(
             test_store,
             row_idx=test_row,
             user_values=user_values,
-            user_id_original=int(user_id_original),
-            context_movies=movie_sequence[:test_target_idx],
-            context_ratings=rating_sequence[:test_target_idx],
-            target_movie_id=int(movie_sequence[test_target_idx]),
-            target_rating=float(rating_sequence[test_target_idx]),
+            user_id_raw=user_id_raw,
+            movie_sequence=movie_sequence,
+            rating_sequence=rating_sequence,
+            target_idx=test_target_idx,
+            interest_rating_min=interest_rating_min,
             negative_rating_max=negative_rating_max,
         )
         test_row += 1
 
         for target_idx in positive_target_indices[:-2]:
             target_movie_id = int(movie_sequence[target_idx])
-            _write_sample_row(
+            _write_target_sample(
                 train_store,
                 row_idx=train_row,
                 user_values=user_values,
-                user_id_original=int(user_id_original),
-                context_movies=movie_sequence[:target_idx],
-                context_ratings=rating_sequence[:target_idx],
-                target_movie_id=target_movie_id,
-                target_rating=float(rating_sequence[target_idx]),
+                user_id_raw=user_id_raw,
+                movie_sequence=movie_sequence,
+                rating_sequence=rating_sequence,
+                target_idx=target_idx,
+                interest_rating_min=interest_rating_min,
                 negative_rating_max=negative_rating_max,
             )
             item_popularity[target_movie_id] += 1
@@ -354,13 +407,15 @@ def run_ranking_preprocessing():
     max_seq_len = int(ranking_settings.get("max_seq_len", settings.get("retrieval", {}).get("max_seq_len", 10)))
     negative_rating_max = float(ranking_settings.get("negative_rating_max", settings.get("retrieval", {}).get("negative_rating_max", 2.0)))
     positive_rating_min = float(ranking_settings.get("positive_rating_min", settings.get("retrieval", {}).get("positive_rating_min", 4.0)))
+    interest_rating_min = float(ranking_settings.get("interest_rating_min", positive_rating_min))
 
     logger.info(
-        "Ranking preprocessing start | protocol=%s | max_seq_len=%s | positive_rating_min=%s | negative_rating_max=%s",
+        "Ranking preprocessing start | protocol=%s | max_seq_len=%s | positive_rating_min=%s | negative_rating_max=%s | interest_rating_min=%s",
         _SAMPLE_PROTOCOL,
         max_seq_len,
         positive_rating_min,
         negative_rating_max,
+        interest_rating_min,
     )
     df_movies, df_ratings, df_users = load_raw_data()
     logger.info("Raw data loaded | movies=%s | ratings=%s | users=%s", len(df_movies), len(df_ratings), len(df_users))
@@ -375,6 +430,7 @@ def run_ranking_preprocessing():
         max_seq_len=max_seq_len,
         negative_rating_max=negative_rating_max,
         positive_rating_min=positive_rating_min,
+        interest_rating_min=interest_rating_min,
     )
     item_catalog = build_item_catalog(
         df_merged,

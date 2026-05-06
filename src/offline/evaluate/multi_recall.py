@@ -15,8 +15,6 @@ from offline.utils.config import resolve_multi_recall_route_names, resolve_retri
 from offline.utils.io import (
     CONFIG_DIR,
     GENRE_MODEL_PATH,
-    ITEM2ITEM_ITEM_EMBEDDINGS_PATH,
-    ITEM2ITEM_MOVIE_IDS_PATH,
     ITEM_CF_MODEL_PATH,
     ITEM_CATALOG_PATH,
     ITEM_EMBEDDINGS_PATH,
@@ -36,7 +34,7 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.evaluate.multi_recall")
-DEFAULT_ROUTE_ORDER = ["two_tower", "sequence", "item_cf", "multimodal", "item2item", "genre", "popular"]
+DEFAULT_ROUTE_ORDER = ["two_tower", "sequence", "item_cf", "multimodal", "genre", "popular"]
 RRF_K = 60
 MIN_ROUTE_WEIGHT = 0.3
 MAX_ROUTE_WEIGHT = 1.0
@@ -186,7 +184,6 @@ def build_route_outputs(topk: int, routes: list[str] | None = None, split_name: 
     route_builders = {
         "two_tower": lambda: _build_two_tower_output(split, encoded_movie_ids, item_features, device, route_topk),
         "sequence": lambda: _build_sequence_output(split, encoded_movie_ids, item_features, device, route_topk),
-        "item2item": lambda: _build_item2item_output(split, route_topk),
         "item_cf": lambda: _build_item_cf_output(split, route_topk),
         "multimodal": lambda: _build_multimodal_output(split, all_item_ids, item_features, route_topk, resolved_config["rating_semantics"]),
         "genre": lambda: _build_genre_output(split, all_item_ids, item_features, route_topk),
@@ -312,7 +309,6 @@ def _build_two_tower_output(test_data: dict, encoded_movie_ids: np.ndarray | Non
     if len(encoded_movie_ids) != int(embeddings.shape[0]):
         raise ValueError(f"Item embedding alignment mismatch: movie_ids={len(encoded_movie_ids)}, two_tower={embeddings.shape[0]}")
 
-    training_settings = retrieval_checkpoint.get("training_settings", {})
     model_settings = retrieval_checkpoint.get("model_settings", {})
     model = TwoTowerRetrievalModel(
         feature_dict,
@@ -320,12 +316,8 @@ def _build_two_tower_output(test_data: dict, encoded_movie_ids: np.ndarray | Non
         user_hidden_dims=model_settings.get("user_hidden_dims"),
         item_hidden_dims=model_settings.get("item_hidden_dims"),
         dropout=float(model_settings.get("dropout", 0.1)),
-        rating_weighting_enabled=bool(training_settings.get("rating_weighting_enabled", False)),
-        rating_weight_neutral=float(training_settings.get("rating_weight_neutral", 3.0)),
-        rating_weight_scale=float(training_settings.get("rating_weight_scale", 0.25)),
-        rating_weight_min=float(training_settings.get("rating_weight_min", 0.0)),
-        rating_weight_max=float(training_settings.get("rating_weight_max", 1.0)),
         multimodal_table=item_features["multimodal_embedding"],
+        recent_history_length=int(model_settings.get("recent_history_length", 20)),
     ).to(device)
     model.load_state_dict(retrieval_checkpoint["state_dict"])
     model.eval()
@@ -360,19 +352,6 @@ def _build_sequence_output(test_data: dict, encoded_movie_ids: np.ndarray | None
     training_settings = sequence_checkpoint.get("training_settings", {})
     history_feedback = str(training_settings.get("sequence_history_feedback", "positive")).strip().lower()
     return _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, to_item_feature_tensors(item_features, device), device, topk, history_feedback=history_feedback)
-
-
-
-def _build_item2item_output(test_data: dict, topk: int):
-    if not ITEM2ITEM_ITEM_EMBEDDINGS_PATH.exists() or not ITEM2ITEM_MOVIE_IDS_PATH.exists():
-        logger.info("Multi-recall route skipped | route=item2item | reason=missing_artifact")
-        return _empty_route_output(test_data["user_id"])
-
-    embeddings = np.load(ITEM2ITEM_ITEM_EMBEDDINGS_PATH, mmap_mode="r")
-    encoded_movie_ids = np.load(ITEM2ITEM_MOVIE_IDS_PATH, mmap_mode="r").astype(np.int64)
-    if len(encoded_movie_ids) != int(embeddings.shape[0]):
-        raise ValueError(f"Item2Item embedding alignment mismatch: movie_ids={len(encoded_movie_ids)}, item2item={embeddings.shape[0]}")
-    return _item2item_candidates(test_data, embeddings, encoded_movie_ids, topk)
 
 
 
@@ -468,36 +447,6 @@ def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, item_f
             scores = embeddings @ user_embedding
             top_indices = np.argsort(scores)[::-1][:topk]
             outputs[int(user_id)] = {int(encoded_movie_ids[i]): float(scores[i]) for i in top_indices}
-    return outputs
-
-
-
-def _item2item_candidates(test_data, embeddings, encoded_movie_ids, topk):
-    if embeddings is None or encoded_movie_ids is None:
-        return _empty_route_output(test_data["user_id"])
-
-    normalized_embeddings = np.asarray(embeddings, dtype=np.float32)
-    encoded_movie_ids = np.asarray(encoded_movie_ids, dtype=np.int64)
-    embedding_by_item = {int(movie_id): idx for idx, movie_id in enumerate(encoded_movie_ids.tolist())}
-    outputs = {}
-    for idx, user_id in enumerate(test_data["user_id"]):
-        history = [int(x) for x in np.asarray(test_data["hist_movie_id"][idx]).reshape(-1) if int(x) > 0]
-        recent_history = history[-3:]
-        seen_items = set(history)
-        scores = Counter()
-        for rank, movie_id in enumerate(reversed(recent_history), start=1):
-            anchor_idx = embedding_by_item.get(int(movie_id))
-            if anchor_idx is None:
-                continue
-            anchor_scores = normalized_embeddings @ normalized_embeddings[anchor_idx]
-            top_indices = np.argsort(anchor_scores)[::-1][: max(topk * 2, 1)]
-            weight = 1.0 / rank
-            for candidate_idx in top_indices.tolist():
-                candidate_id = int(encoded_movie_ids[candidate_idx])
-                if candidate_id in seen_items:
-                    continue
-                scores[candidate_id] += float(anchor_scores[candidate_idx]) * weight
-        outputs[int(user_id)] = dict(scores.most_common(topk))
     return outputs
 
 

@@ -127,9 +127,8 @@ class SequenceRankingTrainCollator:
         hard_count = min(max(int(self.recall_hard_negatives), 0), max(self.num_negatives - low_rating_count, 0))
         random_count = min(max(int(self.random_negatives), 0), max(self.num_negatives - low_rating_count - hard_count, 0))
         random_count += max(self.num_negatives - low_rating_count - hard_count - random_count, 0)
-        low_rating_negative_ids = _sample_low_rating_negative_ids(
-            context_movie_ids=batch["context_movie_id"],
-            context_low_rating_mask=batch["context_low_rating_mask"],
+        low_rating_negative_ids = _sample_low_rating_negative_pool(
+            low_rating_movie_ids=batch["low_rating_movie_id"],
             positive_ids=positive_ids,
             count=low_rating_count,
             rng=self.rng,
@@ -162,9 +161,8 @@ class SequenceRankingTrainCollator:
         return _numpy_batch_to_torch(batch)
 
 
-def _sample_low_rating_negative_ids(
-    context_movie_ids: np.ndarray,
-    context_low_rating_mask: np.ndarray,
+def _sample_low_rating_negative_pool(
+    low_rating_movie_ids: np.ndarray,
     positive_ids: np.ndarray,
     count: int,
     rng: np.random.Generator,
@@ -175,7 +173,7 @@ def _sample_low_rating_negative_ids(
 
     negatives = np.zeros((batch_size, count), dtype=np.int32)
     for row_idx in range(batch_size):
-        candidates = context_movie_ids[row_idx][context_low_rating_mask[row_idx] > 0]
+        candidates = low_rating_movie_ids[row_idx]
         candidates = candidates[(candidates > 0) & (candidates != positive_ids[row_idx])]
         if candidates.size == 0:
             continue
@@ -206,18 +204,14 @@ def _sample_recall_hard_negative_ids(
         return negatives, ranks, scores
 
     for row_idx, sample in enumerate(samples):
-        user_id = int(sample.get("user_id_original", sample["user_id"]))
+        user_id = int(sample["user_id"])
         candidates = fused_candidates_by_user.get(user_id)
-        if candidates is None:
-            candidates = fused_candidates_by_user.get(int(sample["user_id"]))
         if candidates is None:
             continue
         candidate_array = np.asarray(candidates, dtype=np.int32).reshape(-1)
         score_array = None
         if fused_scores_by_user:
             score_values = fused_scores_by_user.get(user_id)
-            if score_values is None:
-                score_values = fused_scores_by_user.get(int(sample["user_id"]))
             if score_values is not None:
                 score_array = np.asarray(score_values, dtype=np.float32).reshape(-1)
         blocked = set(int(item_id) for item_id in context_movie_ids[row_idx].tolist() if int(item_id) > 0)
@@ -283,11 +277,11 @@ def _sample_batch_negative_ids(
 
 def _init_batch_arrays(batch_size: int, context_width: int, candidate_size: int, genre_count: int) -> dict[str, np.ndarray]:
     batch = {field: np.zeros(batch_size, dtype=np.int32) for field in STATIC_USER_FIELDS}
-    batch["user_id_original"] = np.zeros(batch_size, dtype=np.int32)
+    batch["user_id_raw"] = np.zeros(batch_size, dtype=np.int32)
     for field in CONTEXT_FIELDS:
         if field == "context_length":
             batch[field] = np.zeros(batch_size, dtype=np.int32)
-        elif field in {"context_rating", "context_low_rating_mask"}:
+        elif field == "context_rating":
             batch[field] = np.zeros((batch_size, context_width), dtype=np.float32)
         else:
             batch[field] = np.zeros((batch_size, context_width), dtype=np.int32)
@@ -313,12 +307,12 @@ def _init_batch_arrays(batch_size: int, context_width: int, candidate_size: int,
 def _fill_base_fields(batch: dict[str, np.ndarray], sample: dict, row_idx: int) -> None:
     for field in STATIC_USER_FIELDS:
         batch[field][row_idx] = int(sample[field])
-    batch["user_id_original"][row_idx] = int(sample.get("user_id_original", sample["user_id"]))
+    batch["user_id_raw"][row_idx] = int(sample.get("user_id_raw", 0))
     batch["context_movie_id"][row_idx] = np.asarray(sample["context_movie_id"], dtype=np.int32)
     batch["context_rating"][row_idx] = np.asarray(sample.get("context_rating", np.zeros_like(sample["context_movie_id"], dtype=np.float32)), dtype=np.float32)
-    batch["context_low_rating_mask"][row_idx] = np.asarray(sample.get("context_low_rating_mask", np.zeros_like(sample["context_movie_id"], dtype=np.float32)), dtype=np.float32)
     batch["context_recency_bucket"][row_idx] = np.asarray(sample.get("context_recency_bucket", np.zeros_like(sample["context_movie_id"], dtype=np.int32)), dtype=np.int32)
     batch["context_length"][row_idx] = int(sample["context_length"])
+    batch["low_rating_movie_id"][row_idx] = np.asarray(sample.get("low_rating_movie_id", np.zeros_like(sample["context_movie_id"], dtype=np.int32)), dtype=np.int32)
     batch["target_rating"][row_idx] = float(sample.get("target_rating", 0.0))
 
 
@@ -366,7 +360,7 @@ def _numpy_batch_to_torch(batch: dict[str, np.ndarray]) -> dict[str, torch.Tenso
             result[field] = torch.as_tensor(values, dtype=torch.bool)
         elif field == "target_index":
             result[field] = torch.as_tensor(values, dtype=torch.long)
-        elif field in {"context_rating", "context_low_rating_mask", "target_rating", "candidate_relevance", "candidate_recall_rank", "candidate_recall_score"}:
+        elif field in {"context_rating", "target_rating", "candidate_relevance", "candidate_recall_rank", "candidate_recall_score"}:
             result[field] = torch.as_tensor(values, dtype=torch.float32)
         else:
             result[field] = torch.as_tensor(values, dtype=torch.long)

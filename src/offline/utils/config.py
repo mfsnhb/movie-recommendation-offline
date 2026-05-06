@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 
-RETRIEVAL_ROUTE_NAMES = ("two_tower", "sequence", "item2item", "item_cf", "multimodal", "genre", "popular")
+RETRIEVAL_ROUTE_NAMES = ("two_tower", "sequence", "item_cf", "multimodal", "genre", "popular")
 RANKING_MODEL_NAMES = ("deepfm", "din")
 
 
@@ -69,10 +69,8 @@ def resolve_retrieval_route_names(settings: dict, requested_routes=None) -> list
         common_settings = settings.get("common", {}) or {}
         configured_routes = list((common_settings.get("multi_recall", {}) or {}).get("routes", []) or [])
         enabled_learned_routes: list[str] = []
-        for route_name in ("two_tower", "sequence", "item2item"):
-            route_entry = models.get(route_name, {}) or {}
-            if route_name in {"two_tower", "sequence"} or bool(route_entry.get("enabled", True)):
-                enabled_learned_routes.append(route_name)
+        for route_name in ("two_tower", "sequence"):
+            enabled_learned_routes.append(route_name)
         default_routes: list[str] = []
         for route_name in enabled_learned_routes + configured_routes:
             normalized = str(route_name).strip().lower()
@@ -80,7 +78,7 @@ def resolve_retrieval_route_names(settings: dict, requested_routes=None) -> list
                 default_routes.append(normalized)
     else:
         configured_routes = list((settings.get("multi_recall", {}) or {}).get("routes", []) or [])
-        default_routes = ["two_tower", "sequence", "item2item"]
+        default_routes = ["two_tower", "sequence"]
         for route_name in configured_routes:
             normalized = str(route_name).strip().lower()
             if normalized in RETRIEVAL_ROUTE_NAMES and normalized not in default_routes:
@@ -161,19 +159,12 @@ def resolve_retrieval_config(settings: dict) -> dict:
 
         two_tower_entry = models.get("two_tower", {}) or {}
         sequence_entry = models.get("sequence", {}) or {}
-        item2item_entry = models.get("item2item", {}) or {}
         rating_semantics = resolve_rating_semantics(common_training)
         two_tower_training = _merge_dict(_merge_dict(common_training, two_tower_entry.get("training", {})), rating_semantics)
         sequence_training = _merge_dict(_merge_dict(common_training, sequence_entry.get("training", {})), rating_semantics)
 
         two_tower_settings = dict(two_tower_entry.get("architecture", {}))
         sequence_settings = dict(sequence_entry.get("architecture", {}))
-        item2item_settings = _merge_dict(
-            dict(item2item_entry.get("architecture", {})),
-            dict(item2item_entry.get("training", {})),
-        )
-        item2item_settings["enabled"] = bool(item2item_entry.get("enabled", True))
-
         tt_emb_dim = int(two_tower_settings.get("embedding_dim", 32))
         seq_emb_dim = int(sequence_settings.get("embedding_dim", tt_emb_dim))
         if tt_emb_dim != seq_emb_dim:
@@ -182,7 +173,6 @@ def resolve_retrieval_config(settings: dict) -> dict:
         return {
             "two_tower_settings": two_tower_settings,
             "sequence_settings": sequence_settings,
-            "item2item_settings": item2item_settings,
             "training_settings": two_tower_training,
             "two_tower_training_settings": two_tower_training,
             "sequence_training_settings": sequence_training,
@@ -193,7 +183,6 @@ def resolve_retrieval_config(settings: dict) -> dict:
         }
 
     legacy_model_settings = dict(settings.get("model", {}))
-    item2item_settings = dict(settings.get("item2item", {}))
     legacy_training = dict(settings.get("training", {}))
     rating_semantics = resolve_rating_semantics(legacy_training)
     merged_legacy_training = _merge_dict(legacy_training, rating_semantics)
@@ -211,7 +200,6 @@ def resolve_retrieval_config(settings: dict) -> dict:
             "max_len": legacy_model_settings.get("sequence_max_len", 10),
             "dropout": legacy_model_settings.get("sequence_dropout", 0.1),
         },
-        "item2item_settings": item2item_settings,
         "training_settings": merged_legacy_training,
         "two_tower_training_settings": merged_legacy_training,
         "sequence_training_settings": merged_legacy_training,

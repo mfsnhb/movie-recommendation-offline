@@ -76,6 +76,7 @@ class SequenceRetrievalModel(nn.Module):
         self.hidden_dim = int(hidden_dim or emb_dim)
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
         self.rating_projection = nn.Linear(1, emb_dim)
+        self.recency_embedding = nn.Embedding(feature_dict.get("hist_recency_bucket", 2), emb_dim, padding_idx=0)
         self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(
             input_size=emb_dim,
@@ -95,10 +96,13 @@ class SequenceRetrievalModel(nn.Module):
         hist_feedback: torch.Tensor | None = None,
         hist_item_features: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
-        del hist_recency_bucket
         if hist_item_features is None:
             raise ValueError("hist_item_features is required for sequence encoding")
         hist_movie_ids = hist_movie_ids[:, -self.max_len :]
+        if hist_recency_bucket is None:
+            hist_recency_bucket = torch.zeros_like(hist_movie_ids)
+        else:
+            hist_recency_bucket = hist_recency_bucket[:, -self.max_len :].long()
         if hist_rating is None:
             hist_rating = torch.zeros_like(hist_movie_ids, dtype=torch.float32)
         else:
@@ -122,11 +126,15 @@ class SequenceRetrievalModel(nn.Module):
             "averageRating": _left_align_by_order(hist_item_features["averageRating"], order, counts),
         }
         compact_rating = _left_align_by_order(hist_rating, order, counts).unsqueeze(-1)
+        compact_recency = _left_align_by_order(hist_recency_bucket, order, counts).long()
         compact_mask = compact_movie_ids.gt(0)
         lengths = compact_mask.sum(dim=1).cpu()
         x = self.movie_encoder(compact_features)
         rating_embedding = self.rating_projection(compact_rating.clamp_min(0.0) / 5.0).masked_fill(~compact_mask.unsqueeze(-1), 0.0)
-        x = x + rating_embedding
+        recency_embedding = self.recency_embedding(
+            compact_recency.clamp(min=0, max=self.recency_embedding.num_embeddings - 1)
+        ).masked_fill(~compact_mask.unsqueeze(-1), 0.0)
+        x = x + rating_embedding + recency_embedding
         x = self.dropout(x)
         compact_states = torch.zeros(hist_movie_ids.size(0), hist_movie_ids.size(1), self.hidden_dim, device=hist_movie_ids.device, dtype=x.dtype)
         non_empty = lengths.gt(0)

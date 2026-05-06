@@ -7,7 +7,7 @@ STATIC_USER_FIELDS = ["user_id", "gender", "age", "occupation", "zip_code"]
 POINTWISE_ITEM_FIELDS = ["movie_id", "genres", "isAdult", "startYear", "popularity", "averageRating"]
 POINTWISE_SEQUENCE_FIELDS = ["context_movie_id"]
 
-CONTEXT_FIELDS = ["context_movie_id", "context_rating", "context_low_rating_mask", "context_recency_bucket", "context_length"]
+CONTEXT_FIELDS = ["context_movie_id", "context_rating", "context_recency_bucket", "context_length", "low_rating_movie_id"]
 CANDIDATE_FIELDS = ["candidate_movie_id", "candidate_genres", "candidate_isAdult", "candidate_startYear", "candidate_popularity", "candidate_averageRating"]
 CANDIDATE_RECALL_FEATURE_FIELDS = ["candidate_recall_rank", "candidate_recall_score"]
 SPARSE_ITEM_FEATURE_FIELDS = ["genres", "isAdult", "startYear", "popularity", "averageRating"]
@@ -56,7 +56,7 @@ def extract_split_sample(split_data: dict, idx: int) -> dict:
         value = split_data[field][idx]
         if field == "context_length":
             sample[field] = int(value)
-        elif field in {"context_rating", "context_low_rating_mask"}:
+        elif field == "context_rating":
             sample[field] = np.asarray(value, dtype=np.float32)
         else:
             sample[field] = _as_int_array(value)
@@ -64,8 +64,8 @@ def extract_split_sample(split_data: dict, idx: int) -> dict:
         sample["target_movie_id"] = int(split_data["target_movie_id"][idx])
     if "target_rating" in split_data:
         sample["target_rating"] = float(split_data["target_rating"][idx])
-    if "user_id_original" in split_data:
-        sample["user_id_original"] = int(split_data["user_id_original"][idx])
+    if "user_id_raw" in split_data:
+        sample["user_id_raw"] = int(split_data["user_id_raw"][idx])
     return sample
 
 

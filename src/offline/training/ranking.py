@@ -390,11 +390,9 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
     if model_name == "deepfm":
         scorer = DeepFMModel(
             feature_dict,
-            POINTWISE_RANKING_FIELDS,
             emb_dim,
             dnn_hidden_dims=model_settings.get("dnn_hidden_dims"),
             dropout=float(model_settings.get("dropout", 0.1)),
-            history_fields=POINTWISE_SEQUENCE_FIELDS,
             multimodal_table=multimodal_table,
         )
         return scorer
@@ -402,14 +400,12 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
     if model_name == "din":
         scorer = DINModel(
             feature_dict,
-            POINTWISE_RANKING_FIELDS,
             emb_dim,
             dnn_hidden_dims=model_settings.get("dnn_hidden_dims"),
             attention_hidden_dims=model_settings.get("attention_hidden_dims"),
             dropout=float(model_settings.get("dropout", 0.1)),
             multimodal_table=multimodal_table,
-            positive_rating_min=float(model_settings.get("positive_rating_min", 4.0)),
-            negative_rating_max=float(model_settings.get("negative_rating_max", 2.0)),
+            top_m_history=int(model_settings.get("top_m_history", 32)),
         )
         return scorer
 

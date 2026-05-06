@@ -45,9 +45,8 @@ models:
       embedding_dim: 64
       dnn_hidden_dims: [256, 128]
       attention_hidden_dims: [128, 64]
+      top_m_history: 100
       dropout: 0.1
-      positive_rating_min: 4.0
-      negative_rating_max: 2.0
     training:
       batch_size: 512
       epochs: 10

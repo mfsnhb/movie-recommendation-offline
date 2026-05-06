@@ -8,7 +8,6 @@ common:
     early_stopping_patience: 2
     min_delta: 1.0e-4
     negative_sampling: mixed
-    hard_negative_queue_size: 4096
     hard_negative_topk: 32
     export_batch_size: 4096
     rating_weighting_enabled: false
@@ -52,20 +51,6 @@ models:
       dropout: 0.1
     training:
       sequence_num_negatives: 32
-      sequence_user_negative_ratio: 0.75
+      sequence_user_negative_ratio: 0.5
       sequence_loss: bce
       sequence_history_feedback: all
-
-  item2item:
-    enabled: false
-    architecture:
-      embedding_dim: 32
-      window_size: 10
-      negative_samples: 5
-    training:
-      epochs: 3
-      learning_rate: 0.025
-      batch_size: 2048
-      negative_sampling: hard
-      hard_negative_queue_size: 4096
-      hard_negative_topk: 16

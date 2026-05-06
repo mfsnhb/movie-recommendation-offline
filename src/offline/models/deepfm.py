@@ -10,15 +10,12 @@ class DeepFMModel(nn.Module):
     def __init__(
         self,
         feature_dict: dict,
-        fields: list[str],
         emb_dim: int,
         dnn_hidden_dims: list[int] | None = None,
         dropout: float = 0.1,
-        history_fields: list[str] | None = None,
         multimodal_table=None,
     ):
         super().__init__()
-        del fields, history_fields
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
         self.user_encoder = UserFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
         self.movie_linear = nn.Embedding(feature_dict["movie_id"], 1, padding_idx=0)
@@ -44,11 +41,9 @@ class DeepFMModel(nn.Module):
             "averageRating": batch["context_averageRating"],
         })
         history_mask = batch["context_movie_id"].gt(0)
-        if "context_low_rating_mask" in batch:
-            history_mask = history_mask & ~batch["context_low_rating_mask"].gt(0)
         history_weights = history_mask.unsqueeze(-1).float()
         pooled_history = (context_movie * history_weights).sum(dim=1) / history_weights.sum(dim=1).clamp_min(1e-9)
-        user_embedding = self.user_encoder(batch, context_movie, history_mask)
+        user_embedding = self.user_encoder(batch)
         pooled_history = pooled_history.unsqueeze(1).expand(-1, candidate_size, -1)
         user_vector = user_embedding.unsqueeze(1).expand(-1, candidate_size, -1)
         fm_vectors = torch.stack([candidate_movie, pooled_history, user_vector], dim=2)
