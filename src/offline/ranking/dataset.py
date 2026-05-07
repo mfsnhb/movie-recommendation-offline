@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from offline.ranking.protocol import CANDIDATE_FIELDS, CANDIDATE_RECALL_FEATURE_FIELDS, CONTEXT_FIELDS, SPARSE_ITEM_FEATURE_FIELDS, STATIC_USER_FIELDS, extract_split_sample
+from offline.ranking.protocol import CANDIDATE_FIELDS, CANDIDATE_RECALL_FEATURE_FIELDS, HISTORY_FIELDS, SPARSE_ITEM_FEATURE_FIELDS, STATIC_USER_FIELDS, extract_split_sample
 
 
 class SequenceRankingDataset(Dataset):
@@ -63,7 +63,7 @@ def build_inference_batch(
 
     batch = _init_batch_arrays(
         batch_size=len(valid_samples),
-        context_width=len(np.asarray(valid_samples[0]["context_movie_id"]).reshape(-1)),
+        history_width=len(np.asarray(valid_samples[0]["hist_movie_id"]).reshape(-1)),
         candidate_size=max_candidate_size,
         genre_count=int(item_features["genres"].shape[1]),
     )
@@ -72,7 +72,7 @@ def build_inference_batch(
     candidate_scores = np.zeros((len(valid_samples), max_candidate_size), dtype=np.float32)
     for row_idx, (sample, valid_candidates) in enumerate(zip(valid_samples, valid_candidates_by_sample, strict=True)):
         _fill_base_fields(batch, sample, row_idx=row_idx)
-        _fill_context_slots(batch, item_features=item_features, row_idx=row_idx)
+        _fill_history_slots(batch, item_features=item_features, row_idx=row_idx)
         candidate_ids[row_idx, : len(valid_candidates)] = np.asarray(valid_candidates, dtype=np.int32)
         candidate_ranks[row_idx, : len(valid_candidates)] = valid_ranks_by_sample[row_idx]
         candidate_scores[row_idx, : len(valid_candidates)] = valid_scores_by_sample[row_idx]
@@ -113,14 +113,14 @@ class SequenceRankingTrainCollator:
     def __call__(self, samples: list[dict]) -> dict[str, torch.Tensor]:
         batch = _init_batch_arrays(
             batch_size=len(samples),
-            context_width=len(np.asarray(samples[0]["context_movie_id"]).reshape(-1)),
+            history_width=len(np.asarray(samples[0]["hist_movie_id"]).reshape(-1)),
             candidate_size=self.num_negatives + 1,
             genre_count=int(self.item_features["genres"].shape[1]),
         )
         positive_ids = np.zeros(len(samples), dtype=np.int32)
         for row_idx, sample in enumerate(samples):
             _fill_base_fields(batch, sample, row_idx=row_idx)
-            _fill_context_slots(batch, item_features=self.item_features, row_idx=row_idx)
+            _fill_history_slots(batch, item_features=self.item_features, row_idx=row_idx)
             positive_ids[row_idx] = int(sample["target_movie_id"])
 
         low_rating_count = min(max(int(self.low_rating_negatives), 0), self.num_negatives)
@@ -135,7 +135,7 @@ class SequenceRankingTrainCollator:
         )
         hard_negative_ids, hard_negative_ranks, hard_negative_scores = _sample_recall_hard_negative_ids(
             samples=samples,
-            context_movie_ids=batch["context_movie_id"],
+            hist_movie_ids=batch["hist_movie_id"],
             positive_ids=positive_ids,
             count=hard_count,
             fused_candidates_by_user=self.fused_candidates_by_user,
@@ -145,7 +145,7 @@ class SequenceRankingTrainCollator:
         negative_ids = _sample_batch_negative_ids(
             all_item_ids=self.all_item_ids,
             item_id_positions=self.item_id_positions,
-            context_movie_ids=batch["context_movie_id"],
+            hist_movie_ids=batch["hist_movie_id"],
             positive_ids=positive_ids,
             count=random_count,
             rng=self.rng,
@@ -189,7 +189,7 @@ def _sample_low_rating_negative_pool(
 
 def _sample_recall_hard_negative_ids(
     samples: list[dict],
-    context_movie_ids: np.ndarray,
+    hist_movie_ids: np.ndarray,
     positive_ids: np.ndarray,
     count: int,
     fused_candidates_by_user: dict[int, np.ndarray] | None,
@@ -214,7 +214,7 @@ def _sample_recall_hard_negative_ids(
             score_values = fused_scores_by_user.get(user_id)
             if score_values is not None:
                 score_array = np.asarray(score_values, dtype=np.float32).reshape(-1)
-        blocked = set(int(item_id) for item_id in context_movie_ids[row_idx].tolist() if int(item_id) > 0)
+        blocked = set(int(item_id) for item_id in hist_movie_ids[row_idx].tolist() if int(item_id) > 0)
         blocked.add(int(positive_ids[row_idx]))
         if extra_blocked_ids is not None and extra_blocked_ids.size > 0:
             blocked.update(int(item_id) for item_id in extra_blocked_ids[row_idx].tolist() if int(item_id) > 0)
@@ -241,7 +241,7 @@ def _sample_recall_hard_negative_ids(
 def _sample_batch_negative_ids(
     all_item_ids: np.ndarray,
     item_id_positions: np.ndarray,
-    context_movie_ids: np.ndarray,
+    hist_movie_ids: np.ndarray,
     positive_ids: np.ndarray,
     count: int,
     rng: np.random.Generator,
@@ -254,7 +254,7 @@ def _sample_batch_negative_ids(
         return np.zeros((batch_size, count), dtype=np.int32)
 
     scores = rng.random((batch_size, all_item_ids.size), dtype=np.float32)
-    blocked_ids = np.concatenate([context_movie_ids.astype(np.int32, copy=False), positive_ids.reshape(-1, 1)], axis=1)
+    blocked_ids = np.concatenate([hist_movie_ids.astype(np.int32, copy=False), positive_ids.reshape(-1, 1)], axis=1)
     if extra_blocked_ids is not None and extra_blocked_ids.size > 0:
         blocked_ids = np.concatenate([blocked_ids, extra_blocked_ids.astype(np.int32, copy=False)], axis=1)
     flat_blocked = blocked_ids.reshape(-1)
@@ -275,20 +275,20 @@ def _sample_batch_negative_ids(
     return negatives
 
 
-def _init_batch_arrays(batch_size: int, context_width: int, candidate_size: int, genre_count: int) -> dict[str, np.ndarray]:
+def _init_batch_arrays(batch_size: int, history_width: int, candidate_size: int, genre_count: int) -> dict[str, np.ndarray]:
     batch = {field: np.zeros(batch_size, dtype=np.int32) for field in STATIC_USER_FIELDS}
     batch["user_id_raw"] = np.zeros(batch_size, dtype=np.int32)
-    for field in CONTEXT_FIELDS:
-        if field == "context_length":
+    for field in HISTORY_FIELDS:
+        if field == "hist_length":
             batch[field] = np.zeros(batch_size, dtype=np.int32)
-        elif field == "context_rating":
-            batch[field] = np.zeros((batch_size, context_width), dtype=np.float32)
+        elif field == "hist_rating":
+            batch[field] = np.zeros((batch_size, history_width), dtype=np.float32)
         else:
-            batch[field] = np.zeros((batch_size, context_width), dtype=np.int32)
-    batch["context_genres"] = np.zeros((batch_size, context_width, genre_count), dtype=np.int32)
+            batch[field] = np.zeros((batch_size, history_width), dtype=np.int32)
+    batch["hist_genres"] = np.zeros((batch_size, history_width, genre_count), dtype=np.int32)
     for field in SPARSE_ITEM_FEATURE_FIELDS:
         if field != "genres":
-            batch[f"context_{field}"] = np.zeros((batch_size, context_width), dtype=np.int32)
+            batch[f"hist_{field}"] = np.zeros((batch_size, history_width), dtype=np.int32)
     batch["target_index"] = np.zeros(batch_size, dtype=np.int64)
     batch["target_rating"] = np.zeros(batch_size, dtype=np.float32)
     batch["candidate_mask"] = np.zeros((batch_size, candidate_size), dtype=bool)
@@ -308,22 +308,22 @@ def _fill_base_fields(batch: dict[str, np.ndarray], sample: dict, row_idx: int) 
     for field in STATIC_USER_FIELDS:
         batch[field][row_idx] = int(sample[field])
     batch["user_id_raw"][row_idx] = int(sample.get("user_id_raw", 0))
-    batch["context_movie_id"][row_idx] = np.asarray(sample["context_movie_id"], dtype=np.int32)
-    batch["context_rating"][row_idx] = np.asarray(sample.get("context_rating", np.zeros_like(sample["context_movie_id"], dtype=np.float32)), dtype=np.float32)
-    batch["context_recency_bucket"][row_idx] = np.asarray(sample.get("context_recency_bucket", np.zeros_like(sample["context_movie_id"], dtype=np.int32)), dtype=np.int32)
-    batch["context_length"][row_idx] = int(sample["context_length"])
-    batch["low_rating_movie_id"][row_idx] = np.asarray(sample.get("low_rating_movie_id", np.zeros_like(sample["context_movie_id"], dtype=np.int32)), dtype=np.int32)
+    batch["hist_movie_id"][row_idx] = np.asarray(sample["hist_movie_id"], dtype=np.int32)
+    batch["hist_rating"][row_idx] = np.asarray(sample.get("hist_rating", np.zeros_like(sample["hist_movie_id"], dtype=np.float32)), dtype=np.float32)
+    batch["hist_recency_bucket"][row_idx] = np.asarray(sample.get("hist_recency_bucket", np.zeros_like(sample["hist_movie_id"], dtype=np.int32)), dtype=np.int32)
+    batch["hist_length"][row_idx] = int(sample["hist_length"])
+    batch["low_rating_movie_id"][row_idx] = np.asarray(sample.get("low_rating_movie_id", np.zeros_like(sample["hist_movie_id"], dtype=np.int32)), dtype=np.int32)
     batch["target_rating"][row_idx] = float(sample.get("target_rating", 0.0))
 
 
-def _fill_context_slots(batch: dict[str, np.ndarray], item_features: dict[str, np.ndarray], row_idx: int) -> None:
-    context_ids = batch["context_movie_id"][row_idx]
-    valid_mask = (context_ids > 0) & (context_ids < item_features["genres"].shape[0])
-    safe_context_ids = np.where(valid_mask, context_ids, 0).astype(np.int32, copy=False)
-    batch["context_genres"][row_idx] = item_features["genres"][safe_context_ids]
+def _fill_history_slots(batch: dict[str, np.ndarray], item_features: dict[str, np.ndarray], row_idx: int) -> None:
+    history_ids = batch["hist_movie_id"][row_idx]
+    valid_mask = (history_ids > 0) & (history_ids < item_features["genres"].shape[0])
+    safe_history_ids = np.where(valid_mask, history_ids, 0).astype(np.int32, copy=False)
+    batch["hist_genres"][row_idx] = item_features["genres"][safe_history_ids]
     for field in SPARSE_ITEM_FEATURE_FIELDS:
         if field != "genres":
-            batch[f"context_{field}"][row_idx] = item_features[field][safe_context_ids]
+            batch[f"hist_{field}"][row_idx] = item_features[field][safe_history_ids]
 
 
 def _fill_candidate_slots(
@@ -360,7 +360,7 @@ def _numpy_batch_to_torch(batch: dict[str, np.ndarray]) -> dict[str, torch.Tenso
             result[field] = torch.as_tensor(values, dtype=torch.bool)
         elif field == "target_index":
             result[field] = torch.as_tensor(values, dtype=torch.long)
-        elif field in {"context_rating", "target_rating", "candidate_relevance", "candidate_recall_rank", "candidate_recall_score"}:
+        elif field in {"hist_rating", "target_rating", "candidate_relevance", "candidate_recall_rank", "candidate_recall_score"}:
             result[field] = torch.as_tensor(values, dtype=torch.float32)
         else:
             result[field] = torch.as_tensor(values, dtype=torch.long)

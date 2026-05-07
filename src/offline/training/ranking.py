@@ -24,7 +24,9 @@ from offline.ranking.protocol import (
     extract_split_sample,
     get_all_item_ids,
     get_item_feature_arrays,
+    get_seen_movie_ids,
 )
+from offline.training.retrieval_common import validate_min_target_rating
 from offline.utils.config import resolve_ranking_config, resolve_ranking_model_names
 from offline.utils.io import (
     CONFIG_DIR,
@@ -176,6 +178,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     feature_dict = load_pickle(RANKING_FEATURE_DICT_PATH)
     item_features = get_item_feature_arrays(item_catalog)
     all_item_ids = get_all_item_ids(item_catalog)
+    _validate_ranking_training_samples(ranking_samples, training_settings)
 
     train_dataset = SequenceRankingDataset(ranking_samples["train"])
     validation_data = ranking_samples.get("validation")
@@ -406,10 +409,29 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
             dropout=float(model_settings.get("dropout", 0.1)),
             multimodal_table=multimodal_table,
             top_m_history=int(model_settings.get("top_m_history", 32)),
+            force_recent_history=int(model_settings.get("force_recent_history", 0)),
         )
         return scorer
 
     raise ValueError(f"Unsupported ranking model: {model_name}")
+
+
+def _validate_ranking_training_samples(ranking_samples: dict, training_settings: dict) -> None:
+    train_data = ranking_samples.get("train")
+    if not isinstance(train_data, dict):
+        raise ValueError(f"Ranking samples must contain a train split. Regenerate {RANKING_SAMPLE_PATH.name}.")
+    validate_min_target_rating(
+        train_data,
+        rating_field="target_rating",
+        min_rating=float(training_settings.get("positive_rating_min", 4.0)),
+        stage_name="Ranking train",
+        artifact_name=RANKING_SAMPLE_PATH.name,
+    )
+    if int(training_settings.get("low_rating_negatives", 0)) > 0 and "low_rating_movie_id" not in train_data:
+        raise ValueError(
+            "Ranking train samples are missing 'low_rating_movie_id', so low-rating hard negatives cannot be used. "
+            f"Regenerate {RANKING_SAMPLE_PATH.name}."
+        )
 
 
 
@@ -471,7 +493,7 @@ def _evaluate_hard_negative_validation(
                 sample = extract_split_sample(split_data, sample_idx)
                 target = int(sample["target_movie_id"])
                 user_id = int(sample["user_id"])
-                seen_ids = set(int(item_id) for item_id in np.asarray(sample.get("context_movie_id", []), dtype=np.int32).reshape(-1).tolist() if int(item_id) > 0)
+                seen_ids = set(get_seen_movie_ids(sample).tolist())
                 seen_ids.discard(target)
                 selected: list[int] = [target] if target > 0 else []
                 selected_ranks: list[float] = [0.0] if target > 0 else []

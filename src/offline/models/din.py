@@ -34,16 +34,18 @@ class DINModel(nn.Module):
         dropout: float = 0.1,
         multimodal_table=None,
         top_m_history: int = 32,
+        force_recent_history: int = 0,
     ):
         super().__init__()
         self.top_m_history = int(top_m_history)
+        self.force_recent_history = int(force_recent_history)
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
         self.static_embeddings = nn.ModuleDict({field: nn.Embedding(feature_dict[field], emb_dim, padding_idx=0) for field in STATIC_USER_FIELDS})
         self.user_profile_projection = build_mlp(emb_dim * len(STATIC_USER_FIELDS), [emb_dim * 2], emb_dim, dropout=dropout)
         self.history_rating_projection = nn.Linear(1, emb_dim)
         self.history_recency_embedding = nn.Embedding(feature_dict.get("recency_bucket", 21), emb_dim, padding_idx=0)
         self.activation_unit = LocalActivationUnit(emb_dim, attention_hidden_dims, dropout)
-        self.dnn = build_mlp(emb_dim * 4, dnn_hidden_dims or [256, 128], 1, dropout=dropout)
+        self.dnn = build_mlp(emb_dim * 3, dnn_hidden_dims or [256, 128], 1, dropout=dropout)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         candidate_movie_id = batch["candidate_movie_id"]
@@ -56,19 +58,19 @@ class DINModel(nn.Module):
             "popularity": batch["candidate_popularity"],
             "averageRating": batch["candidate_averageRating"],
         })
-        history_movie_id = batch["context_movie_id"]
+        history_movie_id = batch["hist_movie_id"]
         history_movie_embedding = self.movie_encoder({
             "movie_id": history_movie_id,
-            "genres": batch["context_genres"],
-            "isAdult": batch["context_isAdult"],
-            "startYear": batch["context_startYear"],
-            "popularity": batch["context_popularity"],
-            "averageRating": batch["context_averageRating"],
+            "genres": batch["hist_genres"],
+            "isAdult": batch["hist_isAdult"],
+            "startYear": batch["hist_startYear"],
+            "popularity": batch["hist_popularity"],
+            "averageRating": batch["hist_averageRating"],
         })
         history_mask = history_movie_id.gt(0)
-        history_rating = batch.get("context_rating", torch.zeros_like(history_movie_id, dtype=history_movie_embedding.dtype)).float()
+        history_rating = batch.get("hist_rating", torch.zeros_like(history_movie_id, dtype=history_movie_embedding.dtype)).float()
         history_rating_embedding = self.history_rating_projection((history_rating / 5.0).unsqueeze(-1)).masked_fill(~history_mask.unsqueeze(-1), 0.0)
-        history_recency_bucket = batch.get("context_recency_bucket", torch.zeros_like(history_movie_id)).long()
+        history_recency_bucket = batch.get("hist_recency_bucket", torch.zeros_like(history_movie_id)).long()
         history_recency_embedding = self.history_recency_embedding(
             history_recency_bucket.clamp(min=0, max=self.history_recency_embedding.num_embeddings - 1)
         ).masked_fill(~history_mask.unsqueeze(-1), 0.0)
@@ -76,16 +78,12 @@ class DINModel(nn.Module):
         attention_history, attention_mask = self._candidate_topm_history(candidate_embedding, history_embedding, history_mask)
 
         activated_history = self.activation_unit(candidate_embedding, attention_history, attention_mask)
-        global_history_context = self._weighted_pool(history_embedding, history_mask.float(), history_mask)
-        global_recency_context = self._weighted_pool(history_recency_embedding, 1.0 / history_recency_bucket.clamp_min(1).float(), history_mask)
-        context_embedding = global_history_context + global_recency_context
         user_profile = self.user_profile_projection(torch.cat([
             self.static_embeddings[field](batch[field].long())
             for field in STATIC_USER_FIELDS
         ], dim=-1))
         user_profile = user_profile.unsqueeze(1).expand(-1, candidate_size, -1)
-        context_embedding = context_embedding.unsqueeze(1).expand(-1, candidate_size, -1)
-        dnn_input = torch.cat([candidate_embedding, activated_history, user_profile, context_embedding], dim=-1)
+        dnn_input = torch.cat([candidate_embedding, activated_history, user_profile], dim=-1)
         logits = self.dnn(dnn_input.reshape(batch_size * candidate_size, -1)).view(batch_size, candidate_size)
         candidate_mask = batch.get("candidate_mask")
         if candidate_mask is not None:
@@ -100,17 +98,43 @@ class DINModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         history_width = history_embedding.size(1)
         top_m = history_width if self.top_m_history <= 0 else min(self.top_m_history, history_width)
+        recent_count = min(max(self.force_recent_history, 0), top_m)
+        candidate_count = candidate_embedding.size(1)
+        emb_dim = history_embedding.size(-1)
+        expanded_history = history_embedding.unsqueeze(1).expand(-1, candidate_count, -1, -1)
+        expanded_mask = history_mask.unsqueeze(1).expand(-1, candidate_count, -1)
+
+        if recent_count == 0:
+            similarity = torch.einsum("bce,bhe->bch", candidate_embedding, history_embedding)
+            similarity = similarity.masked_fill(~history_mask.unsqueeze(1), torch.finfo(similarity.dtype).min)
+            _, top_indices = torch.topk(similarity, k=top_m, dim=2)
+            gather_indices = top_indices.unsqueeze(-1).expand(-1, -1, -1, emb_dim)
+            selected_history = expanded_history.gather(2, gather_indices)
+            selected_mask = expanded_mask.gather(2, top_indices)
+            return selected_history, selected_mask
+
+        valid_counts = history_mask.long().sum(dim=1)
+        positions = torch.arange(history_width, device=history_embedding.device).unsqueeze(0).expand_as(history_mask)
+        recent_start = (valid_counts - recent_count).clamp_min(0).unsqueeze(1)
+        recent_region = history_mask & positions.ge(recent_start)
+        recent_order_keys = torch.where(recent_region, positions, positions - history_width)
+        recent_indices = recent_order_keys.topk(k=recent_count, dim=1).indices.sort(dim=1).values
+        recent_mask = history_mask.gather(1, recent_indices)
+        recent_history = history_embedding.gather(1, recent_indices.unsqueeze(-1).expand(-1, -1, emb_dim))
+        recent_history = recent_history.unsqueeze(1).expand(-1, candidate_count, -1, -1)
+        recent_mask = recent_mask.unsqueeze(1).expand(-1, candidate_count, -1)
+
+        semantic_count = top_m - recent_count
+        if semantic_count <= 0:
+            return recent_history, recent_mask
+
+        semantic_source_mask = history_mask & ~recent_region
         similarity = torch.einsum("bce,bhe->bch", candidate_embedding, history_embedding)
-        similarity = similarity.masked_fill(~history_mask.unsqueeze(1), torch.finfo(similarity.dtype).min)
-        _, top_indices = torch.topk(similarity, k=top_m, dim=2)
-        gather_indices = top_indices.unsqueeze(-1).expand(-1, -1, -1, history_embedding.size(-1))
-        expanded_history = history_embedding.unsqueeze(1).expand(-1, candidate_embedding.size(1), -1, -1)
-        selected_history = expanded_history.gather(2, gather_indices)
-        selected_mask = history_mask.unsqueeze(1).expand(-1, candidate_embedding.size(1), -1).gather(2, top_indices)
+        similarity = similarity.masked_fill(~semantic_source_mask.unsqueeze(1), torch.finfo(similarity.dtype).min)
+        _, semantic_indices = torch.topk(similarity, k=semantic_count, dim=2)
+        semantic_history = expanded_history.gather(2, semantic_indices.unsqueeze(-1).expand(-1, -1, -1, emb_dim))
+        semantic_mask = expanded_mask.gather(2, semantic_indices) & semantic_source_mask.unsqueeze(1).expand(-1, candidate_count, -1).gather(2, semantic_indices)
+        selected_history = torch.cat([recent_history, semantic_history], dim=2)
+        selected_mask = torch.cat([recent_mask, semantic_mask], dim=2)
         return selected_history, selected_mask
 
-    @staticmethod
-    def _weighted_pool(embeddings: torch.Tensor, weights: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        weighted_mask = weights.unsqueeze(-1).float() * mask.unsqueeze(-1).float()
-        denom = weighted_mask.sum(dim=1).clamp_min(1e-9)
-        return (embeddings * weighted_mask).sum(dim=1) / denom

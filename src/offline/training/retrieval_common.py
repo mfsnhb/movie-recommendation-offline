@@ -31,7 +31,6 @@ def slice_train_batch(train_data: dict[str, np.ndarray], indices: np.ndarray, de
         "hist_movie_id": torch.long,
         "hist_recency_bucket": torch.long,
         "hist_rating": torch.float32,
-        "hist_feedback": torch.long,
         "movie_id": torch.long,
         "rating": torch.float32,
         "user_negative_movie_id": torch.long,
@@ -42,17 +41,6 @@ def slice_train_batch(train_data: dict[str, np.ndarray], indices: np.ndarray, de
             continue
         batch[field] = torch.from_numpy(np.asarray(train_data[field])[indices]).to(device=device, dtype=dtype)
     return batch
-
-
-def rating_weight(values, settings: dict | None):
-    ratings = np.asarray(values, dtype=np.float32)
-    config = _rating_weight_config(settings)
-    if not bool(config["enabled"]):
-        weights = np.ones_like(ratings, dtype=np.float32)
-    else:
-        weights = 1.0 + float(config["scale"]) * (ratings - float(config["neutral"]))
-        weights = np.clip(weights, float(config["min"]), float(config["max"])).astype(np.float32, copy=False)
-    return float(weights.reshape(-1)[0]) if weights.ndim == 0 or weights.size == 1 else weights
 
 
 def gradient_norm(parameters) -> float:
@@ -84,7 +72,6 @@ def load_retrieval_context(settings: dict, config: dict) -> dict:
         "hist_movie_id",
         "hist_recency_bucket",
         "hist_rating",
-        "hist_feedback",
         "movie_id",
         "rating",
     ]
@@ -94,6 +81,14 @@ def load_retrieval_context(settings: dict, config: dict) -> dict:
             "Retrieval training artifacts use an outdated schema. "
             f"Missing fields: {missing_train_fields}. Run retrieval preprocessing again."
         )
+    positive_rating_min = float(config.get("rating_semantics", {}).get("positive_rating_min", 3.0))
+    validate_min_target_rating(
+        train_data,
+        rating_field="rating",
+        min_rating=positive_rating_min,
+        stage_name="Retrieval train",
+        artifact_name=RETRIEVAL_SAMPLE_PATH.name,
+    )
     return {
         "settings": settings,
         "resolved_config": config,
@@ -110,12 +105,21 @@ def load_retrieval_context(settings: dict, config: dict) -> dict:
     }
 
 
-def _rating_weight_config(settings: dict | None) -> dict[str, float | bool]:
-    source = dict(settings or {})
-    return {
-        "enabled": bool(source.get("rating_weighting_enabled", False)),
-        "neutral": float(source.get("rating_weight_neutral", 3.0)),
-        "scale": float(source.get("rating_weight_scale", 0.25)),
-        "min": float(source.get("rating_weight_min", 0.0)),
-        "max": float(source.get("rating_weight_max", 1.0)),
-    }
+def validate_min_target_rating(
+    split_data: dict[str, np.ndarray],
+    rating_field: str,
+    min_rating: float,
+    stage_name: str,
+    artifact_name: str,
+) -> None:
+    if rating_field not in split_data:
+        raise ValueError(f"{stage_name} samples are missing '{rating_field}'. Regenerate {artifact_name}.")
+    ratings = np.asarray(split_data[rating_field], dtype=np.float32)
+    min_seen = float(ratings.min()) if ratings.size else float("nan")
+    if min_seen >= float(min_rating):
+        return
+    bad_count = int(np.count_nonzero(ratings < float(min_rating)))
+    raise ValueError(
+        f"{stage_name} samples contain {bad_count} targets below rating {min_rating}. "
+        f"min_seen={min_seen}. Regenerate {artifact_name} with the current preprocessing config."
+    )

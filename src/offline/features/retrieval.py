@@ -116,19 +116,6 @@ def _recency_buckets(history_timestamps, target_timestamp, max_seq_len: int, pad
 
 
 
-def _feedback_tokens(rating_sequence, max_seq_len: int, positive_rating_min: float, negative_rating_max: float) -> np.ndarray:
-    ratings = np.asarray(rating_sequence, dtype=np.float32).reshape(-1)
-    padded = np.zeros(max_seq_len, dtype=np.int32)
-    clipped = ratings[-max_seq_len:]
-    if clipped.size == 0:
-        return padded
-    feedback = np.full(clipped.shape[0], 2, dtype=np.int32)
-    feedback[clipped >= float(positive_rating_min)] = 3
-    feedback[clipped <= float(negative_rating_max)] = 1
-    padded[-clipped.size :] = feedback
-    return padded
-
-
 
 def _user_negative_pool(movie_sequence, rating_sequence, max_pool_size: int, negative_rating_max: float) -> np.ndarray:
     movies = np.asarray(movie_sequence, dtype=np.int32).reshape(-1)
@@ -166,7 +153,6 @@ def _empty_retrieval_samples(sample_count: int, max_hist_seq_len: int, negative_
         "hist_movie_id": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_recency_bucket": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_rating": np.zeros((sample_count, max_hist_seq_len), dtype=np.float32),
-        "hist_feedback": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "user_negative_movie_id": np.zeros((sample_count, negative_pool_size), dtype=np.int32),
         "movie_id": np.zeros(sample_count, dtype=np.int32),
         "rating": np.zeros(sample_count, dtype=np.float32),
@@ -232,12 +218,6 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
         validation_data_dict["hist_movie_id"][validation_row] = _pad_sequence(movie_sequence[:validation_target_idx], max_hist_seq_len, padding_value)
         validation_data_dict["hist_recency_bucket"][validation_row] = _recency_buckets(timestamp_sequence[:validation_target_idx], timestamp_sequence[validation_target_idx], max_hist_seq_len, padding_value)
         validation_data_dict["hist_rating"][validation_row] = _pad_sequence(rating_sequence[:validation_target_idx], max_hist_seq_len, 0.0)
-        validation_data_dict["hist_feedback"][validation_row] = _feedback_tokens(
-            rating_sequence[:validation_target_idx],
-            max_hist_seq_len,
-            positive_rating_min,
-            negative_rating_max,
-        )
         validation_data_dict["user_negative_movie_id"][validation_row] = _user_negative_pool(
             movie_sequence[:validation_target_idx],
             rating_sequence[:validation_target_idx],
@@ -254,12 +234,6 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
         test_data_dict["hist_movie_id"][test_row] = _pad_sequence(movie_sequence[:test_target_idx], max_hist_seq_len, padding_value)
         test_data_dict["hist_recency_bucket"][test_row] = _recency_buckets(timestamp_sequence[:test_target_idx], timestamp_sequence[test_target_idx], max_hist_seq_len, padding_value)
         test_data_dict["hist_rating"][test_row] = _pad_sequence(rating_sequence[:test_target_idx], max_hist_seq_len, 0.0)
-        test_data_dict["hist_feedback"][test_row] = _feedback_tokens(
-            rating_sequence[:test_target_idx],
-            max_hist_seq_len,
-            positive_rating_min,
-            negative_rating_max,
-        )
         test_data_dict["user_negative_movie_id"][test_row] = _user_negative_pool(
             movie_sequence[:test_target_idx],
             rating_sequence[:test_target_idx],
@@ -277,12 +251,6 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
             train_data_dict["hist_movie_id"][train_row] = _pad_sequence(movie_sequence[:i], max_hist_seq_len, padding_value)
             train_data_dict["hist_recency_bucket"][train_row] = _recency_buckets(timestamp_sequence[:i], timestamp_sequence[i], max_hist_seq_len, padding_value)
             train_data_dict["hist_rating"][train_row] = _pad_sequence(rating_sequence[:i], max_hist_seq_len, 0.0)
-            train_data_dict["hist_feedback"][train_row] = _feedback_tokens(
-                rating_sequence[:i],
-                max_hist_seq_len,
-                positive_rating_min,
-                negative_rating_max,
-            )
             train_data_dict["user_negative_movie_id"][train_row] = _user_negative_pool(
                 movie_sequence[:i],
                 rating_sequence[:i],

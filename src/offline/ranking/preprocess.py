@@ -23,7 +23,9 @@ _SAMPLE_PROTOCOL = "prefix_positive_targets_v8"
 _ID_DTYPE = np.uint16
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
-_RECENCY_BUCKET_COUNT = 20
+_RECENCY_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
+_RECENCY_BUCKET_BOUNDARIES_SECONDS = np.asarray(_RECENCY_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
+_RECENCY_BUCKET_COUNT = len(_RECENCY_BUCKET_BOUNDARIES_DAYS) + 2
 
 
 def process_features_for_ranking(df_movies, df_ratings, df_users):
@@ -104,10 +106,10 @@ def _allocate_split_arrays(sample_count: int, max_seq_len: int) -> dict[str, np.
         "occupation": np.zeros(sample_count, dtype=_ID_DTYPE),
         "zip_code": np.zeros(sample_count, dtype=_ID_DTYPE),
         "user_id_raw": np.zeros(sample_count, dtype=np.int32),
-        "context_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
-        "context_rating": np.zeros((sample_count, max_seq_len), dtype=np.float32),
-        "context_recency_bucket": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
-        "context_length": np.zeros(sample_count, dtype=_ID_DTYPE),
+        "hist_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
+        "hist_rating": np.zeros((sample_count, max_seq_len), dtype=np.float32),
+        "hist_recency_bucket": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
+        "hist_length": np.zeros(sample_count, dtype=_ID_DTYPE),
         "low_rating_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "target_movie_id": np.zeros(sample_count, dtype=_ID_DTYPE),
         "target_rating": np.zeros(sample_count, dtype=np.float32),
@@ -130,32 +132,37 @@ def _fill_padded_float_row(target: np.ndarray, values: list[float]) -> None:
 
 
 
-def _build_recency_buckets(values: list[int], width: int) -> np.ndarray:
-    length = min(len(values), width)
+def _build_recency_buckets(history_timestamps: list[int], target_timestamp: int, width: int) -> np.ndarray:
+    timestamps = np.asarray(history_timestamps, dtype=np.int64).reshape(-1)[-width:]
     buckets = np.zeros(width, dtype=_ID_DTYPE)
-    if length > 0:
-        buckets[-length:] = np.minimum(np.arange(length, 0, -1, dtype=np.int32), _RECENCY_BUCKET_COUNT).astype(_ID_DTYPE)
+    if timestamps.size > 0:
+        deltas = np.maximum(np.int64(target_timestamp) - timestamps, 0)
+        bucket_ids = np.searchsorted(_RECENCY_BUCKET_BOUNDARIES_SECONDS, deltas, side="left") + 1
+        buckets[-bucket_ids.size :] = bucket_ids.astype(_ID_DTYPE, copy=False)
     return buckets
 
 
 def _split_history_by_rating(
     movie_sequence: list[int],
     rating_sequence: list[float],
+    history_timestamps: list[int],
     target_idx: int,
     interest_rating_min: float,
     negative_rating_max: float,
-) -> tuple[list[int], list[float], list[int]]:
-    context_movies: list[int] = []
-    context_ratings: list[float] = []
+) -> tuple[list[int], list[float], list[int], list[int]]:
+    hist_movies: list[int] = []
+    hist_ratings: list[float] = []
+    hist_timestamps: list[int] = []
     low_rating_movies: list[int] = []
-    for movie_id, rating in zip(movie_sequence[:target_idx], rating_sequence[:target_idx], strict=True):
+    for movie_id, rating, timestamp in zip(movie_sequence[:target_idx], rating_sequence[:target_idx], history_timestamps[:target_idx], strict=True):
         rating_value = float(rating)
         if rating_value >= float(interest_rating_min):
-            context_movies.append(int(movie_id))
-            context_ratings.append(rating_value)
+            hist_movies.append(int(movie_id))
+            hist_ratings.append(rating_value)
+            hist_timestamps.append(int(timestamp))
         elif rating_value <= float(negative_rating_max):
             low_rating_movies.append(int(movie_id))
-    return context_movies, context_ratings, low_rating_movies
+    return hist_movies, hist_ratings, hist_timestamps, low_rating_movies
 
 
 def _write_sample_row(
@@ -163,11 +170,13 @@ def _write_sample_row(
     row_idx: int,
     user_values: tuple[int, int, int, int, int],
     user_id_raw: int,
-    context_movies: list[int],
-    context_ratings: list[float],
+    hist_movies: list[int],
+    hist_ratings: list[float],
+    hist_timestamps: list[int],
     low_rating_movies: list[int],
     target_movie_id: int,
     target_rating: float,
+    target_timestamp: int,
 ) -> None:
     user_id, gender, age, occupation, zip_code = user_values
     store["user_id"][row_idx] = user_id
@@ -176,14 +185,14 @@ def _write_sample_row(
     store["occupation"][row_idx] = occupation
     store["zip_code"][row_idx] = zip_code
     store["user_id_raw"][row_idx] = user_id_raw
-    store["context_movie_id"][row_idx].fill(0)
-    store["context_rating"][row_idx].fill(0.0)
-    store["context_recency_bucket"][row_idx].fill(0)
+    store["hist_movie_id"][row_idx].fill(0)
+    store["hist_rating"][row_idx].fill(0.0)
+    store["hist_recency_bucket"][row_idx].fill(0)
     store["low_rating_movie_id"][row_idx].fill(0)
-    context_length = _fill_padded_row(store["context_movie_id"][row_idx], context_movies)
-    _fill_padded_float_row(store["context_rating"][row_idx], context_ratings)
-    store["context_recency_bucket"][row_idx] = _build_recency_buckets(context_movies, store["context_recency_bucket"][row_idx].shape[0])
-    store["context_length"][row_idx] = context_length
+    hist_length = _fill_padded_row(store["hist_movie_id"][row_idx], hist_movies)
+    _fill_padded_float_row(store["hist_rating"][row_idx], hist_ratings)
+    store["hist_recency_bucket"][row_idx] = _build_recency_buckets(hist_timestamps, target_timestamp, store["hist_recency_bucket"][row_idx].shape[0])
+    store["hist_length"][row_idx] = hist_length
     _fill_padded_row(store["low_rating_movie_id"][row_idx], low_rating_movies)
     store["target_movie_id"][row_idx] = target_movie_id
     store["target_rating"][row_idx] = np.float32(target_rating)
@@ -196,13 +205,15 @@ def _write_target_sample(
     user_id_raw: int,
     movie_sequence: list[int],
     rating_sequence: list[float],
+    timestamp_sequence: list[int],
     target_idx: int,
     interest_rating_min: float,
     negative_rating_max: float,
 ) -> None:
-    context_movies, context_ratings, low_rating_movies = _split_history_by_rating(
+    hist_movies, hist_ratings, hist_timestamps, low_rating_movies = _split_history_by_rating(
         movie_sequence,
         rating_sequence,
+        timestamp_sequence,
         target_idx,
         interest_rating_min,
         negative_rating_max,
@@ -212,11 +223,13 @@ def _write_target_sample(
         row_idx=row_idx,
         user_values=user_values,
         user_id_raw=user_id_raw,
-        context_movies=context_movies,
-        context_ratings=context_ratings,
+        hist_movies=hist_movies,
+        hist_ratings=hist_ratings,
+        hist_timestamps=hist_timestamps,
         low_rating_movies=low_rating_movies,
         target_movie_id=int(movie_sequence[target_idx]),
         target_rating=float(rating_sequence[target_idx]),
+        target_timestamp=int(timestamp_sequence[target_idx]),
     )
 
 
@@ -315,6 +328,7 @@ def build_prefix_train_eval_samples(
     for _, user_rows in df_sorted.groupby("user_id", sort=False):
         movie_sequence = [int(movie_id) for movie_id in user_rows["movie_id"].tolist()]
         rating_sequence = [float(rating) for rating in user_rows["rating"].tolist()]
+        timestamp_sequence = [int(timestamp) for timestamp in user_rows["timestamp"].tolist()]
         history_length = len(movie_sequence)
         if history_length < 2:
             continue
@@ -340,6 +354,7 @@ def build_prefix_train_eval_samples(
             user_id_raw=user_id_raw,
             movie_sequence=movie_sequence,
             rating_sequence=rating_sequence,
+            timestamp_sequence=timestamp_sequence,
             target_idx=validation_target_idx,
             interest_rating_min=interest_rating_min,
             negative_rating_max=negative_rating_max,
@@ -353,6 +368,7 @@ def build_prefix_train_eval_samples(
             user_id_raw=user_id_raw,
             movie_sequence=movie_sequence,
             rating_sequence=rating_sequence,
+            timestamp_sequence=timestamp_sequence,
             target_idx=test_target_idx,
             interest_rating_min=interest_rating_min,
             negative_rating_max=negative_rating_max,
@@ -368,6 +384,7 @@ def build_prefix_train_eval_samples(
                 user_id_raw=user_id_raw,
                 movie_sequence=movie_sequence,
                 rating_sequence=rating_sequence,
+                timestamp_sequence=timestamp_sequence,
                 target_idx=target_idx,
                 interest_rating_min=interest_rating_min,
                 negative_rating_max=negative_rating_max,

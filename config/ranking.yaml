@@ -46,6 +46,7 @@ models:
       dnn_hidden_dims: [256, 128]
       attention_hidden_dims: [128, 64]
       top_m_history: 100
+      force_recent_history: 100
       dropout: 0.1
     training:
       batch_size: 512

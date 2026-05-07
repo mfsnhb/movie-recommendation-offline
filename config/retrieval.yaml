@@ -1,6 +1,6 @@
 common:
   training:
-    batch_size: 768
+    batch_size: 512
     epochs: 10
     learning_rate: 0.0005
     weight_decay: 1.0e-5
@@ -10,12 +10,7 @@ common:
     negative_sampling: mixed
     hard_negative_topk: 32
     export_batch_size: 4096
-    rating_weighting_enabled: false
-    rating_weight_neutral: 3.0
-    rating_weight_scale: 0.25
-    rating_weight_min: 0.0
-    rating_weight_max: 1.0
-    positive_rating_min: 4.0
+    positive_rating_min: 3.0
     negative_rating_max: 2.0
     neutral_rating: 3.0
   evaluation:
@@ -47,7 +42,7 @@ models:
       embedding_dim: 32
       hidden_dim: 64
       num_layers: 1
-      max_len: 150
+      max_len: 100
       dropout: 0.1
     training:
       sequence_num_negatives: 32

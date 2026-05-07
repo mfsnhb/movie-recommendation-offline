@@ -6,7 +6,7 @@ from .dataset import (
 )
 from .protocol import (
     CANDIDATE_FIELDS,
-    CONTEXT_FIELDS,
+    HISTORY_FIELDS,
     ITEM_FEATURE_FIELDS,
     POINTWISE_ITEM_FIELDS,
     POINTWISE_SEQUENCE_FIELDS,
@@ -19,7 +19,7 @@ from .protocol import (
 
 __all__ = [
     "CANDIDATE_FIELDS",
-    "CONTEXT_FIELDS",
+    "HISTORY_FIELDS",
     "ITEM_FEATURE_FIELDS",
     "POINTWISE_ITEM_FIELDS",
     "POINTWISE_SEQUENCE_FIELDS",

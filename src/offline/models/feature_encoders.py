@@ -4,6 +4,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from offline.ranking.protocol import SPARSE_ITEM_FEATURE_FIELDS
+
 
 STATIC_USER_FIELDS = ("user_id", "gender", "age", "occupation", "zip_code")
 
@@ -44,6 +46,7 @@ class MovieFeatureEncoder(nn.Module):
         dropout: float = 0.1,
         output_norm: bool = False,
         multimodal_table: np.ndarray | torch.Tensor | None = None,
+        item_feature_table: dict[str, np.ndarray | torch.Tensor] | None = None,
     ):
         super().__init__()
         self.output_norm = bool(output_norm)
@@ -64,10 +67,31 @@ class MovieFeatureEncoder(nn.Module):
         self.multimodal_projection = build_mlp(self.multimodal_dim, [emb_dim * 2], emb_dim, dropout=dropout)
         self.multimodal_gate = nn.Parameter(torch.tensor(-2.0))
         self.projection = build_mlp(emb_dim * 6, hidden_dims or [emb_dim * 2], emb_dim, dropout=dropout)
+        self.has_item_feature_table = item_feature_table is not None
+        if item_feature_table is not None:
+            for field in SPARSE_ITEM_FEATURE_FIELDS:
+                values = torch.as_tensor(item_feature_table[field], dtype=torch.long)
+                self.register_buffer(f"item_feature_{field}", values, persistent=False)
 
-    def forward(self, item_batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def lookup_features(self, movie_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        if not self.has_item_feature_table:
+            raise ValueError("item_feature_table is required for movie_id lookup")
+        safe_ids = movie_ids.long().clamp(min=0, max=getattr(self, "item_feature_genres").size(0) - 1)
+        return {
+            "movie_id": movie_ids.long(),
+            "genres": getattr(self, "item_feature_genres")[safe_ids],
+            "isAdult": getattr(self, "item_feature_isAdult")[safe_ids],
+            "startYear": getattr(self, "item_feature_startYear")[safe_ids],
+            "popularity": getattr(self, "item_feature_popularity")[safe_ids],
+            "averageRating": getattr(self, "item_feature_averageRating")[safe_ids],
+        }
+
+    def forward(self, item_batch: dict[str, torch.Tensor] | torch.Tensor) -> torch.Tensor:
+        if isinstance(item_batch, torch.Tensor):
+            item_batch = self.lookup_features(item_batch)
+        movie_ids = item_batch["movie_id"].long()
         structured_parts = [
-            self.movie_emb(item_batch["movie_id"].long()),
+            self.movie_emb(movie_ids),
             self.genre_pool(item_batch["genres"].long()),
             self.is_adult_emb(item_batch["isAdult"].long()),
             self.start_year_emb(item_batch["startYear"].long()),
@@ -75,7 +99,7 @@ class MovieFeatureEncoder(nn.Module):
             self.average_rating_emb(item_batch["averageRating"].long()),
         ]
         output = self.projection(torch.cat(structured_parts, dim=-1))
-        multimodal = self.multimodal_table[item_batch["movie_id"].long().clamp(min=0, max=self.multimodal_table.size(0) - 1)]
+        multimodal = self.multimodal_table[movie_ids.clamp(min=0, max=self.multimodal_table.size(0) - 1)]
         output = output + torch.sigmoid(self.multimodal_gate) * self.multimodal_projection(multimodal)
         if self.output_norm:
             output = torch.nn.functional.normalize(output, dim=-1)

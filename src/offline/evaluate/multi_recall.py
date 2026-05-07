@@ -7,7 +7,6 @@ import torch
 import yaml
 
 from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, precision_at_k, recall_at_k, save_metrics
-from offline.features.item_batch import build_item_batch, item_feature_tensors as to_item_feature_tensors
 from offline.models.sequence_retrieval import SequenceRetrievalModel, filter_sequence_history
 from offline.models.two_tower import TwoTowerRetrievalModel
 from offline.ranking.protocol import get_all_item_ids, get_item_feature_arrays, get_seen_movie_ids
@@ -51,8 +50,10 @@ def run_multi_recall_build(routes=None, topk: int | None = None):
 
 
 def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
-    route_outputs, retrieval_samples = build_route_outputs(topk=topk, routes=routes, split_name="test")
+    retrieval_samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
+    retrieval_samples.pop("train", None)
     test = retrieval_samples["test"]
+    route_outputs = build_route_outputs(topk=topk, routes=routes, split_name="test", retrieval_samples=retrieval_samples)
     route_order = list(routes or DEFAULT_ROUTE_ORDER)
     metric_ks = sorted({50, 100, min(200, topk)})
     allocation_k = min(200, topk)
@@ -66,7 +67,7 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
     )
 
     validation_data = retrieval_samples["validation"]
-    validation_route_outputs, _ = build_route_outputs(topk=topk, routes=routes, split_name="validation")
+    validation_route_outputs = build_route_outputs(topk=topk, routes=routes, split_name="validation", retrieval_samples=retrieval_samples)
     validation_metrics, validation_route_recalls = evaluate_route_outputs(validation_route_outputs, validation_data, topk)
     incremental_stats = _compute_incremental_route_recalls(route_order, validation_route_outputs, validation_data, topk, validation_route_recalls)
     weight_source = "validation"
@@ -152,30 +153,18 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
 
 
 
-def build_route_outputs(topk: int, routes: list[str] | None = None, split_name: str = "test"):
-    retrieval_samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
+def build_route_outputs(topk: int, routes: list[str] | None = None, split_name: str = "test", retrieval_samples: dict | None = None):
+    retrieval_samples = retrieval_samples or load_pickle(RETRIEVAL_SAMPLE_PATH)
     item_catalog = load_pickle(ITEM_CATALOG_PATH)
     settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
     resolved_config = resolve_retrieval_config(settings)
     split = retrieval_samples[split_name]
-    if "hist_movie_id" not in split and "context_movie_id" in split:
-        split = dict(split)
-        split["hist_movie_id"] = split["context_movie_id"]
-        split["hist_rating"] = split.get("context_rating", np.zeros_like(split["context_movie_id"], dtype=np.float32))
-        split["movie_id"] = split["target_movie_id"]
-    if "hist_feedback" not in split and "hist_rating" in split:
-        split = dict(split)
-        split["hist_feedback"] = _feedback_tokens_from_ratings(
-            split["hist_rating"],
-            positive_rating_min=float(resolved_config["rating_semantics"].get("positive_rating_min", 4.0)),
-            negative_rating_max=float(resolved_config["rating_semantics"].get("negative_rating_max", 2.0)),
-        )
     item_features = get_item_feature_arrays(item_catalog)
     all_item_ids = get_all_item_ids(item_catalog)
     route_order = list(routes or DEFAULT_ROUTE_ORDER)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     route_outputs: dict[str, dict[int, dict[int, float]]] = {}
-    route_topk = max(topk * 2, topk + int(np.asarray(split.get("hist_movie_id", np.zeros((0, 0)))).shape[1] if "hist_movie_id" in split else 0))
+    route_topk = topk
 
     encoded_movie_ids = None
     if MOVIE_IDS_PATH.exists():
@@ -197,7 +186,7 @@ def build_route_outputs(topk: int, routes: list[str] | None = None, split_name: 
         else:
             route_outputs[route_name] = route_builder()
     route_outputs = _filter_seen_route_outputs(route_outputs, split, topk)
-    return route_outputs, retrieval_samples
+    return route_outputs
 
 
 
@@ -266,20 +255,10 @@ def _uniform_incremental_stats(route_order: list[str]) -> dict:
 
 
 
-def _feedback_tokens_from_ratings(ratings, positive_rating_min: float, negative_rating_max: float) -> np.ndarray:
-    values = np.asarray(ratings, dtype=np.float32)
-    feedback = np.zeros(values.shape, dtype=np.int32)
-    valid = values > 0
-    feedback[valid] = 2
-    feedback[values >= positive_rating_min] = 3
-    feedback[(values > 0) & (values <= negative_rating_max)] = 1
-    return feedback
-
-
 
 def _filter_seen_route_outputs(route_outputs: dict[str, dict[int, dict[int, float]]], test_data: dict, topk: int):
     seen_by_user = {
-        int(user_id): set(get_seen_movie_ids({"context_movie_id": test_data["hist_movie_id"][idx]}).tolist())
+        int(user_id): set(get_seen_movie_ids({"hist_movie_id": test_data["hist_movie_id"][idx]}).tolist())
         for idx, user_id in enumerate(test_data["user_id"])
     }
     filtered_outputs = {}
@@ -317,11 +296,12 @@ def _build_two_tower_output(test_data: dict, encoded_movie_ids: np.ndarray | Non
         item_hidden_dims=model_settings.get("item_hidden_dims"),
         dropout=float(model_settings.get("dropout", 0.1)),
         multimodal_table=item_features["multimodal_embedding"],
+        item_feature_table=item_features,
         recent_history_length=int(model_settings.get("recent_history_length", 20)),
     ).to(device)
     model.load_state_dict(retrieval_checkpoint["state_dict"])
     model.eval()
-    return _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, to_item_feature_tensors(item_features, device), device, topk)
+    return _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk)
 
 
 
@@ -346,12 +326,14 @@ def _build_sequence_output(test_data: dict, encoded_movie_ids: np.ndarray | None
         max_len=int(model_settings.get("max_len", model_settings.get("sequence_max_len", 10))),
         dropout=float(model_settings.get("dropout", model_settings.get("sequence_dropout", 0.1))),
         multimodal_table=item_features["multimodal_embedding"],
+        item_feature_table=item_features,
     ).to(device)
     model.load_state_dict(sequence_checkpoint["state_dict"])
     model.eval()
     training_settings = sequence_checkpoint.get("training_settings", {})
     history_feedback = str(training_settings.get("sequence_history_feedback", "positive")).strip().lower()
-    return _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, to_item_feature_tensors(item_features, device), device, topk, history_feedback=history_feedback)
+    positive_rating_min = float(training_settings.get("positive_rating_min", 3.0))
+    return _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk, history_feedback=history_feedback, positive_rating_min=positive_rating_min)
 
 
 
@@ -397,7 +379,7 @@ def _build_multimodal_output(test_data: dict, all_item_ids: np.ndarray, item_fea
 
 
 
-def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, item_feature_tensors, device, topk):
+def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk):
     outputs = {}
     with torch.no_grad():
         for idx, user_id in enumerate(test_data["user_id"]):
@@ -411,8 +393,6 @@ def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, item_
                 "hist_recency_bucket": torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device),
                 "hist_rating": torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device),
             }
-            hist_item_batch = build_item_batch(batch["hist_movie_id"], item_feature_tensors, device)
-            batch.update({f"hist_{field}": value for field, value in hist_item_batch.items() if field != "movie_id"})
             user_embedding = model.encode_user(batch).cpu().numpy()[0]
             scores = embeddings @ user_embedding
             top_indices = np.argsort(scores)[::-1][:topk]
@@ -421,28 +401,24 @@ def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, item_
 
 
 
-def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, item_feature_tensors, device, topk, history_feedback: str = "positive"):
+def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk, history_feedback: str = "positive", positive_rating_min: float = 3.0):
     outputs = {}
     with torch.no_grad():
         for idx, user_id in enumerate(test_data["user_id"]):
             hist_movie_ids = torch.tensor(np.asarray(test_data["hist_movie_id"][idx]).reshape(1, -1), dtype=torch.long, device=device)
             hist_recency_bucket = torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device)
             hist_rating = torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device)
-            hist_feedback = torch.tensor(np.asarray(test_data["hist_feedback"][idx]).reshape(1, -1), dtype=torch.long, device=device)
-            hist_movie_ids, hist_recency_bucket, hist_rating, hist_feedback = filter_sequence_history(
+            hist_movie_ids, hist_recency_bucket, hist_rating = filter_sequence_history(
                 hist_movie_ids,
                 hist_recency_bucket,
                 hist_rating,
-                hist_feedback,
                 history_feedback,
+                positive_rating_min,
             )
-            hist_item_features = build_item_batch(hist_movie_ids, item_feature_tensors, device)
             user_embedding = model.encode_user(
                 hist_movie_ids,
                 hist_recency_bucket,
                 hist_rating,
-                hist_feedback,
-                {field: value for field, value in hist_item_features.items() if field != "movie_id"},
             ).cpu().numpy()[0]
             scores = embeddings @ user_embedding
             top_indices = np.argsort(scores)[::-1][:topk]
@@ -488,7 +464,7 @@ def _multimodal_candidates(test_data, embeddings: np.ndarray, all_item_ids: np.n
         if user_norm > 0:
             user_vector = user_vector / user_norm
         scores = candidate_matrix @ user_vector
-        seen_items = set(get_seen_movie_ids({"context_movie_id": history_ids}).tolist())
+        seen_items = set(get_seen_movie_ids({"hist_movie_id": history_ids}).tolist())
         take = min(max(topk + len(seen_items), topk), scores.shape[0])
         top_positions = np.argpartition(scores, kth=scores.shape[0] - take)[-take:]
         top_positions = top_positions[np.argsort(scores[top_positions])[::-1]]
@@ -540,7 +516,7 @@ def _popular_candidates(test_data: dict, ranked_items: dict[int, float], topk: i
     ranked_pairs = [(int(item_id), float(score)) for item_id, score in ranked_items.items()]
     outputs = {}
     for idx, user_id in enumerate(test_data["user_id"]):
-        seen_items = set(get_seen_movie_ids({"context_movie_id": test_data["hist_movie_id"][idx]}).tolist())
+        seen_items = set(get_seen_movie_ids({"hist_movie_id": test_data["hist_movie_id"][idx]}).tolist())
         candidates = [(item_id, score) for item_id, score in ranked_pairs if item_id not in seen_items][:topk]
         outputs[int(user_id)] = dict(candidates)
     return outputs

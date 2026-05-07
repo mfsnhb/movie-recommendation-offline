@@ -5,9 +5,9 @@ import numpy as np
 
 STATIC_USER_FIELDS = ["user_id", "gender", "age", "occupation", "zip_code"]
 POINTWISE_ITEM_FIELDS = ["movie_id", "genres", "isAdult", "startYear", "popularity", "averageRating"]
-POINTWISE_SEQUENCE_FIELDS = ["context_movie_id"]
+POINTWISE_SEQUENCE_FIELDS = ["hist_movie_id"]
 
-CONTEXT_FIELDS = ["context_movie_id", "context_rating", "context_recency_bucket", "context_length", "low_rating_movie_id"]
+HISTORY_FIELDS = ["hist_movie_id", "hist_rating", "hist_recency_bucket", "hist_length", "low_rating_movie_id"]
 CANDIDATE_FIELDS = ["candidate_movie_id", "candidate_genres", "candidate_isAdult", "candidate_startYear", "candidate_popularity", "candidate_averageRating"]
 CANDIDATE_RECALL_FEATURE_FIELDS = ["candidate_recall_rank", "candidate_recall_score"]
 SPARSE_ITEM_FEATURE_FIELDS = ["genres", "isAdult", "startYear", "popularity", "averageRating"]
@@ -50,13 +50,13 @@ def get_all_item_ids(source: dict) -> np.ndarray:
 
 def extract_split_sample(split_data: dict, idx: int) -> dict:
     sample = {}
-    for field in STATIC_USER_FIELDS + CONTEXT_FIELDS:
+    for field in STATIC_USER_FIELDS + HISTORY_FIELDS:
         if field not in split_data:
             continue
         value = split_data[field][idx]
-        if field == "context_length":
+        if field == "hist_length":
             sample[field] = int(value)
-        elif field == "context_rating":
+        elif field == "hist_rating":
             sample[field] = np.asarray(value, dtype=np.float32)
         else:
             sample[field] = _as_int_array(value)
@@ -70,5 +70,5 @@ def extract_split_sample(split_data: dict, idx: int) -> dict:
 
 
 def get_seen_movie_ids(sample: dict) -> np.ndarray:
-    context = np.asarray(sample.get("context_movie_id", []), dtype=np.int32).reshape(-1)
+    context = np.asarray(sample.get("hist_movie_id", []), dtype=np.int32).reshape(-1)
     return np.unique(context[context > 0]).astype(np.int32, copy=False)

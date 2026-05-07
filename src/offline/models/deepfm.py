@@ -33,14 +33,14 @@ class DeepFMModel(nn.Module):
             "averageRating": batch["candidate_averageRating"],
         })
         context_movie = self.movie_encoder({
-            "movie_id": batch["context_movie_id"],
-            "genres": batch["context_genres"],
-            "isAdult": batch["context_isAdult"],
-            "startYear": batch["context_startYear"],
-            "popularity": batch["context_popularity"],
-            "averageRating": batch["context_averageRating"],
+            "movie_id": batch["hist_movie_id"],
+            "genres": batch["hist_genres"],
+            "isAdult": batch["hist_isAdult"],
+            "startYear": batch["hist_startYear"],
+            "popularity": batch["hist_popularity"],
+            "averageRating": batch["hist_averageRating"],
         })
-        history_mask = batch["context_movie_id"].gt(0)
+        history_mask = batch["hist_movie_id"].gt(0)
         history_weights = history_mask.unsqueeze(-1).float()
         pooled_history = (context_movie * history_weights).sum(dim=1) / history_weights.sum(dim=1).clamp_min(1e-9)
         user_embedding = self.user_encoder(batch)

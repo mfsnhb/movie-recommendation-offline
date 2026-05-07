@@ -15,6 +15,7 @@ class TwoTowerRetrievalModel(nn.Module):
         item_hidden_dims: list[int] | None = None,
         dropout: float = 0.1,
         multimodal_table=None,
+        item_feature_table=None,
         recent_history_length: int = 20,
     ):
         super().__init__()
@@ -25,6 +26,7 @@ class TwoTowerRetrievalModel(nn.Module):
             dropout=dropout,
             output_norm=False,
             multimodal_table=multimodal_table,
+            item_feature_table=item_feature_table,
         )
         self.user_encoder = UserFeatureEncoder(
             feature_dict,
@@ -36,14 +38,7 @@ class TwoTowerRetrievalModel(nn.Module):
         self.user_projection = build_mlp(emb_dim * 3, user_hidden_dims or [emb_dim * 4, emb_dim * 2], emb_dim, dropout=dropout)
 
     def encode_user(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        history_movie_embeddings = self.movie_encoder({
-            "movie_id": batch["hist_movie_id"],
-            "genres": batch["hist_genres"],
-            "isAdult": batch["hist_isAdult"],
-            "startYear": batch["hist_startYear"],
-            "popularity": batch["hist_popularity"],
-            "averageRating": batch["hist_averageRating"],
-        })
+        history_movie_embeddings = self.movie_encoder(batch["hist_movie_id"])
         history_mask = batch["hist_movie_id"].gt(0)
         static_user = self.user_encoder(batch)
         history_rating = batch.get("hist_rating")
@@ -65,6 +60,6 @@ class TwoTowerRetrievalModel(nn.Module):
         valid_count = history_mask.long().sum(dim=1, keepdim=True)
         return hist_movie_id.gt(0) & history_mask & valid_seen.gt((valid_count - self.recent_history_length).clamp_min(0))
 
-    def encode_item(self, item_batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        item_repr = self.movie_encoder(item_batch)
+    def encode_item(self, item_ids: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+        item_repr = self.movie_encoder(item_ids)
         return torch.nn.functional.normalize(item_repr, dim=1)
