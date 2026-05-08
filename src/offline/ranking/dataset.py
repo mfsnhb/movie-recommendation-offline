@@ -94,9 +94,9 @@ class SequenceRankingTrainCollator:
     item_features: dict[str, np.ndarray]
     all_item_ids: np.ndarray
     num_negatives: int
-    low_rating_negatives: int = 5
-    recall_hard_negatives: int = 10
-    random_negatives: int = 5
+    low_rating_negative_ratio: float = 0.6
+    recall_negative_ratio: float = 0.3
+    random_negative_ratio: float = 0.1
     fused_candidates_by_user: dict[int, np.ndarray] | None = None
     fused_scores_by_user: dict[int, np.ndarray] | None = None
     seed: int = 42
@@ -123,10 +123,12 @@ class SequenceRankingTrainCollator:
             _fill_history_slots(batch, item_features=self.item_features, row_idx=row_idx)
             positive_ids[row_idx] = int(sample["target_movie_id"])
 
-        low_rating_count = min(max(int(self.low_rating_negatives), 0), self.num_negatives)
-        hard_count = min(max(int(self.recall_hard_negatives), 0), max(self.num_negatives - low_rating_count, 0))
-        random_count = min(max(int(self.random_negatives), 0), max(self.num_negatives - low_rating_count - hard_count, 0))
-        random_count += max(self.num_negatives - low_rating_count - hard_count - random_count, 0)
+        low_rating_count, hard_count, random_count = _negative_counts_from_ratios(
+            num_negatives=self.num_negatives,
+            low_rating_ratio=self.low_rating_negative_ratio,
+            recall_ratio=self.recall_negative_ratio,
+            random_ratio=self.random_negative_ratio,
+        )
         low_rating_negative_ids = _sample_low_rating_negative_pool(
             low_rating_movie_ids=batch["low_rating_movie_id"],
             positive_ids=positive_ids,
@@ -159,6 +161,28 @@ class SequenceRankingTrainCollator:
         candidate_scores[:, hard_start : hard_start + hard_negative_ids.shape[1]] = hard_negative_scores
         _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=self.item_features, candidate_recall_ranks=candidate_ranks, candidate_recall_scores=candidate_scores)
         return _numpy_batch_to_torch(batch)
+
+
+def _negative_counts_from_ratios(
+    num_negatives: int,
+    low_rating_ratio: float,
+    recall_ratio: float,
+    random_ratio: float,
+) -> tuple[int, int, int]:
+    total = max(int(num_negatives), 0)
+    if total == 0:
+        return 0, 0, 0
+    ratios = np.asarray([low_rating_ratio, recall_ratio, random_ratio], dtype=np.float64)
+    ratios = np.where(np.isfinite(ratios) & (ratios > 0), ratios, 0.0)
+    if float(ratios.sum()) <= 0.0:
+        ratios = np.asarray([0.6, 0.3, 0.1], dtype=np.float64)
+    quotas = ratios / ratios.sum() * total
+    counts = np.floor(quotas).astype(np.int32)
+    remainder = total - int(counts.sum())
+    if remainder > 0:
+        order = np.argsort(-(quotas - counts))
+        counts[order[:remainder]] += 1
+    return int(counts[0]), int(counts[1]), int(counts[2])
 
 
 def _sample_low_rating_negative_pool(

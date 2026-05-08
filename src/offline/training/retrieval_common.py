@@ -33,7 +33,6 @@ def slice_train_batch(train_data: dict[str, np.ndarray], indices: np.ndarray, de
         "hist_rating": torch.float32,
         "movie_id": torch.long,
         "rating": torch.float32,
-        "user_negative_movie_id": torch.long,
     }
     batch: dict[str, torch.Tensor] = {}
     for field, dtype in tensor_specs.items():
@@ -81,14 +80,31 @@ def load_retrieval_context(settings: dict, config: dict) -> dict:
             "Retrieval training artifacts use an outdated schema. "
             f"Missing fields: {missing_train_fields}. Run retrieval preprocessing again."
         )
+    if np.asarray(train_data["hist_movie_id"]).shape != np.asarray(train_data["hist_rating"]).shape:
+        raise ValueError(f"Retrieval training artifacts have misaligned hist_movie_id/hist_rating shapes. Regenerate {RETRIEVAL_SAMPLE_PATH.name}.")
+    sample_rating_semantics = train_eval_samples.get("rating_semantics", {})
     positive_rating_min = float(config.get("rating_semantics", {}).get("positive_rating_min", 3.0))
+    eval_positive_rating_min = float(
+        sample_rating_semantics.get(
+            "eval_positive_rating_min",
+            config.get("rating_semantics", {}).get("eval_positive_rating_min", 4.0),
+        )
+    )
     validate_min_target_rating(
-        train_data,
+        train_eval_samples["train"],
         rating_field="rating",
         min_rating=positive_rating_min,
         stage_name="Retrieval train",
         artifact_name=RETRIEVAL_SAMPLE_PATH.name,
     )
+    for split_name in ("validation", "test"):
+        validate_min_target_rating(
+            train_eval_samples[split_name],
+            rating_field="rating",
+            min_rating=eval_positive_rating_min,
+            stage_name=f"Retrieval {split_name}",
+            artifact_name=RETRIEVAL_SAMPLE_PATH.name,
+        )
     return {
         "settings": settings,
         "resolved_config": config,

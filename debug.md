@@ -1,12 +1,14 @@
 # debug
 
-- 特征有哪些？movie侧
+- 项目是推荐用户下一个喜欢看的电影，而不是是简单的推荐下一个电影。因为数据集里面由显式的评分数据，而不是只是点击交互。所以输入序列可以包含所有交互历史，但监督信号一定只来自高分。
+- 特征有哪些？user 侧：包含了user_id，gender，age，occupation，zip_code；movie侧：movie_id，genres，isAdult，startYear，popularity，averagerating，多模态embedding。
 - 最大序列长度？从原始的数据来看，用户平均历史交互长度为165左右，p75大概是200多，p90大概400，超过150条历史的用户大概占35%。过滤掉非高分（小于等于4）交互movie后，平均长度变成95，p75大概124左右，超过150条正反馈的用户大概占19%。过滤掉低分（小于3）交互movie后，平均长度变为138，p75为177，p90为328。现在召回侧的max_len设置为500，排序侧为300
 - 指标不太行 -> 召回策略有问题，不够强，很多物品没被召回。 -> 召回集是所有用户共享的还是**用户有各自的候选集**？或者就是召回质量差
 - 数据集不包含天然负样本，因此排序模型也需要hard negative（一开始用in_batch negative太简单了）。召回本来就需要负采样，但召回可以选（in_batch_negative）
 - 多路召回，怎么融合多路召回的结果的？按recall率分配各自该召回的数量。多路包括two-tower，GRU4Rec，还有基于启发式的popular，genre召回。itemcf做了时间加权，还加入了多模态embedding召回（使用VIT-L14对poster，title，description进行了embedding，user embedding用mean pooling之后的最近序列的movie的embedding来代表，然后内积打分）。最终召回的候选集应该排除掉测试集之前的所有见过的movie，否则指标天然高。当前召回率**recall@200 0.736**，单路最高是GRU4Rec，0.65；然后是itemcf，0.63；然后是双塔，0.55
-  - GRU4Rec是序列模型，根据输入序列（每个位置是movie id的embedding），通过GRU（重置门控制上一个阶段的隐状态有多少要保留到这阶段作为信息，更新们控制当前阶段的隐状态用多少当前阶段的信息进行更新）为每个位置生成一个代表当前状态的hidden states，然后可以跟ground truth做监督学习。loss是next item的pairwise的BPR，可以选listwise的softmax作为辅助，也就是拉开user embedding与正样本的embedding的点积与其他负样本点积的差距。（注，这里还是用prefix吧，因为用户太少，序列不够，绝对样本少了）
-  - 双塔模型loss不怎么掉？本来双塔模型的loss就很难降，因为loss主要来自于用户的embedding与item的embedding的内积，而且两个塔之间中间互补交互，梯度很难传递。并且如果负采样很随机，每个item和user的内积都差不多，logits区分度不够，正负样本的logits差不多，无法区分哪些是真正应该召回。debug：设置temperature=0.05，区分开正负样本的logits。（为什么温度设置这么低，因为正则化之后，内积范围为[0,1]，所以logits很小，温度小一点才能起到很大的放缩作用）。并且严格过滤负样本，不允许出现用户交互过的序列，被in_batch设置为负样本。
+  - GRU4Rec是序列模型，根据输入序列（每个位置是movie id的embedding），通过GRU（重置门控制上一个阶段的隐状态有多少要保留到这阶段作为信息，更新们控制当前阶段的隐状态用多少当前阶段的信息进行更新）为每个位置生成一个代表当前状态的hidden states，然后可以跟ground truth做监督学习。loss是next item的pairwise的BPR（一对正负样本），可以选listwise的softmax作为辅助，也就是拉开user embedding与正样本的embedding的点积与其他负样本点积的差距。（注，这里还是用prefix吧，因为用户太少，序列不够，绝对样本少了）
+  - 双塔模型loss不怎么掉？本来双塔模型的loss就很难降，因为loss主要来自于用户的embedding与item的embedding的内积，而且两个塔之间中间互补交互，梯度很难传递。并且如果负采样很随机，每个item和user的内积都差不多，logits区分度不够，正负样本的logits差不多，无法区分哪些是真正应该召回。debug：设置temperature=0.05，区分开正负样本的logits。（为什么温度设置这么低，因为正则化之后，内积范围为[0,1]，所以logits很小，温度小一点才能起到很大的放缩作用）。并且严格过滤负样本，不允许出现用户交互过的序列，被in_batch设置为负样本。随机负采样是大头，可以加少量相似样本；还可以根据流行度采样，被采样概率Q 正比于 点击次数的0.75次方。注意，如果非随机采样了，logits要做logQ修正。
+  - 召回模型不能选择低分movie作为负样本！！！
 - 排序模型主要使用DIN这个序列模型，DIN怎么设计的？输入的是？输出的是？
 - 早停是需要根据一个指标来判断的，比如随机采样的ce loss（优点是解耦），或者直接在召回的候选集进行top-k排序，然后看NDCG@20进行早停。
 - 如何利用评分？低分（小于等于2）当负例，高分（大于等于4）当正例，3分当中立。序列模型的训练只拿正例进行训练，低分的movie直接mask掉。召回模型允许拿中性样本与正样本进行训练

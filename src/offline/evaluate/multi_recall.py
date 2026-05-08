@@ -7,7 +7,7 @@ import torch
 import yaml
 
 from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, precision_at_k, recall_at_k, save_metrics
-from offline.models.sequence_retrieval import SequenceRetrievalModel, filter_sequence_history
+from offline.models.sequence_retrieval import SequenceRetrievalModel
 from offline.models.two_tower import TwoTowerRetrievalModel
 from offline.ranking.protocol import get_all_item_ids, get_item_feature_arrays, get_seen_movie_ids
 from offline.utils.config import resolve_multi_recall_route_names, resolve_retrieval_config
@@ -21,6 +21,7 @@ from offline.utils.io import (
     MULTI_RECALL_ARTIFACTS_PATH,
     MULTI_RECALL_METRICS_PATH,
     POPULAR_MODEL_PATH,
+    RANKING_SAMPLE_PATH,
     RETRIEVAL_FEATURE_DICT_PATH,
     RETRIEVAL_MODEL_PATH,
     RETRIEVAL_SAMPLE_PATH,
@@ -52,6 +53,7 @@ def run_multi_recall_build(routes=None, topk: int | None = None):
 def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
     retrieval_samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
     retrieval_samples.pop("train", None)
+    _validate_retrieval_ranking_targets(retrieval_samples)
     test = retrieval_samples["test"]
     route_outputs = build_route_outputs(topk=topk, routes=routes, split_name="test", retrieval_samples=retrieval_samples)
     route_order = list(routes or DEFAULT_ROUTE_ORDER)
@@ -150,6 +152,41 @@ def build_multi_recall_artifacts(topk: int, routes: list[str] | None = None):
     save_pickle(artifacts, MULTI_RECALL_ARTIFACTS_PATH)
     logger.info("Multi-recall artifact build done | fused_metrics=%s", fused_metrics)
     return artifacts
+
+
+def _validate_retrieval_ranking_targets(retrieval_samples: dict) -> None:
+    if not RANKING_SAMPLE_PATH.exists():
+        logger.warning(
+            "Retrieval/ranking target alignment check skipped | reason=missing_ranking_samples | path=%s",
+            RANKING_SAMPLE_PATH.name,
+        )
+        return
+    ranking_samples = load_pickle(RANKING_SAMPLE_PATH)
+    for split_name in ("validation", "test"):
+        retrieval_split = retrieval_samples.get(split_name)
+        ranking_split = ranking_samples.get(split_name)
+        if not isinstance(retrieval_split, dict) or not isinstance(ranking_split, dict):
+            raise ValueError(f"Missing {split_name} split in retrieval or ranking samples. Rerun preprocessing.")
+        retrieval_users = np.asarray(retrieval_split["user_id"], dtype=np.int64).reshape(-1)
+        retrieval_targets = np.asarray(retrieval_split["movie_id"], dtype=np.int64).reshape(-1)
+        ranking_users = np.asarray(ranking_split["user_id"], dtype=np.int64).reshape(-1)
+        ranking_targets = np.asarray(ranking_split["target_movie_id"], dtype=np.int64).reshape(-1)
+        if retrieval_users.shape[0] != ranking_users.shape[0]:
+            raise ValueError(
+                f"Retrieval/ranking {split_name} target count mismatch: "
+                f"retrieval={retrieval_users.shape[0]} ranking={ranking_users.shape[0]}. Rerun preprocessing."
+            )
+        if not np.array_equal(retrieval_users, ranking_users) or not np.array_equal(retrieval_targets, ranking_targets):
+            mismatches = np.flatnonzero((retrieval_users != ranking_users) | (retrieval_targets != ranking_targets))
+            first_idx = int(mismatches[0]) if mismatches.size else 0
+            raise ValueError(
+                f"Retrieval/ranking {split_name} targets are not aligned. "
+                f"first_mismatch_idx={first_idx} "
+                f"retrieval=(user={int(retrieval_users[first_idx])}, target={int(retrieval_targets[first_idx])}) "
+                f"ranking=(user={int(ranking_users[first_idx])}, target={int(ranking_targets[first_idx])}). "
+                "Rerun ranking and retrieval preprocessing."
+            )
+        logger.info("Retrieval/ranking target alignment ok | split=%s | users=%s", split_name, retrieval_users.shape[0])
 
 
 
@@ -330,10 +367,7 @@ def _build_sequence_output(test_data: dict, encoded_movie_ids: np.ndarray | None
     ).to(device)
     model.load_state_dict(sequence_checkpoint["state_dict"])
     model.eval()
-    training_settings = sequence_checkpoint.get("training_settings", {})
-    history_feedback = str(training_settings.get("sequence_history_feedback", "positive")).strip().lower()
-    positive_rating_min = float(training_settings.get("positive_rating_min", 3.0))
-    return _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk, history_feedback=history_feedback, positive_rating_min=positive_rating_min)
+    return _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk)
 
 
 
@@ -373,7 +407,7 @@ def _build_multimodal_output(test_data: dict, all_item_ids: np.ndarray, item_fea
         embeddings,
         all_item_ids,
         topk,
-        positive_rating_min=float(rating_semantics.get("positive_rating_min", 4.0)),
+        positive_rating_min=float(rating_semantics.get("positive_rating_min", 3.0)),
         history_size=int(rating_semantics.get("multimodal_history_size", 10)),
     )
 
@@ -401,20 +435,13 @@ def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, devic
 
 
 
-def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk, history_feedback: str = "positive", positive_rating_min: float = 3.0):
+def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device, topk):
     outputs = {}
     with torch.no_grad():
         for idx, user_id in enumerate(test_data["user_id"]):
             hist_movie_ids = torch.tensor(np.asarray(test_data["hist_movie_id"][idx]).reshape(1, -1), dtype=torch.long, device=device)
             hist_recency_bucket = torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device)
             hist_rating = torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device)
-            hist_movie_ids, hist_recency_bucket, hist_rating = filter_sequence_history(
-                hist_movie_ids,
-                hist_recency_bucket,
-                hist_rating,
-                history_feedback,
-                positive_rating_min,
-            )
             user_embedding = model.encode_user(
                 hist_movie_ids,
                 hist_recency_bucket,

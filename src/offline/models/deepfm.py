@@ -39,6 +39,7 @@ class DeepFMModel(nn.Module):
             "startYear": batch["hist_startYear"],
             "popularity": batch["hist_popularity"],
             "averageRating": batch["hist_averageRating"],
+            "interaction_rating": batch["hist_rating"],
         })
         history_mask = batch["hist_movie_id"].gt(0)
         history_weights = history_mask.unsqueeze(-1).float()

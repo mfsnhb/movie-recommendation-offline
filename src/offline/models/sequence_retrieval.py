@@ -43,22 +43,6 @@ def _right_align_sequence_states(states: torch.Tensor, compact_mask: torch.Tenso
     return torch.where(valid_positions.unsqueeze(-1), gathered, torch.zeros_like(states))
 
 
-def filter_sequence_history(
-    hist_movie_ids: torch.Tensor,
-    hist_recency_bucket: torch.Tensor | None = None,
-    hist_rating: torch.Tensor | None = None,
-    history_feedback: str = "positive",
-    positive_rating_min: float = 3.0,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    if history_feedback == "all" or hist_rating is None:
-        return hist_movie_ids, hist_recency_bucket, hist_rating
-    keep_mask = hist_movie_ids.gt(0) & hist_rating.float().ge(float(positive_rating_min))
-    filtered_movie_ids = right_align_by_mask(hist_movie_ids, keep_mask)
-    filtered_recency = right_align_by_mask(hist_recency_bucket, keep_mask) if hist_recency_bucket is not None else None
-    filtered_rating = right_align_by_mask(hist_rating, keep_mask)
-    return filtered_movie_ids, filtered_recency, filtered_rating
-
-
 class SequenceRetrievalModel(nn.Module):
     def __init__(
         self,
@@ -75,7 +59,6 @@ class SequenceRetrievalModel(nn.Module):
         self.max_len = max_len
         self.hidden_dim = int(hidden_dim or emb_dim)
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table, item_feature_table=item_feature_table)
-        self.rating_projection = nn.Linear(1, emb_dim)
         self.recency_embedding = nn.Embedding(feature_dict.get("hist_recency_bucket", 2), emb_dim, padding_idx=0)
         self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(
@@ -111,16 +94,15 @@ class SequenceRetrievalModel(nn.Module):
         order = order_keys.argsort(dim=1)
         counts = visible_mask.sum(dim=1)
         compact_movie_ids = _left_align_by_order(hist_movie_ids, order, counts)
-        compact_rating = _left_align_by_order(hist_rating, order, counts).unsqueeze(-1)
+        compact_rating = _left_align_by_order(hist_rating, order, counts)
         compact_recency = _left_align_by_order(hist_recency_bucket, order, counts).long()
         compact_mask = compact_movie_ids.gt(0)
         lengths = compact_mask.sum(dim=1).cpu()
-        x = self.movie_encoder(compact_movie_ids)
-        rating_embedding = self.rating_projection(compact_rating.clamp_min(0.0) / 5.0).masked_fill(~compact_mask.unsqueeze(-1), 0.0)
+        x = self.movie_encoder({"movie_id": compact_movie_ids, "interaction_rating": compact_rating})
         recency_embedding = self.recency_embedding(
             compact_recency.clamp(min=0, max=self.recency_embedding.num_embeddings - 1)
         ).masked_fill(~compact_mask.unsqueeze(-1), 0.0)
-        x = x + rating_embedding + recency_embedding
+        x = x + recency_embedding
         x = self.dropout(x)
         compact_states = torch.zeros(hist_movie_ids.size(0), hist_movie_ids.size(1), self.hidden_dim, device=hist_movie_ids.device, dtype=x.dtype)
         non_empty = lengths.gt(0)

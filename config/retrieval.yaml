@@ -7,11 +7,10 @@ common:
     log_every_n_batches: 100
     early_stopping_patience: 2
     min_delta: 1.0e-4
-    negative_sampling: mixed
-    hard_negative_topk: 32
+    hard_negative_ratio: 0.1
     export_batch_size: 4096
     positive_rating_min: 3.0
-    negative_rating_max: 2.0
+    eval_positive_rating_min: 4.0
     neutral_rating: 3.0
   evaluation:
     topk: 200
@@ -34,7 +33,7 @@ models:
       dropout: 0.1
       recent_history_length: 20
     training:
-      two_tower_num_sampled_negatives: 64
+      two_tower_num_negatives: 256
       two_tower_temperature: 0.05
 
   sequence:
@@ -45,7 +44,5 @@ models:
       max_len: 100
       dropout: 0.1
     training:
-      sequence_num_negatives: 32
-      sequence_user_negative_ratio: 0.5
-      sequence_loss: bce
-      sequence_history_feedback: all
+      sequence_num_negatives: 128
+      sequence_loss: softmax

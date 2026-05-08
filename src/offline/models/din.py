@@ -42,8 +42,6 @@ class DINModel(nn.Module):
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
         self.static_embeddings = nn.ModuleDict({field: nn.Embedding(feature_dict[field], emb_dim, padding_idx=0) for field in STATIC_USER_FIELDS})
         self.user_profile_projection = build_mlp(emb_dim * len(STATIC_USER_FIELDS), [emb_dim * 2], emb_dim, dropout=dropout)
-        self.history_rating_projection = nn.Linear(1, emb_dim)
-        self.history_recency_embedding = nn.Embedding(feature_dict.get("recency_bucket", 21), emb_dim, padding_idx=0)
         self.activation_unit = LocalActivationUnit(emb_dim, attention_hidden_dims, dropout)
         self.dnn = build_mlp(emb_dim * 3, dnn_hidden_dims or [256, 128], 1, dropout=dropout)
 
@@ -59,22 +57,16 @@ class DINModel(nn.Module):
             "averageRating": batch["candidate_averageRating"],
         })
         history_movie_id = batch["hist_movie_id"]
-        history_movie_embedding = self.movie_encoder({
+        history_embedding = self.movie_encoder({
             "movie_id": history_movie_id,
             "genres": batch["hist_genres"],
             "isAdult": batch["hist_isAdult"],
             "startYear": batch["hist_startYear"],
             "popularity": batch["hist_popularity"],
             "averageRating": batch["hist_averageRating"],
+            "interaction_rating": batch["hist_rating"],
         })
         history_mask = history_movie_id.gt(0)
-        history_rating = batch.get("hist_rating", torch.zeros_like(history_movie_id, dtype=history_movie_embedding.dtype)).float()
-        history_rating_embedding = self.history_rating_projection((history_rating / 5.0).unsqueeze(-1)).masked_fill(~history_mask.unsqueeze(-1), 0.0)
-        history_recency_bucket = batch.get("hist_recency_bucket", torch.zeros_like(history_movie_id)).long()
-        history_recency_embedding = self.history_recency_embedding(
-            history_recency_bucket.clamp(min=0, max=self.history_recency_embedding.num_embeddings - 1)
-        ).masked_fill(~history_mask.unsqueeze(-1), 0.0)
-        history_embedding = history_movie_embedding + history_rating_embedding + history_recency_embedding
         attention_history, attention_mask = self._candidate_topm_history(candidate_embedding, history_embedding, history_mask)
 
         activated_history = self.activation_unit(candidate_embedding, attention_history, attention_mask)

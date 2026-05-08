@@ -19,7 +19,7 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.ranking")
-_SAMPLE_PROTOCOL = "prefix_positive_targets_v8"
+_SAMPLE_PROTOCOL = "prefix_positive_targets_v9_all_history"
 _ID_DTYPE = np.uint16
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
@@ -147,7 +147,6 @@ def _split_history_by_rating(
     rating_sequence: list[float],
     history_timestamps: list[int],
     target_idx: int,
-    interest_rating_min: float,
     negative_rating_max: float,
 ) -> tuple[list[int], list[float], list[int], list[int]]:
     hist_movies: list[int] = []
@@ -156,11 +155,10 @@ def _split_history_by_rating(
     low_rating_movies: list[int] = []
     for movie_id, rating, timestamp in zip(movie_sequence[:target_idx], rating_sequence[:target_idx], history_timestamps[:target_idx], strict=True):
         rating_value = float(rating)
-        if rating_value >= float(interest_rating_min):
-            hist_movies.append(int(movie_id))
-            hist_ratings.append(rating_value)
-            hist_timestamps.append(int(timestamp))
-        elif rating_value <= float(negative_rating_max):
+        hist_movies.append(int(movie_id))
+        hist_ratings.append(rating_value)
+        hist_timestamps.append(int(timestamp))
+        if rating_value <= float(negative_rating_max):
             low_rating_movies.append(int(movie_id))
     return hist_movies, hist_ratings, hist_timestamps, low_rating_movies
 
@@ -207,7 +205,6 @@ def _write_target_sample(
     rating_sequence: list[float],
     timestamp_sequence: list[int],
     target_idx: int,
-    interest_rating_min: float,
     negative_rating_max: float,
 ) -> None:
     hist_movies, hist_ratings, hist_timestamps, low_rating_movies = _split_history_by_rating(
@@ -215,7 +212,6 @@ def _write_target_sample(
         rating_sequence,
         timestamp_sequence,
         target_idx,
-        interest_rating_min,
         negative_rating_max,
     )
     _write_sample_row(
@@ -286,7 +282,8 @@ def build_prefix_train_eval_samples(
     max_seq_len: int,
     negative_rating_max: float,
     positive_rating_min: float,
-    interest_rating_min: float,
+    neutral_rating: float = 3.0,
+    history_policy: str = "all_ratings",
 ) -> dict:
     df_sorted = df_merged.sort_values(["user_id", "timestamp"], kind="stable")
 
@@ -307,14 +304,16 @@ def build_prefix_train_eval_samples(
         train_sample_count += max(len(positive_target_indices) - 2, 0)
 
     logger.info(
-        "Ranking sample allocation | protocol=%s | train_samples=%s | validation_samples=%s | test_samples=%s | max_seq_len=%s | positive_rating_min=%s | interest_rating_min=%s",
+        "Ranking sample allocation | protocol=%s | train_samples=%s | validation_samples=%s | test_samples=%s | max_seq_len=%s | positive_rating_min=%s | negative_rating_max=%s | neutral_rating=%s | history_policy=%s",
         _SAMPLE_PROTOCOL,
         train_sample_count,
         validation_sample_count,
         test_sample_count,
         max_seq_len,
         positive_threshold,
-        interest_rating_min,
+        negative_rating_max,
+        neutral_rating,
+        history_policy,
     )
 
     train_store = _allocate_split_arrays(train_sample_count, max_seq_len)
@@ -356,7 +355,6 @@ def build_prefix_train_eval_samples(
             rating_sequence=rating_sequence,
             timestamp_sequence=timestamp_sequence,
             target_idx=validation_target_idx,
-            interest_rating_min=interest_rating_min,
             negative_rating_max=negative_rating_max,
         )
         validation_row += 1
@@ -370,7 +368,6 @@ def build_prefix_train_eval_samples(
             rating_sequence=rating_sequence,
             timestamp_sequence=timestamp_sequence,
             target_idx=test_target_idx,
-            interest_rating_min=interest_rating_min,
             negative_rating_max=negative_rating_max,
         )
         test_row += 1
@@ -386,7 +383,6 @@ def build_prefix_train_eval_samples(
                 rating_sequence=rating_sequence,
                 timestamp_sequence=timestamp_sequence,
                 target_idx=target_idx,
-                interest_rating_min=interest_rating_min,
                 negative_rating_max=negative_rating_max,
             )
             item_popularity[target_movie_id] += 1
@@ -399,6 +395,12 @@ def build_prefix_train_eval_samples(
         "test": test_store,
         "all_item_ids": np.arange(1, total_item_count + 1, dtype=np.int32),
         "item_popularity": item_popularity,
+        "rating_semantics": {
+            "positive_rating_min": float(positive_rating_min),
+            "negative_rating_max": float(negative_rating_max),
+            "neutral_rating": float(neutral_rating),
+            "history_policy": str(history_policy),
+        },
     }
 
 
@@ -423,16 +425,18 @@ def run_ranking_preprocessing():
     multimodal_settings = resolve_multimodal_settings(settings.get("multimodal", {}))
     max_seq_len = int(ranking_settings.get("max_seq_len", settings.get("retrieval", {}).get("max_seq_len", 10)))
     negative_rating_max = float(ranking_settings.get("negative_rating_max", settings.get("retrieval", {}).get("negative_rating_max", 2.0)))
-    positive_rating_min = float(ranking_settings.get("positive_rating_min", settings.get("retrieval", {}).get("positive_rating_min", 4.0)))
-    interest_rating_min = float(ranking_settings.get("interest_rating_min", positive_rating_min))
+    positive_rating_min = float(ranking_settings.get("positive_rating_min", 4.0))
+    neutral_rating = float(ranking_settings.get("neutral_rating", settings.get("retrieval", {}).get("neutral_rating", 3.0)))
+    history_policy = str(ranking_settings.get("history_policy", settings.get("retrieval", {}).get("history_policy", "all_ratings")))
 
     logger.info(
-        "Ranking preprocessing start | protocol=%s | max_seq_len=%s | positive_rating_min=%s | negative_rating_max=%s | interest_rating_min=%s",
+        "Ranking preprocessing start | protocol=%s | max_seq_len=%s | positive_rating_min=%s | negative_rating_max=%s | neutral_rating=%s | history_policy=%s",
         _SAMPLE_PROTOCOL,
         max_seq_len,
         positive_rating_min,
         negative_rating_max,
-        interest_rating_min,
+        neutral_rating,
+        history_policy,
     )
     df_movies, df_ratings, df_users = load_raw_data()
     logger.info("Raw data loaded | movies=%s | ratings=%s | users=%s", len(df_movies), len(df_ratings), len(df_users))
@@ -447,7 +451,8 @@ def run_ranking_preprocessing():
         max_seq_len=max_seq_len,
         negative_rating_max=negative_rating_max,
         positive_rating_min=positive_rating_min,
-        interest_rating_min=interest_rating_min,
+        neutral_rating=neutral_rating,
+        history_policy=history_policy,
     )
     item_catalog = build_item_catalog(
         df_merged,

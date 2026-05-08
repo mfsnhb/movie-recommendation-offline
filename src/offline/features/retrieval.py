@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
-
 import numpy as np
 import yaml
 from sklearn.preprocessing import LabelEncoder
@@ -24,13 +22,12 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.retrieval")
-_PREPROCESS_VERSION = 17
+_PREPROCESS_VERSION = 21
 _RECENCY_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
 _RECENCY_BUCKET_BOUNDARIES_SECONDS = np.asarray(_RECENCY_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
 _RECENCY_BUCKET_COUNT = len(_RECENCY_BUCKET_BOUNDARIES_DAYS) + 2
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
-
 
 
 def process_features(df_movies, df_ratings, df_users):
@@ -91,8 +88,7 @@ def process_features(df_movies, df_ratings, df_users):
     return df_merged[["user_id", "gender", "age", "occupation", "zip_code", "movie_id", "genres", "rating", "timestamp"]], user_vocab, movie_vocab
 
 
-
-def _pad_sequence(values, max_seq_len: int, padding_value: int = 0):
+def _pad_int_sequence(values, max_seq_len: int, padding_value: int = 0):
     arr = np.asarray(values, dtype=np.int32).reshape(-1)[-max_seq_len:]
     padded = np.full(max_seq_len, padding_value, dtype=np.int32)
     if arr.size > 0:
@@ -100,6 +96,12 @@ def _pad_sequence(values, max_seq_len: int, padding_value: int = 0):
     return padded
 
 
+def _pad_float_sequence(values, max_seq_len: int, padding_value: float = 0.0):
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)[-max_seq_len:]
+    padded = np.full(max_seq_len, padding_value, dtype=np.float32)
+    if arr.size > 0:
+        padded[-arr.size:] = arr
+    return padded
 
 
 def _recency_buckets(history_timestamps, target_timestamp, max_seq_len: int, padding_value: int = 0) -> np.ndarray:
@@ -115,35 +117,18 @@ def _recency_buckets(history_timestamps, target_timestamp, max_seq_len: int, pad
     return padded
 
 
-
-
-def _user_negative_pool(movie_sequence, rating_sequence, max_pool_size: int, negative_rating_max: float) -> np.ndarray:
-    movies = np.asarray(movie_sequence, dtype=np.int32).reshape(-1)
-    ratings = np.asarray(rating_sequence, dtype=np.float32).reshape(-1)
-    negatives = movies[ratings <= float(negative_rating_max)] if movies.size > 0 else np.zeros(0, dtype=np.int32)
-    if negatives.size == 0:
-        return np.zeros(max_pool_size, dtype=np.int32)
-    unique_negatives = np.unique(negatives.astype(np.int32, copy=False))[-max_pool_size:]
-    padded = np.zeros(max_pool_size, dtype=np.int32)
-    padded[-unique_negatives.size :] = unique_negatives
-    return padded
-
-
-
 def _positive_target_indices(rating_sequence: np.ndarray, positive_rating_min: float) -> list[int]:
     return [idx for idx in range(1, len(rating_sequence)) if float(rating_sequence[idx]) >= float(positive_rating_min)]
 
 
-
-def _split_positive_targets(rating_sequence: np.ndarray, positive_rating_min: float) -> tuple[list[int], int | None, int | None]:
-    target_indices = _positive_target_indices(rating_sequence, positive_rating_min)
-    if len(target_indices) < 2:
-        return [], None, None
-    return target_indices[:-2], target_indices[-2], target_indices[-1]
-
+def _split_eval_targets(rating_sequence: np.ndarray, eval_positive_rating_min: float) -> tuple[int | None, int | None]:
+    eval_target_indices = _positive_target_indices(rating_sequence, eval_positive_rating_min)
+    if len(eval_target_indices) < 2:
+        return None, None
+    return eval_target_indices[-2], eval_target_indices[-1]
 
 
-def _empty_retrieval_samples(sample_count: int, max_hist_seq_len: int, negative_pool_size: int) -> dict[str, np.ndarray]:
+def _empty_retrieval_samples(sample_count: int, max_hist_seq_len: int) -> dict[str, np.ndarray]:
     return {
         "user_id": np.zeros(sample_count, dtype=np.int32),
         "gender": np.zeros(sample_count, dtype=np.int32),
@@ -153,15 +138,44 @@ def _empty_retrieval_samples(sample_count: int, max_hist_seq_len: int, negative_
         "hist_movie_id": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_recency_bucket": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_rating": np.zeros((sample_count, max_hist_seq_len), dtype=np.float32),
-        "user_negative_movie_id": np.zeros((sample_count, negative_pool_size), dtype=np.int32),
         "movie_id": np.zeros(sample_count, dtype=np.int32),
         "rating": np.zeros(sample_count, dtype=np.float32),
     }
 
 
+def _fill_user_fields(store: dict[str, np.ndarray], row_idx: int, user_id_value: int, user_features: dict[str, np.int32], user_columns: list[str]) -> None:
+    store["user_id"][row_idx] = np.int32(user_id_value)
+    for col in user_columns:
+        store[col][row_idx] = user_features[col]
 
-def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_seq_len=10, max_feat_seq_len=10, padding_value=0, positive_rating_min: float = 4.0, negative_rating_max: float = 2.0, sequence_negative_pool_size: int | None = None):
+
+def _fill_history(
+    store: dict[str, np.ndarray],
+    row_idx: int,
+    movie_sequence: np.ndarray,
+    rating_sequence: np.ndarray,
+    timestamp_sequence: np.ndarray,
+    target_idx: int,
+    max_hist_seq_len: int,
+    padding_value: int,
+) -> None:
+    store["hist_movie_id"][row_idx] = _pad_int_sequence(movie_sequence[:target_idx], max_hist_seq_len, padding_value)
+    store["hist_recency_bucket"][row_idx] = _recency_buckets(timestamp_sequence[:target_idx], timestamp_sequence[target_idx], max_hist_seq_len, padding_value)
+    store["hist_rating"][row_idx] = _pad_float_sequence(rating_sequence[:target_idx], max_hist_seq_len, 0.0)
+
+
+def generate_train_eval_samples(
+    data_df,
+    user_columns,
+    item_columns,
+    max_hist_seq_len=10,
+    max_feat_seq_len=10,
+    padding_value=0,
+    positive_rating_min: float = 3.0,
+    eval_positive_rating_min: float | None = None,
+):
     del item_columns, max_feat_seq_len
+    eval_positive_rating_min = float(positive_rating_min if eval_positive_rating_min is None else eval_positive_rating_min)
     data_df = data_df.sort_values(["user_id", "timestamp"], kind="stable")
     grouped_users = list(data_df.groupby("user_id", sort=False))
     train_sample_count = 0
@@ -174,92 +188,64 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
         if history_length < 2:
             continue
         rating_sequence = grouped_feats["rating"].to_numpy(dtype=np.float32, copy=False)
-        target_indices, validation_target_idx, test_target_idx = _split_positive_targets(rating_sequence, positive_rating_min)
+        validation_target_idx, test_target_idx = _split_eval_targets(rating_sequence, eval_positive_rating_min)
         if validation_target_idx is None or test_target_idx is None:
             continue
-        train_sample_count += len(target_indices)
+        train_target_indices = [
+            idx for idx in range(1, validation_target_idx) if float(rating_sequence[idx]) >= float(positive_rating_min)
+        ]
+        train_sample_count += len(train_target_indices)
         validation_sample_count += 1
         test_sample_count += 1
-    negative_pool_size = int(sequence_negative_pool_size or max_hist_seq_len)
 
     logger.info(
-        "Retrieval sample allocation | users=%s | train=%s | validation=%s | test=%s | max_hist_seq_len=%s | negative_pool_size=%s",
+        "Retrieval sample allocation | users=%s | train=%s | validation=%s | test=%s | max_hist_seq_len=%s",
         len(grouped_users),
         train_sample_count,
         validation_sample_count,
         test_sample_count,
         max_hist_seq_len,
-        negative_pool_size,
     )
 
-    train_data_dict = _empty_retrieval_samples(train_sample_count, max_hist_seq_len, negative_pool_size)
-    validation_data_dict = _empty_retrieval_samples(validation_sample_count, max_hist_seq_len, negative_pool_size)
-    test_data_dict = _empty_retrieval_samples(test_sample_count, max_hist_seq_len, negative_pool_size)
+    train_data_dict = _empty_retrieval_samples(train_sample_count, max_hist_seq_len)
+    validation_data_dict = _empty_retrieval_samples(validation_sample_count, max_hist_seq_len)
+    test_data_dict = _empty_retrieval_samples(test_sample_count, max_hist_seq_len)
 
     train_row = 0
     validation_row = 0
     test_row = 0
     for user_id_value, grouped_feats in grouped_users:
-        history_length = len(grouped_feats)
-        if history_length < 2:
+        if len(grouped_feats) < 2:
             continue
 
         user_features = {col: np.int32(grouped_feats[col].iloc[0]) for col in user_columns}
         movie_sequence = grouped_feats["movie_id"].to_numpy(dtype=np.int32, copy=False)
         rating_sequence = grouped_feats["rating"].to_numpy(dtype=np.float32, copy=False)
         timestamp_sequence = grouped_feats["timestamp"].to_numpy(dtype=np.int64, copy=False)
-        train_target_indices, validation_target_idx, test_target_idx = _split_positive_targets(rating_sequence, positive_rating_min)
+        validation_target_idx, test_target_idx = _split_eval_targets(rating_sequence, eval_positive_rating_min)
         if validation_target_idx is None or test_target_idx is None:
             continue
 
-        validation_data_dict["user_id"][validation_row] = np.int32(user_id_value)
-        for col in user_columns:
-            validation_data_dict[col][validation_row] = user_features[col]
-        validation_data_dict["hist_movie_id"][validation_row] = _pad_sequence(movie_sequence[:validation_target_idx], max_hist_seq_len, padding_value)
-        validation_data_dict["hist_recency_bucket"][validation_row] = _recency_buckets(timestamp_sequence[:validation_target_idx], timestamp_sequence[validation_target_idx], max_hist_seq_len, padding_value)
-        validation_data_dict["hist_rating"][validation_row] = _pad_sequence(rating_sequence[:validation_target_idx], max_hist_seq_len, 0.0)
-        validation_data_dict["user_negative_movie_id"][validation_row] = _user_negative_pool(
-            movie_sequence[:validation_target_idx],
-            rating_sequence[:validation_target_idx],
-            negative_pool_size,
-            negative_rating_max,
-        )
+        for train_target_idx in range(1, validation_target_idx):
+            if float(rating_sequence[train_target_idx]) < float(positive_rating_min):
+                continue
+            _fill_user_fields(train_data_dict, train_row, user_id_value, user_features, user_columns)
+            _fill_history(train_data_dict, train_row, movie_sequence, rating_sequence, timestamp_sequence, train_target_idx, max_hist_seq_len, padding_value)
+            train_data_dict["movie_id"][train_row] = np.int32(movie_sequence[train_target_idx])
+            train_data_dict["rating"][train_row] = np.float32(rating_sequence[train_target_idx])
+            train_row += 1
+
+        _fill_user_fields(validation_data_dict, validation_row, user_id_value, user_features, user_columns)
+        _fill_history(validation_data_dict, validation_row, movie_sequence, rating_sequence, timestamp_sequence, validation_target_idx, max_hist_seq_len, padding_value)
         validation_data_dict["movie_id"][validation_row] = np.int32(movie_sequence[validation_target_idx])
         validation_data_dict["rating"][validation_row] = np.float32(rating_sequence[validation_target_idx])
         validation_row += 1
 
-        test_data_dict["user_id"][test_row] = np.int32(user_id_value)
-        for col in user_columns:
-            test_data_dict[col][test_row] = user_features[col]
-        test_data_dict["hist_movie_id"][test_row] = _pad_sequence(movie_sequence[:test_target_idx], max_hist_seq_len, padding_value)
-        test_data_dict["hist_recency_bucket"][test_row] = _recency_buckets(timestamp_sequence[:test_target_idx], timestamp_sequence[test_target_idx], max_hist_seq_len, padding_value)
-        test_data_dict["hist_rating"][test_row] = _pad_sequence(rating_sequence[:test_target_idx], max_hist_seq_len, 0.0)
-        test_data_dict["user_negative_movie_id"][test_row] = _user_negative_pool(
-            movie_sequence[:test_target_idx],
-            rating_sequence[:test_target_idx],
-            negative_pool_size,
-            negative_rating_max,
-        )
+        _fill_user_fields(test_data_dict, test_row, user_id_value, user_features, user_columns)
+        _fill_history(test_data_dict, test_row, movie_sequence, rating_sequence, timestamp_sequence, test_target_idx, max_hist_seq_len, padding_value)
         test_data_dict["movie_id"][test_row] = np.int32(movie_sequence[test_target_idx])
         test_data_dict["rating"][test_row] = np.float32(rating_sequence[test_target_idx])
         test_row += 1
-
-        for i in train_target_indices:
-            train_data_dict["user_id"][train_row] = np.int32(user_id_value)
-            for col in user_columns:
-                train_data_dict[col][train_row] = user_features[col]
-            train_data_dict["hist_movie_id"][train_row] = _pad_sequence(movie_sequence[:i], max_hist_seq_len, padding_value)
-            train_data_dict["hist_recency_bucket"][train_row] = _recency_buckets(timestamp_sequence[:i], timestamp_sequence[i], max_hist_seq_len, padding_value)
-            train_data_dict["hist_rating"][train_row] = _pad_sequence(rating_sequence[:i], max_hist_seq_len, 0.0)
-            train_data_dict["user_negative_movie_id"][train_row] = _user_negative_pool(
-                movie_sequence[:i],
-                rating_sequence[:i],
-                negative_pool_size,
-                negative_rating_max,
-            )
-            train_data_dict["movie_id"][train_row] = np.int32(movie_sequence[i])
-            train_data_dict["rating"][train_row] = np.float32(rating_sequence[i])
-            train_row += 1
 
     return {
         "train": train_data_dict,
@@ -267,12 +253,12 @@ def generate_train_eval_samples(data_df, user_columns, item_columns, max_hist_se
         "test": test_data_dict,
         "rating_semantics": {
             "positive_rating_min": float(positive_rating_min),
-            "negative_rating_max": float(negative_rating_max),
-            "sequence_negative_pool_size": int(negative_pool_size),
+            "eval_positive_rating_min": float(eval_positive_rating_min),
+            "neutral_rating": 3.0,
+            "history_policy": "all_interactions",
             "max_user_history": int(max_user_history),
         },
     }
-
 
 
 def _multimodal_embedding_dim() -> int:
@@ -280,13 +266,21 @@ def _multimodal_embedding_dim() -> int:
     return int(meta["embedding_dim"])
 
 
-def _build_preprocess_meta(max_seq_len: int, positive_rating_min: float, negative_rating_max: float, sequence_negative_pool_size: int, multimodal_embedding_dim: int) -> dict:
+def _build_preprocess_meta(
+    max_seq_len: int,
+    positive_rating_min: float,
+    eval_positive_rating_min: float,
+    multimodal_embedding_dim: int,
+) -> dict:
     return {
         "version": _PREPROCESS_VERSION,
         "retrieval_max_seq_len": int(max_seq_len),
         "positive_rating_min": float(positive_rating_min),
-        "negative_rating_max": float(negative_rating_max),
-        "sequence_negative_pool_size": int(sequence_negative_pool_size),
+        "eval_positive_rating_min": float(eval_positive_rating_min),
+        "neutral_rating": 3.0,
+        "history_policy": "all_interactions",
+        "train_target_policy": f"rating>={positive_rating_min:g}",
+        "eval_target_policy": f"rating>={eval_positive_rating_min:g}",
         "rating_scale": "five_point",
         "recency_bucket_boundaries_days": list(_RECENCY_BUCKET_BOUNDARIES_DAYS),
         "recency_bucket_count": int(_RECENCY_BUCKET_COUNT),
@@ -294,8 +288,12 @@ def _build_preprocess_meta(max_seq_len: int, positive_rating_min: float, negativ
     }
 
 
-
-def _can_reuse_cache(max_seq_len: int, positive_rating_min: float, negative_rating_max: float, sequence_negative_pool_size: int, multimodal_embedding_dim: int) -> bool:
+def _can_reuse_cache(
+    max_seq_len: int,
+    positive_rating_min: float,
+    eval_positive_rating_min: float,
+    multimodal_embedding_dim: int,
+) -> bool:
     if not RETRIEVAL_PREPROCESS_META_PATH.exists():
         return False
     if not RETRIEVAL_SAMPLE_PATH.exists() or not RETRIEVAL_FEATURE_DICT_PATH.exists() or not RETRIEVAL_VOCAB_DICT_PATH.exists():
@@ -307,28 +305,21 @@ def _can_reuse_cache(max_seq_len: int, positive_rating_min: float, negative_rati
     return meta == _build_preprocess_meta(
         max_seq_len,
         positive_rating_min,
-        negative_rating_max,
-        sequence_negative_pool_size,
+        eval_positive_rating_min,
         multimodal_embedding_dim,
     )
-
 
 
 def run_retrieval_preprocessing():
     settings = yaml.safe_load((CONFIG_DIR / "preprocess.yaml").read_text(encoding="utf-8")) or {}
     retrieval_settings = settings.get("retrieval", {})
     max_seq_len = int(retrieval_settings.get("max_seq_len", 10))
-    positive_rating_min = float(retrieval_settings.get("positive_rating_min", 4.0))
-    negative_rating_max = float(retrieval_settings.get("negative_rating_max", 2.0))
-    sequence_negative_pool_size = int(retrieval_settings.get("sequence_negative_pool_size", max_seq_len))
+    positive_rating_min = float(retrieval_settings.get("positive_rating_min", 3.0))
+    eval_positive_rating_min = float(
+        retrieval_settings.get("eval_positive_rating_min", settings.get("ranking", {}).get("positive_rating_min", 4.0))
+    )
     multimodal_embedding_dim = _multimodal_embedding_dim()
-    if _can_reuse_cache(
-        max_seq_len,
-        positive_rating_min,
-        negative_rating_max,
-        sequence_negative_pool_size,
-        multimodal_embedding_dim,
-    ):
+    if _can_reuse_cache(max_seq_len, positive_rating_min, eval_positive_rating_min, multimodal_embedding_dim):
         samples = load_pickle(RETRIEVAL_SAMPLE_PATH)
         feature_dict = load_pickle(RETRIEVAL_FEATURE_DICT_PATH)
         logger.info(
@@ -341,12 +332,11 @@ def run_retrieval_preprocessing():
         return samples, feature_dict
 
     logger.info(
-        "Retrieval preprocessing start | max_seq_len=%s | version=%s | positive_rating_min=%s | negative_rating_max=%s | sequence_negative_pool_size=%s",
+        "Retrieval preprocessing start | max_seq_len=%s | version=%s | positive_rating_min=%s | eval_positive_rating_min=%s | history_policy=all_interactions",
         max_seq_len,
         _PREPROCESS_VERSION,
         positive_rating_min,
-        negative_rating_max,
-        sequence_negative_pool_size,
+        eval_positive_rating_min,
     )
     df_movies, df_ratings, df_users = load_raw_data()
     logger.info("Raw data loaded | movies=%s | ratings=%s | users=%s", len(df_movies), len(df_ratings), len(df_users))
@@ -361,8 +351,7 @@ def run_retrieval_preprocessing():
         max_hist_seq_len=max_seq_len,
         max_feat_seq_len=max_seq_len,
         positive_rating_min=positive_rating_min,
-        negative_rating_max=negative_rating_max,
-        sequence_negative_pool_size=sequence_negative_pool_size,
+        eval_positive_rating_min=eval_positive_rating_min,
     )
     vocab_dict = {**user_vocab, **movie_vocab}
     feature_dict = {k: len(v) + 1 for k, v in vocab_dict.items()}
@@ -373,13 +362,7 @@ def run_retrieval_preprocessing():
     save_pickle(vocab_dict, RETRIEVAL_VOCAB_DICT_PATH)
     save_pickle(feature_dict, RETRIEVAL_FEATURE_DICT_PATH)
     save_json(
-        _build_preprocess_meta(
-            max_seq_len,
-            positive_rating_min,
-            negative_rating_max,
-            sequence_negative_pool_size,
-            multimodal_embedding_dim,
-        ),
+        _build_preprocess_meta(max_seq_len, positive_rating_min, eval_positive_rating_min, multimodal_embedding_dim),
         RETRIEVAL_PREPROCESS_META_PATH,
     )
     save_numpy(np.array(vocab_dict["movie_id"]), MOVIE_RAW_IDS_PATH)

@@ -6,10 +6,10 @@ common:
     validation_samples_per_user: 1
     validation_max_users: 6040
     min_delta: 1.0e-4
-    train_negatives: 15
-    low_rating_negatives: 3
-    recall_hard_negatives: 10
-    random_negatives: 2
+    train_negatives: 20
+    low_rating_negative_ratio: 0.6
+    recall_negative_ratio: 0.3
+    random_negative_ratio: 0.1
     validation_negatives: 500
     positive_rating_min: 4.0
     negative_rating_max: 2.0
@@ -46,7 +46,7 @@ models:
       dnn_hidden_dims: [256, 128]
       attention_hidden_dims: [128, 64]
       top_m_history: 100
-      force_recent_history: 100
+      force_recent_history: 30
       dropout: 0.1
     training:
       batch_size: 512

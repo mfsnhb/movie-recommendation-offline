@@ -67,6 +67,8 @@ class MovieFeatureEncoder(nn.Module):
         self.multimodal_projection = build_mlp(self.multimodal_dim, [emb_dim * 2], emb_dim, dropout=dropout)
         self.multimodal_gate = nn.Parameter(torch.tensor(-2.0))
         self.projection = build_mlp(emb_dim * 6, hidden_dims or [emb_dim * 2], emb_dim, dropout=dropout)
+        self.interaction_rating_emb = nn.Embedding(6, emb_dim, padding_idx=0)
+        self.interaction_projection = build_mlp(emb_dim * 2, [emb_dim * 2], emb_dim, dropout=dropout)
         self.has_item_feature_table = item_feature_table is not None
         if item_feature_table is not None:
             for field in SPARSE_ITEM_FEATURE_FIELDS:
@@ -101,6 +103,10 @@ class MovieFeatureEncoder(nn.Module):
         output = self.projection(torch.cat(structured_parts, dim=-1))
         multimodal = self.multimodal_table[movie_ids.clamp(min=0, max=self.multimodal_table.size(0) - 1)]
         output = output + torch.sigmoid(self.multimodal_gate) * self.multimodal_projection(multimodal)
+        interaction_rating = item_batch.get("interaction_rating", item_batch.get("rating"))
+        if interaction_rating is not None:
+            rating_ids = interaction_rating.float().round().long().clamp(min=0, max=5)
+            output = self.interaction_projection(torch.cat([output, self.interaction_rating_emb(rating_ids)], dim=-1))
         if self.output_norm:
             output = torch.nn.functional.normalize(output, dim=-1)
         return output

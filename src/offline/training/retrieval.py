@@ -12,7 +12,7 @@ from torch import nn
 from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, precision_at_k, recall_at_k, save_metrics
 from offline.evaluate.multi_recall import build_multi_recall_artifacts
 from offline.features.item_batch import ITEM_FEATURE_FIELDS
-from offline.models.sequence_retrieval import SequenceRetrievalModel, filter_sequence_history
+from offline.models.sequence_retrieval import SequenceRetrievalModel
 from offline.models.two_tower import TwoTowerRetrievalModel
 from offline.ranking.protocol import get_item_feature_arrays
 from offline.training.retrieval_common import batch_indices, gradient_norm, load_retrieval_context, slice_train_batch
@@ -117,14 +117,17 @@ def train_two_tower(context=None, warm_start: bool = True):
     log_every_n_batches = int(training_settings.get("log_every_n_batches", 100))
     early_stopping_patience = int(training_settings.get("early_stopping_patience", 2))
     min_delta = float(training_settings.get("min_delta", 1e-4))
-    negative_sampling = str(training_settings.get("negative_sampling", "in_batch")).strip().lower()
-    hard_negative_topk = int(training_settings.get("hard_negative_topk", 0))
-    two_tower_num_sampled_negatives = int(training_settings.get("two_tower_num_sampled_negatives", 64))
+    two_tower_num_negatives = int(training_settings.get("two_tower_num_negatives", 256))
+    hard_negative_ratio = float(training_settings.get("hard_negative_ratio", 0.1))
     export_batch_size = int(training_settings.get("export_batch_size", 4096))
     two_tower_temperature = float(training_settings.get("two_tower_temperature", 0.05))
 
     device = context["device"]
     all_item_id_tensor = torch.as_tensor(all_item_ids, dtype=torch.long, device=device)
+    multimodal_matrix = torch.nn.functional.normalize(
+        torch.as_tensor(item_feature_arrays["multimodal_embedding"], dtype=torch.float32, device=device),
+        dim=1,
+    )
     two_tower_model = TwoTowerRetrievalModel(
         feature_dict,
         emb_dim,
@@ -152,20 +155,18 @@ def train_two_tower(context=None, warm_start: bool = True):
     val_indices = all_indices[:val_size]
     train_indices = all_indices[val_size:]
 
-    use_hard_negatives = negative_sampling in {"in_batch_hard", "mixed"} and hard_negative_topk > 0
-    use_sampled_negatives = negative_sampling in {"sampled", "mixed"} and two_tower_num_sampled_negatives > 0
+    use_explicit_negatives = two_tower_num_negatives > 0
 
     logger.info(
-        "TwoTower training start | device=%s | train_samples=%s | val_samples=%s | test_users=%s | batch_size=%s | epochs=%s | negative_sampling=%s | low_rating_hard_negatives=%s | sampled_negatives=%s | export_batch_size=%s | temperature=%s | warm_start=%s",
+        "TwoTower training start | device=%s | train_samples=%s | val_samples=%s | test_users=%s | batch_size=%s | epochs=%s | negatives=%s | hard_negative_ratio=%s | export_batch_size=%s | temperature=%s | warm_start=%s",
         device,
         train_size,
         val_size,
         len(test_data["user_id"]),
         batch_size,
         epochs,
-        negative_sampling,
-        hard_negative_topk if use_hard_negatives else 0,
-        two_tower_num_sampled_negatives if use_sampled_negatives else 0,
+        two_tower_num_negatives if use_explicit_negatives else 0,
+        hard_negative_ratio if use_explicit_negatives else 0.0,
         export_batch_size,
         two_tower_temperature,
         warm_start,
@@ -191,53 +192,42 @@ def train_two_tower(context=None, warm_start: bool = True):
 
             two_tower_optimizer.zero_grad()
             user_repr_tt = two_tower_model.encode_user(batch_dict)
-            item_repr_tt = two_tower_model.encode_item(batch_dict["movie_id"])
-            sampled_negative_ids = None
-            sampled_negative_repr = None
-            if use_sampled_negatives:
-                sampled_negative_ids = _sample_context_negative_ids(
-                    positive_ids=batch_dict["movie_id"],
+            positive_ids = batch_dict["movie_id"]
+            positive_ratings = batch_dict["rating"]
+            item_repr_tt = two_tower_model.encode_item(positive_ids)
+            explicit_negative_ids = None
+            explicit_negative_repr = None
+            if use_explicit_negatives:
+                explicit_negative_ids = _sample_retrieval_negative_ids(
+                    positive_ids=positive_ids,
                     context_ids=batch_dict["hist_movie_id"],
                     all_item_ids=all_item_id_tensor,
-                    num_negatives=two_tower_num_sampled_negatives,
+                    multimodal_matrix=multimodal_matrix,
+                    num_negatives=two_tower_num_negatives,
+                    hard_negative_ratio=hard_negative_ratio,
                 )
-                sampled_negative_repr = two_tower_model.encode_item(sampled_negative_ids.reshape(-1)).reshape(
-                    sampled_negative_ids.size(0),
-                    sampled_negative_ids.size(1),
-                    -1,
-                )
-            low_rating_negative_ids = None
-            low_rating_negative_repr = None
-            if use_hard_negatives:
-                low_rating_negative_ids = _sample_user_negative_ids(
-                    user_negative_ids=batch_dict["user_negative_movie_id"],
-                    positive_ids=batch_dict["movie_id"],
-                    context_ids=batch_dict["hist_movie_id"],
-                    num_negatives=hard_negative_topk,
-                )
-                low_rating_negative_repr = two_tower_model.encode_item(low_rating_negative_ids.reshape(-1)).reshape(
-                    low_rating_negative_ids.size(0),
-                    low_rating_negative_ids.size(1),
+                explicit_negative_repr = two_tower_model.encode_item(explicit_negative_ids.reshape(-1)).reshape(
+                    explicit_negative_ids.size(0),
+                    explicit_negative_ids.size(1),
                     -1,
                 )
             logits_tt, labels_tt = _build_training_logits(
                 user_repr_tt,
                 item_repr_tt,
-                batch_dict["movie_id"],
+                positive_ids,
                 batch_dict["hist_movie_id"],
                 two_tower_temperature,
-                sampled_negative_ids=sampled_negative_ids,
-                sampled_negative_repr=sampled_negative_repr,
-                low_rating_negative_ids=low_rating_negative_ids,
-                low_rating_negative_repr=low_rating_negative_repr,
+                explicit_negative_ids=explicit_negative_ids,
+                explicit_negative_repr=explicit_negative_repr,
             )
-            loss_tt = torch.nn.functional.cross_entropy(logits_tt, labels_tt)
+            row_loss = torch.nn.functional.cross_entropy(logits_tt, labels_tt, reduction="none")
+            loss_tt = _weighted_mean(row_loss, positive_ratings)
             loss_tt.backward()
             should_log = batch_idx % log_every_n_batches == 0 or batch_idx == total_batches
             grad_norm_tt = gradient_norm(two_tower_model.parameters()) if should_log else 0.0
             two_tower_optimizer.step()
 
-            batch_size_now = batch_dict["user_id"].size(0)
+            batch_size_now = positive_ids.size(0)
             total_tt_loss += float(loss_tt.item()) * batch_size_now
             seen_examples += batch_size_now
             if should_log:
@@ -269,6 +259,7 @@ def train_two_tower(context=None, warm_start: bool = True):
             train_data,
             val_indices,
             device,
+            item_feature_arrays,
             batch_size=batch_size,
             evaluate_two_tower=True,
             evaluate_sequence=False,
@@ -356,14 +347,16 @@ def train_sequence(context=None, warm_start: bool = True):
     early_stopping_patience = int(training_settings.get("early_stopping_patience", 2))
     min_delta = float(training_settings.get("min_delta", 1e-4))
     export_batch_size = int(training_settings.get("export_batch_size", 4096))
-    sequence_num_negatives = int(training_settings.get("sequence_num_negatives", 32))
-    sequence_user_negative_ratio = float(training_settings.get("sequence_user_negative_ratio", 0.75))
+    sequence_num_negatives = int(training_settings.get("sequence_num_negatives", 128))
     sequence_loss = str(training_settings.get("sequence_loss", "bce")).strip().lower()
-    sequence_history_feedback = str(training_settings.get("sequence_history_feedback", "positive")).strip().lower()
-    positive_rating_min = float(resolved_config.get("rating_semantics", {}).get("positive_rating_min", training_settings.get("positive_rating_min", 3.0)))
+    hard_negative_ratio = float(training_settings.get("hard_negative_ratio", 0.1))
 
     device = context["device"]
     all_item_id_tensor = torch.as_tensor(all_item_ids, dtype=torch.long, device=device)
+    multimodal_matrix = torch.nn.functional.normalize(
+        torch.as_tensor(item_feature_arrays["multimodal_embedding"], dtype=torch.float32, device=device),
+        dim=1,
+    )
     sequence_model = SequenceRetrievalModel(
         feature_dict,
         emb_dim,
@@ -392,7 +385,7 @@ def train_sequence(context=None, warm_start: bool = True):
     train_indices = all_indices[val_size:]
 
     logger.info(
-        "Sequence training start | device=%s | train_samples=%s | val_samples=%s | test_users=%s | batch_size=%s | epochs=%s | export_batch_size=%s | sequence_num_negatives=%s | sequence_user_negative_ratio=%s | sequence_loss=%s | sequence_history_feedback=%s | warm_start=%s",
+        "Sequence training start | device=%s | train_samples=%s | val_samples=%s | test_users=%s | batch_size=%s | epochs=%s | export_batch_size=%s | sequence_num_negatives=%s | sequence_loss=%s | hard_negative_ratio=%s | warm_start=%s",
         device,
         train_size,
         val_size,
@@ -401,9 +394,8 @@ def train_sequence(context=None, warm_start: bool = True):
         epochs,
         export_batch_size,
         sequence_num_negatives,
-        sequence_user_negative_ratio,
         sequence_loss,
-        sequence_history_feedback,
+        hard_negative_ratio,
         warm_start,
     )
 
@@ -427,11 +419,10 @@ def train_sequence(context=None, warm_start: bool = True):
                 sequence_model,
                 batch_dict,
                 all_item_ids=all_item_id_tensor,
+                multimodal_matrix=multimodal_matrix,
                 num_negatives=sequence_num_negatives,
-                user_negative_ratio=sequence_user_negative_ratio,
+                hard_negative_ratio=hard_negative_ratio,
                 loss_type=sequence_loss,
-                history_feedback=sequence_history_feedback,
-                positive_rating_min=positive_rating_min,
             )
             if supervised_positions == 0:
                 continue
@@ -472,11 +463,10 @@ def train_sequence(context=None, warm_start: bool = True):
             evaluate_two_tower=False,
             evaluate_sequence=True,
             all_item_ids=all_item_id_tensor,
+            multimodal_matrix=multimodal_matrix,
             sequence_num_negatives=sequence_num_negatives,
-            sequence_user_negative_ratio=sequence_user_negative_ratio,
+            hard_negative_ratio=hard_negative_ratio,
             sequence_loss=sequence_loss,
-            sequence_history_feedback=sequence_history_feedback,
-            positive_rating_min=positive_rating_min,
         )
         logger.info(
             "Sequence epoch %s/%s done | train_loss=%.4f | val_loss=%.4f | epoch_time=%s | elapsed=%s",
@@ -544,14 +534,9 @@ def train_item_cf(context=None):
     transitions = defaultdict(Counter)
     neutral_rating = float(context["resolved_config"].get("training_settings", {}).get("neutral_rating", 3.0))
     hist_ratings = train_data.get("hist_rating")
-    for history, ratings, target_id, target_rating in zip(train_data["hist_movie_id"], hist_ratings, train_data["movie_id"], train_data["rating"], strict=False):
+    for history, ratings in zip(train_data["hist_movie_id"], hist_ratings, strict=False):
         valid_history = [int(x) for x in np.asarray(history).reshape(-1) if int(x) > 0]
         valid_ratings = [float(x) for x in np.asarray(ratings).reshape(-1) if float(x) > 0]
-        target_id = int(target_id)
-        if target_id <= 0:
-            continue
-        valid_history.append(target_id)
-        valid_ratings.append(float(target_rating))
         if len(valid_history) < 2:
             continue
         if len(valid_ratings) < len(valid_history):
@@ -580,10 +565,10 @@ def train_genre(context=None):
     genre_scores = defaultdict(Counter)
     item_features = context["item_feature_arrays"]
     genre_matrix = np.asarray(item_features["genres"], dtype=np.int32)
-    positive_rating_min = float(context["resolved_config"].get("rating_semantics", {}).get("positive_rating_min", 4.0))
-    for history, ratings, target_id, target_rating in zip(context["train_data"]["hist_movie_id"], context["train_data"]["hist_rating"], context["train_data"]["movie_id"], context["train_data"]["rating"], strict=False):
-        history_ids = np.concatenate([np.asarray(history).reshape(-1), np.asarray([target_id])])
-        history_ratings = np.concatenate([np.asarray(ratings).reshape(-1), np.asarray([target_rating])])
+    positive_rating_min = float(context["resolved_config"].get("rating_semantics", {}).get("positive_rating_min", 3.0))
+    for history, ratings in zip(context["train_data"]["hist_movie_id"], context["train_data"]["hist_rating"], strict=False):
+        history_ids = np.asarray(history).reshape(-1)
+        history_ratings = np.asarray(ratings).reshape(-1)
         for movie_id, rating in zip(history_ids, history_ratings, strict=False):
             movie_id = int(movie_id)
             rating = float(rating)
@@ -606,10 +591,10 @@ def train_popular(context=None):
         settings = yaml.safe_load((CONFIG_DIR / "retrieval.yaml").read_text(encoding="utf-8")) or {}
         context = load_retrieval_context(settings, resolve_retrieval_config(settings))
     popularity = Counter()
-    positive_rating_min = float(context["resolved_config"].get("rating_semantics", {}).get("positive_rating_min", 4.0))
-    for history, ratings, target_id, target_rating in zip(context["train_data"]["hist_movie_id"], context["train_data"]["hist_rating"], context["train_data"]["movie_id"], context["train_data"]["rating"], strict=False):
-        history_ids = np.concatenate([np.asarray(history).reshape(-1), np.asarray([target_id])])
-        history_ratings = np.concatenate([np.asarray(ratings).reshape(-1), np.asarray([target_rating])])
+    positive_rating_min = float(context["resolved_config"].get("rating_semantics", {}).get("positive_rating_min", 3.0))
+    for history, ratings in zip(context["train_data"]["hist_movie_id"], context["train_data"]["hist_rating"], strict=False):
+        history_ids = np.asarray(history).reshape(-1)
+        history_ratings = np.asarray(ratings).reshape(-1)
         for movie_id, rating in zip(history_ids, history_ratings, strict=False):
             movie_id = int(movie_id)
             rating = float(rating)
@@ -676,9 +661,7 @@ def evaluate_retrieval(route: str = "two_tower", topk: int | None = None):
 
     encoded_movie_ids = np.load(MOVIE_IDS_PATH, mmap_mode="r").astype(np.int64)
     item_embeddings = np.load(embedding_path, mmap_mode="r")
-    history_feedback = str(training_settings.get("sequence_history_feedback", "positive")).strip().lower()
-    positive_rating_min = float(resolved_config.get("rating_semantics", {}).get("positive_rating_min", training_settings.get("positive_rating_min", 3.0)))
-    metrics = _evaluate_retrieval(model, train_eval_samples["test"], encoded_movie_ids, item_embeddings, device, resolved_topk, route=normalized_route, sequence_history_feedback=history_feedback, positive_rating_min=positive_rating_min, item_feature_arrays=item_feature_arrays)
+    metrics = _evaluate_retrieval(model, train_eval_samples["test"], encoded_movie_ids, item_embeddings, device, resolved_topk, route=normalized_route, item_feature_arrays=item_feature_arrays)
     all_metrics = {}
     if RETRIEVAL_METRICS_PATH.exists():
         all_metrics = json.loads(RETRIEVAL_METRICS_PATH.read_text(encoding="utf-8"))
@@ -723,10 +706,8 @@ def _build_training_logits(
     positive_item_ids: torch.Tensor,
     hist_movie_ids: torch.Tensor,
     temperature: float,
-    sampled_negative_ids: torch.Tensor | None = None,
-    sampled_negative_repr: torch.Tensor | None = None,
-    low_rating_negative_ids: torch.Tensor | None = None,
-    low_rating_negative_repr: torch.Tensor | None = None,
+    explicit_negative_ids: torch.Tensor | None = None,
+    explicit_negative_repr: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = (user_repr @ positive_item_repr.T) / temperature
     duplicate_positive_mask = positive_item_ids.unsqueeze(0).eq(positive_item_ids.unsqueeze(1))
@@ -737,24 +718,25 @@ def _build_training_logits(
     labels = torch.arange(logits.size(0), device=logits.device)
     extra_logits = []
 
-    if sampled_negative_ids is not None and sampled_negative_repr is not None and sampled_negative_ids.numel() > 0:
-        sampled_scores = torch.einsum("bd,bnd->bn", user_repr, sampled_negative_repr) / temperature
-        sampled_invalid_mask = sampled_negative_ids.le(0)
-        sampled_invalid_mask |= sampled_negative_ids.eq(positive_item_ids.unsqueeze(1))
-        sampled_invalid_mask |= hist_movie_ids.unsqueeze(2).eq(sampled_negative_ids.unsqueeze(1)).any(dim=1)
-        sampled_scores = sampled_scores.masked_fill(sampled_invalid_mask, torch.finfo(sampled_scores.dtype).min)
-        extra_logits.append(sampled_scores)
-
-    if low_rating_negative_ids is not None and low_rating_negative_repr is not None and low_rating_negative_ids.numel() > 0:
-        low_rating_scores = torch.einsum("bd,bnd->bn", user_repr, low_rating_negative_repr) / temperature
-        low_rating_invalid_mask = low_rating_negative_ids.le(0)
-        low_rating_invalid_mask |= low_rating_negative_ids.eq(positive_item_ids.unsqueeze(1))
-        low_rating_scores = low_rating_scores.masked_fill(low_rating_invalid_mask, torch.finfo(low_rating_scores.dtype).min)
-        extra_logits.append(low_rating_scores)
+    if explicit_negative_ids is not None and explicit_negative_repr is not None and explicit_negative_ids.numel() > 0:
+        explicit_scores = torch.einsum("bd,bnd->bn", user_repr, explicit_negative_repr) / temperature
+        explicit_invalid_mask = explicit_negative_ids.le(0)
+        explicit_invalid_mask |= explicit_negative_ids.eq(positive_item_ids.unsqueeze(1))
+        explicit_invalid_mask |= hist_movie_ids.unsqueeze(2).eq(explicit_negative_ids.unsqueeze(1)).any(dim=1)
+        explicit_scores = explicit_scores.masked_fill(explicit_invalid_mask, torch.finfo(explicit_scores.dtype).min)
+        extra_logits.append(explicit_scores)
 
     if extra_logits:
         logits = torch.cat([logits, *extra_logits], dim=1)
     return logits, labels
+
+
+def _weighted_mean(loss: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    safe_weights = weights.float().clamp_min(1.0)
+    return (loss * safe_weights).sum() / safe_weights.sum().clamp_min(1e-9)
+
+
+
 
 
 def _valid_candidate_mask(candidates: torch.Tensor, blocked_ids: torch.Tensor, blocked_mask: torch.Tensor) -> torch.Tensor:
@@ -785,78 +767,109 @@ def _pack_candidate_ids(candidates: torch.Tensor, selection: torch.Tensor, width
 
 
 
-def _sample_user_negative_ids(
-    user_negative_ids: torch.Tensor,
-    positive_ids: torch.Tensor,
-    context_ids: torch.Tensor,
-    num_negatives: int,
-) -> torch.Tensor:
-    batch_size = positive_ids.size(0)
-    if batch_size == 0 or num_negatives <= 0:
-        return torch.zeros((batch_size, max(num_negatives, 0)), dtype=torch.long, device=positive_ids.device)
-    candidates = user_negative_ids.long()
-    valid = candidates.gt(0)
-    valid &= candidates.ne(positive_ids.unsqueeze(1))
-    valid &= _first_occurrence_mask(candidates)
-    selection = valid & (valid.cumsum(dim=1) <= num_negatives)
-    return _pack_candidate_ids(candidates, selection, num_negatives)
-
-
-def _sample_context_negative_ids(
+def _sample_global_unseen_negative_ids(
     positive_ids: torch.Tensor,
     context_ids: torch.Tensor,
     all_item_ids: torch.Tensor,
     num_negatives: int,
-    candidate_pools: torch.Tensor | None = None,
-    candidate_pool_ratio: float = 0.0,
-    allow_candidate_pool_history: bool = False,
+    existing_negative_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size = positive_ids.size(0)
     device = positive_ids.device
     if batch_size == 0 or num_negatives <= 0 or all_item_ids.numel() == 0:
         return torch.zeros((batch_size, max(num_negatives, 0)), dtype=torch.long, device=device)
 
+    blocked_parts = [context_ids.long(), positive_ids.long().unsqueeze(1)]
+    if existing_negative_ids is not None and existing_negative_ids.numel() > 0:
+        blocked_parts.append(existing_negative_ids.long())
+    blocked_ids = torch.cat(blocked_parts, dim=1)
+    blocked_mask = blocked_ids.gt(0)
+    random_width = max(num_negatives * 32, num_negatives + context_ids.size(1) + 64)
+    random_candidates = all_item_ids[torch.randint(0, all_item_ids.numel(), (batch_size, random_width), device=device)]
+    random_valid = _valid_candidate_mask(random_candidates, blocked_ids, blocked_mask)
+    random_valid &= _first_occurrence_mask(random_candidates)
+    random_selection = random_valid & (random_valid.cumsum(dim=1) <= num_negatives)
+    return _pack_candidate_ids(random_candidates, random_selection, num_negatives)
+
+
+def _sample_in_batch_simple_negative_ids(
+    positive_ids: torch.Tensor,
+    context_ids: torch.Tensor,
+    num_negatives: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = positive_ids.size(0)
+    device = positive_ids.device
+    if batch_size == 0 or num_negatives <= 0:
+        empty = torch.zeros((batch_size, max(num_negatives, 0)), dtype=torch.long, device=device)
+        return empty, empty.new_zeros(empty.shape, dtype=torch.bool)
+    candidates = positive_ids.unsqueeze(0).expand(batch_size, -1)
     blocked_ids = torch.cat([context_ids.long(), positive_ids.long().unsqueeze(1)], dim=1)
     blocked_mask = blocked_ids.gt(0)
-    packed_ids = torch.zeros((batch_size, num_negatives), dtype=torch.long, device=device)
-    filled_counts = torch.zeros(batch_size, dtype=torch.long, device=device)
+    valid = _valid_candidate_mask(candidates, blocked_ids, blocked_mask)
+    valid &= _first_occurrence_mask(candidates)
+    selection = valid & (valid.cumsum(dim=1) <= num_negatives)
+    sampled = _pack_candidate_ids(candidates, selection, num_negatives)
+    sampled_mask = torch.arange(num_negatives, device=device).unsqueeze(0) < selection.sum(dim=1).clamp_max(num_negatives).unsqueeze(1)
+    return sampled, sampled_mask
 
-    preferred_width = 0
-    if candidate_pools is not None and candidate_pool_ratio > 0:
-        preferred_width = min(candidate_pools.size(1), max(0, int(round(num_negatives * candidate_pool_ratio))))
-    if preferred_width > 0:
-        preferred_candidates = candidate_pools[:, -preferred_width:].long()
-        preferred_valid = preferred_candidates.gt(0)
-        if allow_candidate_pool_history:
-            preferred_blocked_ids = positive_ids.long().unsqueeze(1)
-            preferred_blocked_mask = preferred_blocked_ids.gt(0)
-            preferred_valid &= _valid_candidate_mask(preferred_candidates, preferred_blocked_ids, preferred_blocked_mask)
-        else:
-            preferred_valid &= _valid_candidate_mask(preferred_candidates, blocked_ids, blocked_mask)
-        preferred_valid &= _first_occurrence_mask(preferred_candidates)
-        preferred_selection = preferred_valid & (preferred_valid.cumsum(dim=1) <= num_negatives)
-        packed_ids = _pack_candidate_ids(preferred_candidates, preferred_selection, num_negatives)
-        filled_counts = preferred_selection.sum(dim=1).clamp_max(num_negatives)
 
-    packed_mask = torch.arange(num_negatives, device=device).unsqueeze(0) < filled_counts.unsqueeze(1)
-    remaining_needed = num_negatives - filled_counts
-    random_width = max(num_negatives * 16, num_negatives + context_ids.size(1) + 32)
-    random_candidates = all_item_ids[torch.randint(0, all_item_ids.numel(), (batch_size, random_width), device=device)]
-    random_blocked_ids = torch.cat([blocked_ids, packed_ids], dim=1)
-    random_blocked_mask = torch.cat([blocked_mask, packed_mask], dim=1)
-    random_valid = _valid_candidate_mask(random_candidates, random_blocked_ids, random_blocked_mask)
-    random_valid &= _first_occurrence_mask(random_candidates)
-    random_selection = random_valid & (random_valid.cumsum(dim=1) <= remaining_needed.unsqueeze(1))
-    random_counts = random_selection.sum(dim=1).clamp_max(num_negatives)
-    random_packed = _pack_candidate_ids(random_candidates, random_selection, num_negatives)
+def _sample_simple_negative_ids(
+    positive_ids: torch.Tensor,
+    context_ids: torch.Tensor,
+    all_item_ids: torch.Tensor,
+    num_negatives: int,
+) -> torch.Tensor:
+    in_batch_ids, in_batch_mask = _sample_in_batch_simple_negative_ids(positive_ids, context_ids, num_negatives)
+    filled_counts = in_batch_mask.sum(dim=1)
+    if bool(filled_counts.eq(num_negatives).all()):
+        return in_batch_ids
+    global_ids = _sample_global_unseen_negative_ids(
+        positive_ids,
+        context_ids,
+        all_item_ids,
+        num_negatives,
+        existing_negative_ids=in_batch_ids,
+    )
+    global_mask = global_ids.gt(0)
+    combined_ids = torch.cat([in_batch_ids, global_ids], dim=1)
+    combined_mask = torch.cat([in_batch_mask, global_mask], dim=1)
+    return _pack_candidate_ids(combined_ids, combined_mask, num_negatives)
 
-    combined_ids = torch.cat([packed_ids, random_packed], dim=1)
-    combined_mask = torch.cat([
-        packed_mask,
-        torch.arange(num_negatives, device=device).unsqueeze(0) < random_counts.unsqueeze(1),
-    ], dim=1)
-    sampled_ids = _pack_candidate_ids(combined_ids, combined_mask, num_negatives)
-    return sampled_ids
+
+def _sample_retrieval_negative_ids(
+    positive_ids: torch.Tensor,
+    context_ids: torch.Tensor,
+    all_item_ids: torch.Tensor,
+    multimodal_matrix: torch.Tensor,
+    num_negatives: int,
+    hard_negative_ratio: float,
+) -> torch.Tensor:
+    batch_size = positive_ids.size(0)
+    device = positive_ids.device
+    if batch_size == 0 or num_negatives <= 0:
+        return torch.zeros((batch_size, max(num_negatives, 0)), dtype=torch.long, device=device)
+    hard_count = min(num_negatives, max(0, int(round(num_negatives * float(hard_negative_ratio)))))
+    simple_count = num_negatives - hard_count
+    simple_ids = _sample_simple_negative_ids(positive_ids, context_ids, all_item_ids, simple_count)
+    if hard_count <= 0 or multimodal_matrix.numel() == 0:
+        return simple_ids
+
+    positive_vectors = multimodal_matrix[positive_ids.clamp(min=0, max=multimodal_matrix.size(0) - 1)]
+    candidate_vectors = multimodal_matrix[all_item_ids.clamp(min=0, max=multimodal_matrix.size(0) - 1)]
+    scores = positive_vectors @ candidate_vectors.T
+    blocked_ids = torch.cat([context_ids.long(), positive_ids.long().unsqueeze(1), simple_ids], dim=1)
+    blocked_mask = blocked_ids.gt(0)
+    blocked_candidate_mask = ((all_item_ids.view(1, -1, 1) == blocked_ids.unsqueeze(1)) & blocked_mask.unsqueeze(1)).any(dim=2)
+    scores = scores.masked_fill(blocked_candidate_mask, torch.finfo(scores.dtype).min)
+    top_count = min(max(hard_count * 8, hard_count), all_item_ids.numel())
+    hard_candidates = all_item_ids[scores.topk(top_count, dim=1).indices]
+    hard_valid = hard_candidates.gt(0)
+    hard_valid &= _valid_candidate_mask(hard_candidates, blocked_ids, blocked_mask)
+    hard_valid &= _first_occurrence_mask(hard_candidates)
+    hard_selection = hard_valid & (hard_valid.cumsum(dim=1) <= hard_count)
+    hard_ids = _pack_candidate_ids(hard_candidates, hard_selection, hard_count)
+    return torch.cat([simple_ids, hard_ids], dim=1)
+
 
 
 
@@ -864,55 +877,38 @@ def _compute_sequence_loss(
     sequence_model: SequenceRetrievalModel,
     batch_dict: dict[str, torch.Tensor],
     all_item_ids: torch.Tensor,
+    multimodal_matrix: torch.Tensor,
     num_negatives: int,
-    user_negative_ratio: float,
+    hard_negative_ratio: float,
     loss_type: str,
-    history_feedback: str,
-    positive_rating_min: float,
 ) -> tuple[torch.Tensor, int]:
     positive_ids = batch_dict["movie_id"]
     valid_mask = positive_ids.gt(0)
     if not valid_mask.any():
         return torch.zeros((), device=batch_dict["hist_movie_id"].device), 0
 
-    if not valid_mask.all():
-        positive_ids = positive_ids[valid_mask]
-        hist_movie_ids = batch_dict["hist_movie_id"][valid_mask]
-        history_movie_ids = hist_movie_ids
-        hist_recency_bucket = batch_dict.get("hist_recency_bucket")
-        hist_rating = batch_dict.get("hist_rating")
-        user_negative_ids = batch_dict["user_negative_movie_id"][valid_mask]
-        if hist_recency_bucket is not None:
-            hist_recency_bucket = hist_recency_bucket[valid_mask]
-        if hist_rating is not None:
-            hist_rating = hist_rating[valid_mask]
-    else:
-        hist_movie_ids = batch_dict["hist_movie_id"]
-        history_movie_ids = hist_movie_ids
-        hist_recency_bucket = batch_dict.get("hist_recency_bucket")
-        hist_rating = batch_dict.get("hist_rating")
-        user_negative_ids = batch_dict["user_negative_movie_id"]
+    positive_ids = positive_ids[valid_mask]
+    positive_ratings = batch_dict["rating"][valid_mask].float().clamp_min(0.0)
+    hist_movie_ids = batch_dict["hist_movie_id"][valid_mask]
+    hist_recency_bucket = batch_dict.get("hist_recency_bucket")
+    hist_rating = batch_dict.get("hist_rating")
+    if hist_recency_bucket is not None:
+        hist_recency_bucket = hist_recency_bucket[valid_mask]
+    if hist_rating is not None:
+        hist_rating = hist_rating[valid_mask]
 
-    hist_movie_ids, hist_recency_bucket, hist_rating = filter_sequence_history(
-        hist_movie_ids,
-        hist_recency_bucket,
-        hist_rating,
-        history_feedback,
-        positive_rating_min,
-    )
     hidden_states = sequence_model.encode_user(
         hist_movie_ids,
         hist_recency_bucket,
         hist_rating,
     )
-    negative_ids = _sample_context_negative_ids(
+    negative_ids = _sample_retrieval_negative_ids(
         positive_ids=positive_ids,
-        context_ids=history_movie_ids,
+        context_ids=hist_movie_ids,
         all_item_ids=all_item_ids,
+        multimodal_matrix=multimodal_matrix,
         num_negatives=num_negatives,
-        candidate_pools=user_negative_ids,
-        candidate_pool_ratio=user_negative_ratio,
-        allow_candidate_pool_history=True,
+        hard_negative_ratio=hard_negative_ratio,
     )
     positive_emb = sequence_model.encode_item(positive_ids)
     negative_emb = sequence_model.encode_item(negative_ids.reshape(-1)).reshape(negative_ids.size(0), negative_ids.size(1), -1)
@@ -922,15 +918,18 @@ def _compute_sequence_loss(
     if loss_type == "softmax":
         logits = torch.cat([positive_logits.unsqueeze(1), negative_logits.masked_fill(~negative_mask, torch.finfo(negative_logits.dtype).min)], dim=1)
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-        return torch.nn.functional.cross_entropy(logits, labels), int(logits.size(0))
+        row_loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
+        return _weighted_mean(row_loss, positive_ratings), int(logits.size(0))
 
-    positive_loss = torch.nn.functional.binary_cross_entropy_with_logits(positive_logits, torch.ones_like(positive_logits), reduction="sum")
+    positive_loss = torch.nn.functional.binary_cross_entropy_with_logits(positive_logits, torch.ones_like(positive_logits), reduction="none")
+    weighted_positive_loss = (positive_loss * positive_ratings.clamp_min(1.0)).sum()
+    positive_weight = positive_ratings.clamp_min(1.0).sum()
     if negative_mask.any():
         negative_loss = torch.nn.functional.binary_cross_entropy_with_logits(negative_logits[negative_mask], torch.zeros_like(negative_logits[negative_mask]), reduction="sum")
-        denominator = positive_logits.numel() + int(negative_mask.sum().item())
-        loss = (positive_loss + negative_loss) / max(denominator, 1)
+        denominator = positive_weight + negative_mask.sum().float().clamp_min(1.0)
+        loss = (weighted_positive_loss + negative_loss) / denominator
     else:
-        loss = positive_loss / max(int(positive_logits.numel()), 1)
+        loss = weighted_positive_loss / positive_weight.clamp_min(1e-9)
     return loss, int(positive_logits.numel())
 
 
@@ -946,11 +945,10 @@ def _evaluate_loss(
     evaluate_two_tower: bool = True,
     evaluate_sequence: bool = True,
     all_item_ids: torch.Tensor | None = None,
+    multimodal_matrix: torch.Tensor | None = None,
     sequence_num_negatives: int = 0,
-    sequence_user_negative_ratio: float = 0.0,
+    hard_negative_ratio: float = 0.1,
     sequence_loss: str = "bce",
-    sequence_history_feedback: str = "positive",
-    positive_rating_min: float = 3.0,
     two_tower_temperature: float = 1.0,
 ) -> dict[str, float]:
     if evaluate_two_tower and two_tower_model is None:
@@ -979,19 +977,19 @@ def _evaluate_loss(
                     batch_dict["hist_movie_id"],
                     two_tower_temperature,
                 )
-                loss_tt = torch.nn.functional.cross_entropy(logits_tt, labels_tt)
+                row_loss = torch.nn.functional.cross_entropy(logits_tt, labels_tt, reduction="none")
+                loss_tt = _weighted_mean(row_loss, batch_dict["rating"])
             if evaluate_sequence:
-                if all_item_ids is None:
-                    raise ValueError("all_item_ids is required when evaluate_sequence=True")
+                if all_item_ids is None or multimodal_matrix is None:
+                    raise ValueError("all_item_ids and multimodal_matrix are required when evaluate_sequence=True")
                 loss_seq, supervised_positions = _compute_sequence_loss(
                     sequence_model,
                     batch_dict,
                     all_item_ids=all_item_ids,
+                    multimodal_matrix=multimodal_matrix,
                     num_negatives=sequence_num_negatives,
-                    user_negative_ratio=sequence_user_negative_ratio,
+                    hard_negative_ratio=hard_negative_ratio,
                     loss_type=sequence_loss,
-                    history_feedback=sequence_history_feedback,
-                    positive_rating_min=positive_rating_min,
                 )
                 if supervised_positions == 0:
                     continue
@@ -1024,7 +1022,7 @@ def _evaluate_loss(
 
 
 
-def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, device: torch.device, topk: int, route: str = "two_tower", sequence_history_feedback: str = "positive", positive_rating_min: float = 3.0, item_feature_arrays: dict[str, np.ndarray] | None = None) -> dict:
+def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, device: torch.device, topk: int, route: str = "two_tower", item_feature_arrays: dict[str, np.ndarray] | None = None) -> dict:
     labels, scores, user_ids = [], [], []
     item_embeddings = np.asarray(item_embeddings)
     with torch.no_grad():
@@ -1040,17 +1038,10 @@ def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, de
                 "hist_rating": torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device),
             }
             if route == "sequence":
-                hist_movie_ids, hist_recency_bucket, hist_rating = filter_sequence_history(
+                user_embedding = model.encode_user(
                     batch["hist_movie_id"],
                     batch["hist_recency_bucket"],
                     batch["hist_rating"],
-                    sequence_history_feedback,
-                    positive_rating_min,
-                )
-                user_embedding = model.encode_user(
-                    hist_movie_ids,
-                    hist_recency_bucket,
-                    hist_rating,
                 ).cpu().numpy()[0]
             else:
                 user_embedding = model.encode_user(batch).cpu().numpy()[0]

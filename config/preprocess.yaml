@@ -1,15 +1,15 @@
 retrieval:
   max_seq_len: 500
   positive_rating_min: 3.0
-  negative_rating_max: 2.0
+  eval_positive_rating_min: 4.0
   neutral_rating: 3.0
-  sequence_negative_pool_size: 500
 
 ranking:
   max_seq_len: 300
   positive_rating_min: 4.0
   negative_rating_max: 2.0
-  interest_rating_min: 4.0
+  neutral_rating: 3.0
+  history_policy: all_ratings
 
 multimodal:
   model_name: ViT-L-14

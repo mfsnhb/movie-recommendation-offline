@@ -21,12 +21,14 @@ def _merge_dict(base: dict | None, override: dict | None) -> dict:
 
 
 
-def resolve_rating_semantics(settings: dict | None) -> dict[str, float | bool]:
+def resolve_rating_semantics(settings: dict | None) -> dict[str, float | str]:
     source = dict(settings or {})
     return {
-        "positive_rating_min": float(source.get("positive_rating_min", 4.0)),
+        "positive_rating_min": float(source.get("positive_rating_min", 3.0)),
+        "eval_positive_rating_min": float(source.get("eval_positive_rating_min", 4.0)),
         "negative_rating_max": float(source.get("negative_rating_max", 2.0)),
         "neutral_rating": float(source.get("neutral_rating", 3.0)),
+        "history_policy": str(source.get("history_policy", "all_ratings")),
     }
 
 

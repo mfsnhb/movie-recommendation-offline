@@ -194,7 +194,10 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     early_stopping_patience = int(training_settings.get("early_stopping_patience", 2))
     min_delta = float(training_settings.get("min_delta", 1e-4))
     emb_dim = int(model_settings.get("embedding_dim", 16))
-    train_negatives = int(training_settings.get("train_negatives", 7))
+    train_negatives = int(training_settings.get("train_negatives", 20))
+    low_rating_negative_ratio = float(training_settings.get("low_rating_negative_ratio", 0.6))
+    recall_negative_ratio = float(training_settings.get("recall_negative_ratio", 0.3))
+    random_negative_ratio = float(training_settings.get("random_negative_ratio", 0.1))
 
     device = _resolve_torch_device(resolved_config.get("training_settings", {}))
     train_loader = DataLoader(
@@ -206,9 +209,9 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             item_features=item_features,
             all_item_ids=all_item_ids,
             num_negatives=train_negatives,
-            low_rating_negatives=int(training_settings.get("low_rating_negatives", 5)),
-            recall_hard_negatives=int(training_settings.get("recall_hard_negatives", 10)),
-            random_negatives=int(training_settings.get("random_negatives", max(train_negatives - int(training_settings.get("low_rating_negatives", 5)) - int(training_settings.get("recall_hard_negatives", 10)), 0))),
+            low_rating_negative_ratio=low_rating_negative_ratio,
+            recall_negative_ratio=recall_negative_ratio,
+            random_negative_ratio=random_negative_ratio,
             fused_candidates_by_user=fused_candidates_by_user,
             fused_scores_by_user=fused_scores_by_user,
             seed=42,
@@ -225,7 +228,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     logger.info(
-        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | validation_samples=%s | validation_users=%s | batch_size=%s | epochs=%s | train_negatives=%s | low_rating_negatives=%s | recall_hard_negatives=%s | random_negatives=%s | validation_negatives=%s | warm_start=%s",
+        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | validation_samples=%s | validation_users=%s | batch_size=%s | epochs=%s | sampled_softmax_negatives=%s | negative_ratios=low_rating:recall:random %.2f:%.2f:%.2f | validation_negatives=%s | warm_start=%s",
         model_name,
         ranking_samples.get("protocol", "unknown"),
         device,
@@ -235,9 +238,9 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
         batch_size,
         epochs,
         train_negatives,
-        int(training_settings.get("low_rating_negatives", 5)),
-        int(training_settings.get("recall_hard_negatives", 10)),
-        int(training_settings.get("random_negatives", max(train_negatives - int(training_settings.get("low_rating_negatives", 5)) - int(training_settings.get("recall_hard_negatives", 10)), 0))),
+        low_rating_negative_ratio,
+        recall_negative_ratio,
+        random_negative_ratio,
         int(training_settings.get("validation_negatives", 1000)),
         warm_start,
     )
@@ -257,7 +260,17 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             batch = batch_to_device(batch, device)
             optimizer.zero_grad()
             logits = model(batch)
-            loss = _listwise_candidate_loss(logits, batch["candidate_relevance"], batch["candidate_mask"])
+            loss = _sampled_softmax_candidate_loss(
+                logits,
+                batch["target_index"],
+                batch["target_rating"],
+                batch["candidate_mask"],
+                rating_weighting_enabled=bool(training_settings.get("rating_weighting_enabled", True)),
+                rating_weight_neutral=float(training_settings.get("rating_weight_neutral", 3.0)),
+                rating_weight_scale=float(training_settings.get("rating_weight_scale", 0.25)),
+                rating_weight_min=float(training_settings.get("rating_weight_min", 0.5)),
+                rating_weight_max=float(training_settings.get("rating_weight_max", 1.5)),
+            )
             loss.backward()
             optimizer.step()
 
@@ -420,38 +433,50 @@ def _validate_ranking_training_samples(ranking_samples: dict, training_settings:
     train_data = ranking_samples.get("train")
     if not isinstance(train_data, dict):
         raise ValueError(f"Ranking samples must contain a train split. Regenerate {RANKING_SAMPLE_PATH.name}.")
-    validate_min_target_rating(
-        train_data,
-        rating_field="target_rating",
-        min_rating=float(training_settings.get("positive_rating_min", 4.0)),
-        stage_name="Ranking train",
-        artifact_name=RANKING_SAMPLE_PATH.name,
-    )
-    if int(training_settings.get("low_rating_negatives", 0)) > 0 and "low_rating_movie_id" not in train_data:
+    for split_name in ("train", "validation", "test"):
+        split_data = ranking_samples.get(split_name)
+        if not isinstance(split_data, dict):
+            raise ValueError(f"Ranking samples must contain a {split_name} split. Regenerate {RANKING_SAMPLE_PATH.name}.")
+        validate_min_target_rating(
+            split_data,
+            rating_field="target_rating",
+            min_rating=float(training_settings.get("positive_rating_min", 4.0)),
+            stage_name=f"Ranking {split_name}",
+            artifact_name=RANKING_SAMPLE_PATH.name,
+        )
+    if "low_rating_movie_id" not in train_data:
         raise ValueError(
-            "Ranking train samples are missing 'low_rating_movie_id', so low-rating hard negatives cannot be used. "
+            "Ranking train samples are missing 'low_rating_movie_id', so low-rating sampled-softmax negatives cannot be used. "
             f"Regenerate {RANKING_SAMPLE_PATH.name}."
         )
 
 
 
-def _listwise_candidate_loss(
+def _sampled_softmax_candidate_loss(
     logits: torch.Tensor,
-    relevance: torch.Tensor,
+    target_index: torch.Tensor,
+    target_rating: torch.Tensor,
     candidate_mask: torch.Tensor,
+    rating_weighting_enabled: bool,
+    rating_weight_neutral: float,
+    rating_weight_scale: float,
+    rating_weight_min: float,
+    rating_weight_max: float,
 ) -> torch.Tensor:
     mask = candidate_mask.bool()
-    masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
-    gains = torch.clamp(relevance.float(), min=0.0) * mask.float()
-    gain_sums = gains.sum(dim=1, keepdim=True)
-    valid_rows = mask.any(dim=1) & gain_sums.squeeze(1).gt(0)
+    row_indices = torch.arange(logits.size(0), device=logits.device)
+    target_index = target_index.long().clamp(min=0, max=logits.size(1) - 1)
+    valid_rows = mask[row_indices, target_index]
     if not valid_rows.any():
         return torch.zeros((), dtype=logits.dtype, device=logits.device)
 
-    target_dist = gains[valid_rows] / gain_sums[valid_rows].clamp_min(1e-9)
-    pred_log_probs = torch.log_softmax(masked_logits[valid_rows], dim=1)
-    row_losses = -(target_dist * pred_log_probs).sum(dim=1)
-    return row_losses.mean()
+    masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+    row_losses = torch.nn.functional.cross_entropy(masked_logits[valid_rows], target_index[valid_rows], reduction="none")
+    if not rating_weighting_enabled:
+        return row_losses.mean()
+    weights = 1.0 + (target_rating[valid_rows].float() - float(rating_weight_neutral)) * float(rating_weight_scale)
+    weights = weights.clamp(min=float(rating_weight_min), max=float(rating_weight_max))
+    return (row_losses * weights).sum() / weights.sum().clamp_min(1e-9)
 
 
 
