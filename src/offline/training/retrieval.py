@@ -890,16 +890,16 @@ def _compute_sequence_loss(
     positive_ids = positive_ids[valid_mask]
     positive_ratings = batch_dict["rating"][valid_mask].float().clamp_min(0.0)
     hist_movie_ids = batch_dict["hist_movie_id"][valid_mask]
-    hist_recency_bucket = batch_dict.get("hist_recency_bucket")
+    hist_time_gap_bucket = batch_dict.get("hist_time_gap_bucket")
     hist_rating = batch_dict.get("hist_rating")
-    if hist_recency_bucket is not None:
-        hist_recency_bucket = hist_recency_bucket[valid_mask]
+    if hist_time_gap_bucket is not None:
+        hist_time_gap_bucket = hist_time_gap_bucket[valid_mask]
     if hist_rating is not None:
         hist_rating = hist_rating[valid_mask]
 
     hidden_states = sequence_model.encode_user(
         hist_movie_ids,
-        hist_recency_bucket,
+        hist_time_gap_bucket,
         hist_rating,
     )
     negative_ids = _sample_retrieval_negative_ids(
@@ -1034,13 +1034,13 @@ def _evaluate_retrieval(model, test_data, encoded_movie_ids, item_embeddings, de
                 "occupation": torch.tensor([int(test_data["occupation"][idx])], dtype=torch.long, device=device),
                 "zip_code": torch.tensor([int(test_data["zip_code"][idx])], dtype=torch.long, device=device),
                 "hist_movie_id": torch.tensor(np.asarray(test_data["hist_movie_id"][idx]).reshape(1, -1), dtype=torch.long, device=device),
-                "hist_recency_bucket": torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device),
+                "hist_time_gap_bucket": torch.tensor(np.asarray(test_data["hist_time_gap_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device),
                 "hist_rating": torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device),
             }
             if route == "sequence":
                 user_embedding = model.encode_user(
                     batch["hist_movie_id"],
-                    batch["hist_recency_bucket"],
+                    batch["hist_time_gap_bucket"],
                     batch["hist_rating"],
                 ).cpu().numpy()[0]
             else:

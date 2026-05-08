@@ -38,7 +38,11 @@ class TwoTowerRetrievalModel(nn.Module):
         self.user_projection = build_mlp(emb_dim * 3, user_hidden_dims or [emb_dim * 4, emb_dim * 2], emb_dim, dropout=dropout)
 
     def encode_user(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        history_embedding = self.movie_encoder({"movie_id": batch["hist_movie_id"], "interaction_rating": batch["hist_rating"]})
+        history_embedding = self.movie_encoder({
+            "movie_id": batch["hist_movie_id"],
+            "interaction_rating": batch["hist_rating"],
+            "interaction_time_gap_bucket": batch["hist_time_gap_bucket"],
+        })
         history_mask = batch["hist_movie_id"].gt(0)
         static_user = self.user_encoder(batch)
         pooled_history = self._mean_pool(history_embedding, history_mask)

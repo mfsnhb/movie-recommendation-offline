@@ -29,7 +29,7 @@ def slice_train_batch(train_data: dict[str, np.ndarray], indices: np.ndarray, de
         "occupation": torch.long,
         "zip_code": torch.long,
         "hist_movie_id": torch.long,
-        "hist_recency_bucket": torch.long,
+        "hist_time_gap_bucket": torch.long,
         "hist_rating": torch.float32,
         "movie_id": torch.long,
         "rating": torch.float32,
@@ -69,7 +69,7 @@ def load_retrieval_context(settings: dict, config: dict) -> dict:
     required_train_fields = [
         "user_id",
         "hist_movie_id",
-        "hist_recency_bucket",
+        "hist_time_gap_bucket",
         "hist_rating",
         "movie_id",
         "rating",

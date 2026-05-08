@@ -23,9 +23,9 @@ from offline.utils.logging import get_logger
 
 logger = get_logger("offline.features.retrieval")
 _PREPROCESS_VERSION = 21
-_RECENCY_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
-_RECENCY_BUCKET_BOUNDARIES_SECONDS = np.asarray(_RECENCY_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
-_RECENCY_BUCKET_COUNT = len(_RECENCY_BUCKET_BOUNDARIES_DAYS) + 2
+_TIME_GAP_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
+_TIME_GAP_BUCKET_BOUNDARIES_SECONDS = np.asarray(_TIME_GAP_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
+_TIME_GAP_BUCKET_COUNT = len(_TIME_GAP_BUCKET_BOUNDARIES_DAYS) + 2
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
 
@@ -104,13 +104,13 @@ def _pad_float_sequence(values, max_seq_len: int, padding_value: float = 0.0):
     return padded
 
 
-def _recency_buckets(history_timestamps, target_timestamp, max_seq_len: int, padding_value: int = 0) -> np.ndarray:
+def _time_gap_buckets(history_timestamps, target_timestamp, max_seq_len: int, padding_value: int = 0) -> np.ndarray:
     history = np.asarray(history_timestamps, dtype=np.int64).reshape(-1)
     if history.size == 0:
         return np.full(max_seq_len, padding_value, dtype=np.int32)
     clipped_history = history[-max_seq_len:]
     deltas = np.maximum(np.int64(target_timestamp) - clipped_history, 0)
-    bucket_ids = np.searchsorted(_RECENCY_BUCKET_BOUNDARIES_SECONDS, deltas, side="left") + 1
+    bucket_ids = np.searchsorted(_TIME_GAP_BUCKET_BOUNDARIES_SECONDS, deltas, side="left") + 1
     padded = np.full(max_seq_len, padding_value, dtype=np.int32)
     if bucket_ids.size > 0:
         padded[-bucket_ids.size :] = bucket_ids.astype(np.int32, copy=False)
@@ -136,7 +136,7 @@ def _empty_retrieval_samples(sample_count: int, max_hist_seq_len: int) -> dict[s
         "occupation": np.zeros(sample_count, dtype=np.int32),
         "zip_code": np.zeros(sample_count, dtype=np.int32),
         "hist_movie_id": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
-        "hist_recency_bucket": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
+        "hist_time_gap_bucket": np.zeros((sample_count, max_hist_seq_len), dtype=np.int32),
         "hist_rating": np.zeros((sample_count, max_hist_seq_len), dtype=np.float32),
         "movie_id": np.zeros(sample_count, dtype=np.int32),
         "rating": np.zeros(sample_count, dtype=np.float32),
@@ -160,7 +160,7 @@ def _fill_history(
     padding_value: int,
 ) -> None:
     store["hist_movie_id"][row_idx] = _pad_int_sequence(movie_sequence[:target_idx], max_hist_seq_len, padding_value)
-    store["hist_recency_bucket"][row_idx] = _recency_buckets(timestamp_sequence[:target_idx], timestamp_sequence[target_idx], max_hist_seq_len, padding_value)
+    store["hist_time_gap_bucket"][row_idx] = _time_gap_buckets(timestamp_sequence[:target_idx], timestamp_sequence[target_idx], max_hist_seq_len, padding_value)
     store["hist_rating"][row_idx] = _pad_float_sequence(rating_sequence[:target_idx], max_hist_seq_len, 0.0)
 
 
@@ -282,8 +282,8 @@ def _build_preprocess_meta(
         "train_target_policy": f"rating>={positive_rating_min:g}",
         "eval_target_policy": f"rating>={eval_positive_rating_min:g}",
         "rating_scale": "five_point",
-        "recency_bucket_boundaries_days": list(_RECENCY_BUCKET_BOUNDARIES_DAYS),
-        "recency_bucket_count": int(_RECENCY_BUCKET_COUNT),
+        "time_gap_bucket_boundaries_days": list(_TIME_GAP_BUCKET_BOUNDARIES_DAYS),
+        "time_gap_bucket_count": int(_TIME_GAP_BUCKET_COUNT),
         "multimodal_embedding_dim": int(multimodal_embedding_dim),
     }
 
@@ -355,7 +355,7 @@ def run_retrieval_preprocessing():
     )
     vocab_dict = {**user_vocab, **movie_vocab}
     feature_dict = {k: len(v) + 1 for k, v in vocab_dict.items()}
-    feature_dict["hist_recency_bucket"] = _RECENCY_BUCKET_COUNT
+    feature_dict["hist_time_gap_bucket"] = _TIME_GAP_BUCKET_COUNT
     feature_dict["popularity"] = _POPULARITY_BUCKET_COUNT + 1
     feature_dict["multimodal_embedding_dim"] = multimodal_embedding_dim
     save_pickle(samples, RETRIEVAL_SAMPLE_PATH)

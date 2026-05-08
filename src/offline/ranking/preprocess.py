@@ -23,9 +23,9 @@ _SAMPLE_PROTOCOL = "prefix_positive_targets_v9_all_history"
 _ID_DTYPE = np.uint16
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
-_RECENCY_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
-_RECENCY_BUCKET_BOUNDARIES_SECONDS = np.asarray(_RECENCY_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
-_RECENCY_BUCKET_COUNT = len(_RECENCY_BUCKET_BOUNDARIES_DAYS) + 2
+_TIME_GAP_BUCKET_BOUNDARIES_DAYS = (1, 3, 7, 14, 30, 90, 365)
+_TIME_GAP_BUCKET_BOUNDARIES_SECONDS = np.asarray(_TIME_GAP_BUCKET_BOUNDARIES_DAYS, dtype=np.int64) * 24 * 60 * 60
+_TIME_GAP_BUCKET_COUNT = len(_TIME_GAP_BUCKET_BOUNDARIES_DAYS) + 2
 
 
 def process_features_for_ranking(df_movies, df_ratings, df_users):
@@ -108,7 +108,7 @@ def _allocate_split_arrays(sample_count: int, max_seq_len: int) -> dict[str, np.
         "user_id_raw": np.zeros(sample_count, dtype=np.int32),
         "hist_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "hist_rating": np.zeros((sample_count, max_seq_len), dtype=np.float32),
-        "hist_recency_bucket": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
+        "hist_time_gap_bucket": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "hist_length": np.zeros(sample_count, dtype=_ID_DTYPE),
         "low_rating_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "target_movie_id": np.zeros(sample_count, dtype=_ID_DTYPE),
@@ -132,12 +132,12 @@ def _fill_padded_float_row(target: np.ndarray, values: list[float]) -> None:
 
 
 
-def _build_recency_buckets(history_timestamps: list[int], target_timestamp: int, width: int) -> np.ndarray:
+def _build_time_gap_buckets(history_timestamps: list[int], target_timestamp: int, width: int) -> np.ndarray:
     timestamps = np.asarray(history_timestamps, dtype=np.int64).reshape(-1)[-width:]
     buckets = np.zeros(width, dtype=_ID_DTYPE)
     if timestamps.size > 0:
         deltas = np.maximum(np.int64(target_timestamp) - timestamps, 0)
-        bucket_ids = np.searchsorted(_RECENCY_BUCKET_BOUNDARIES_SECONDS, deltas, side="left") + 1
+        bucket_ids = np.searchsorted(_TIME_GAP_BUCKET_BOUNDARIES_SECONDS, deltas, side="left") + 1
         buckets[-bucket_ids.size :] = bucket_ids.astype(_ID_DTYPE, copy=False)
     return buckets
 
@@ -185,11 +185,11 @@ def _write_sample_row(
     store["user_id_raw"][row_idx] = user_id_raw
     store["hist_movie_id"][row_idx].fill(0)
     store["hist_rating"][row_idx].fill(0.0)
-    store["hist_recency_bucket"][row_idx].fill(0)
+    store["hist_time_gap_bucket"][row_idx].fill(0)
     store["low_rating_movie_id"][row_idx].fill(0)
     hist_length = _fill_padded_row(store["hist_movie_id"][row_idx], hist_movies)
     _fill_padded_float_row(store["hist_rating"][row_idx], hist_ratings)
-    store["hist_recency_bucket"][row_idx] = _build_recency_buckets(hist_timestamps, target_timestamp, store["hist_recency_bucket"][row_idx].shape[0])
+    store["hist_time_gap_bucket"][row_idx] = _build_time_gap_buckets(hist_timestamps, target_timestamp, store["hist_time_gap_bucket"][row_idx].shape[0])
     store["hist_length"][row_idx] = hist_length
     _fill_padded_row(store["low_rating_movie_id"][row_idx], low_rating_movies)
     store["target_movie_id"][row_idx] = target_movie_id
@@ -463,7 +463,7 @@ def run_ranking_preprocessing():
 
     vocab_dict = {**user_vocab, **movie_vocab}
     vocab_dict["popularity"] = np.arange(_POPULARITY_BUCKET_COUNT, dtype=np.int32)
-    vocab_dict["recency_bucket"] = np.arange(1, _RECENCY_BUCKET_COUNT + 1, dtype=np.int32)
+    vocab_dict["time_gap_bucket"] = np.arange(1, _TIME_GAP_BUCKET_COUNT + 1, dtype=np.int32)
     feature_dict = {key: len(values) + 1 for key, values in vocab_dict.items()}
     feature_dict["multimodal_embedding_dim"] = int(multimodal_artifacts.embeddings.shape[1])
 

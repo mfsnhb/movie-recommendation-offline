@@ -59,7 +59,6 @@ class SequenceRetrievalModel(nn.Module):
         self.max_len = max_len
         self.hidden_dim = int(hidden_dim or emb_dim)
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table, item_feature_table=item_feature_table)
-        self.recency_embedding = nn.Embedding(feature_dict.get("hist_recency_bucket", 2), emb_dim, padding_idx=0)
         self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(
             input_size=emb_dim,
@@ -74,15 +73,15 @@ class SequenceRetrievalModel(nn.Module):
     def encode_sequence(
         self,
         hist_movie_ids: torch.Tensor,
-        hist_recency_bucket: torch.Tensor | None = None,
+        hist_time_gap_bucket: torch.Tensor | None = None,
         hist_rating: torch.Tensor | None = None,
         hist_item_features: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         hist_movie_ids = hist_movie_ids[:, -self.max_len :]
-        if hist_recency_bucket is None:
-            hist_recency_bucket = torch.zeros_like(hist_movie_ids)
+        if hist_time_gap_bucket is None:
+            hist_time_gap_bucket = torch.zeros_like(hist_movie_ids)
         else:
-            hist_recency_bucket = hist_recency_bucket[:, -self.max_len :].long()
+            hist_time_gap_bucket = hist_time_gap_bucket[:, -self.max_len :].long()
         if hist_rating is None:
             hist_rating = torch.zeros_like(hist_movie_ids, dtype=torch.float32)
         else:
@@ -95,14 +94,14 @@ class SequenceRetrievalModel(nn.Module):
         counts = visible_mask.sum(dim=1)
         compact_movie_ids = _left_align_by_order(hist_movie_ids, order, counts)
         compact_rating = _left_align_by_order(hist_rating, order, counts)
-        compact_recency = _left_align_by_order(hist_recency_bucket, order, counts).long()
+        compact_time_gap = _left_align_by_order(hist_time_gap_bucket, order, counts).long()
         compact_mask = compact_movie_ids.gt(0)
         lengths = compact_mask.sum(dim=1).cpu()
-        x = self.movie_encoder({"movie_id": compact_movie_ids, "interaction_rating": compact_rating})
-        recency_embedding = self.recency_embedding(
-            compact_recency.clamp(min=0, max=self.recency_embedding.num_embeddings - 1)
-        ).masked_fill(~compact_mask.unsqueeze(-1), 0.0)
-        x = x + recency_embedding
+        x = self.movie_encoder({
+            "movie_id": compact_movie_ids,
+            "interaction_rating": compact_rating,
+            "interaction_time_gap_bucket": compact_time_gap,
+        })
         x = self.dropout(x)
         compact_states = torch.zeros(hist_movie_ids.size(0), hist_movie_ids.size(1), self.hidden_dim, device=hist_movie_ids.device, dtype=x.dtype)
         non_empty = lengths.gt(0)
@@ -129,11 +128,11 @@ class SequenceRetrievalModel(nn.Module):
     def encode_user(
         self,
         hist_movie_ids: torch.Tensor,
-        hist_recency_bucket: torch.Tensor | None = None,
+        hist_time_gap_bucket: torch.Tensor | None = None,
         hist_rating: torch.Tensor | None = None,
         hist_item_features: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        sequence_outputs = self.encode_sequence(hist_movie_ids, hist_recency_bucket, hist_rating, hist_item_features)
+        sequence_outputs = self.encode_sequence(hist_movie_ids, hist_time_gap_bucket, hist_rating, hist_item_features)
         hidden_states = sequence_outputs["hidden_states"]
         visible_mask = sequence_outputs["visible_mask"]
         visible_counts = visible_mask.sum(dim=1)

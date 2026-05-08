@@ -424,7 +424,7 @@ def _two_tower_candidates(test_data, model, embeddings, encoded_movie_ids, devic
                 "occupation": torch.tensor([int(test_data["occupation"][idx])], dtype=torch.long, device=device),
                 "zip_code": torch.tensor([int(test_data["zip_code"][idx])], dtype=torch.long, device=device),
                 "hist_movie_id": torch.tensor(np.asarray(test_data["hist_movie_id"][idx]).reshape(1, -1), dtype=torch.long, device=device),
-                "hist_recency_bucket": torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device),
+                "hist_time_gap_bucket": torch.tensor(np.asarray(test_data["hist_time_gap_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device),
                 "hist_rating": torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device),
             }
             user_embedding = model.encode_user(batch).cpu().numpy()[0]
@@ -440,11 +440,11 @@ def _sequence_candidates(test_data, model, embeddings, encoded_movie_ids, device
     with torch.no_grad():
         for idx, user_id in enumerate(test_data["user_id"]):
             hist_movie_ids = torch.tensor(np.asarray(test_data["hist_movie_id"][idx]).reshape(1, -1), dtype=torch.long, device=device)
-            hist_recency_bucket = torch.tensor(np.asarray(test_data["hist_recency_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device)
+            hist_time_gap_bucket = torch.tensor(np.asarray(test_data["hist_time_gap_bucket"][idx]).reshape(1, -1), dtype=torch.long, device=device)
             hist_rating = torch.tensor(np.asarray(test_data["hist_rating"][idx]).reshape(1, -1), dtype=torch.float32, device=device)
             user_embedding = model.encode_user(
                 hist_movie_ids,
-                hist_recency_bucket,
+                hist_time_gap_bucket,
                 hist_rating,
             ).cpu().numpy()[0]
             scores = embeddings @ user_embedding

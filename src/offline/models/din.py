@@ -65,6 +65,7 @@ class DINModel(nn.Module):
             "popularity": batch["hist_popularity"],
             "averageRating": batch["hist_averageRating"],
             "interaction_rating": batch["hist_rating"],
+            "interaction_time_gap_bucket": batch["hist_time_gap_bucket"],
         })
         history_mask = history_movie_id.gt(0)
         attention_history, attention_mask = self._candidate_topm_history(candidate_embedding, history_embedding, history_mask)
