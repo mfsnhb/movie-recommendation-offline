@@ -104,6 +104,7 @@ def train_two_tower(context=None, warm_start: bool = True):
     training_settings = resolved_config["training_settings"]
 
     train_data = context["train_data"]
+    validation_data = context["validation_data"]
     test_data = context["test_data"]
     feature_dict = context["feature_dict"]
     vocab_dict = context["vocab_dict"]
@@ -119,11 +120,19 @@ def train_two_tower(context=None, warm_start: bool = True):
     min_delta = float(training_settings.get("min_delta", 1e-4))
     two_tower_num_negatives = int(training_settings.get("two_tower_num_negatives", 256))
     hard_negative_ratio = float(training_settings.get("hard_negative_ratio", 0.1))
+    negative_popularity_alpha = float(training_settings.get("negative_popularity_alpha", 0.75))
     export_batch_size = int(training_settings.get("export_batch_size", 4096))
     two_tower_temperature = float(training_settings.get("two_tower_temperature", 0.05))
 
     device = context["device"]
     all_item_id_tensor = torch.as_tensor(all_item_ids, dtype=torch.long, device=device)
+    item_id_positions = _build_item_position_lookup(all_item_id_tensor)
+    popularity_weights = _build_retrieval_popularity_weights(
+        all_item_id_tensor,
+        item_feature_arrays,
+        device,
+        negative_popularity_alpha,
+    )
     multimodal_matrix = torch.nn.functional.normalize(
         torch.as_tensor(item_feature_arrays["multimodal_embedding"], dtype=torch.float32, device=device),
         dim=1,
@@ -146,37 +155,33 @@ def train_two_tower(context=None, warm_start: bool = True):
     two_tower_optimizer = torch.optim.Adam(two_tower_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     train_size = int(len(train_data["user_id"]))
-    val_ratio = 0.1
-    val_size = max(1, int(train_size * val_ratio))
-    train_size = train_size - val_size
-    all_indices = np.arange(len(train_data["user_id"]), dtype=np.int64)
-    rng = np.random.default_rng(42)
-    rng.shuffle(all_indices)
-    val_indices = all_indices[:val_size]
-    train_indices = all_indices[val_size:]
+    train_indices = np.arange(train_size, dtype=np.int64)
 
     use_explicit_negatives = two_tower_num_negatives > 0
 
     logger.info(
-        "TwoTower training start | device=%s | train_samples=%s | val_samples=%s | test_users=%s | batch_size=%s | epochs=%s | negatives=%s | hard_negative_ratio=%s | export_batch_size=%s | temperature=%s | warm_start=%s",
+        "TwoTower training start | device=%s | train_samples=%s | validation_users=%s | test_users=%s | batch_size=%s | epochs=%s | negatives=%s | hard_negative_ratio=%s | negative_popularity_alpha=%s | export_batch_size=%s | temperature=%s | warm_start=%s",
         device,
         train_size,
-        val_size,
+        len(validation_data["user_id"]),
         len(test_data["user_id"]),
         batch_size,
         epochs,
         two_tower_num_negatives if use_explicit_negatives else 0,
         hard_negative_ratio if use_explicit_negatives else 0.0,
+        negative_popularity_alpha if use_explicit_negatives else 0.0,
         export_batch_size,
         two_tower_temperature,
         warm_start,
     )
 
     best_state = None
-    best_val_loss = float("inf")
+    best_val_metric = float("-inf")
     stale_epochs = 0
     training_start = time.perf_counter()
     total_batches = max(int(np.ceil(train_size / max(batch_size, 1))), 1)
+    encoded_movie_ids = np.asarray(all_item_ids, dtype=np.int64)
+    evaluation_topk = int(resolved_config["evaluation_settings"].get("topk", 200))
 
     for epoch in range(epochs):
         two_tower_model.train()
@@ -197,11 +202,14 @@ def train_two_tower(context=None, warm_start: bool = True):
             item_repr_tt = two_tower_model.encode_item(positive_ids)
             explicit_negative_ids = None
             explicit_negative_repr = None
+            explicit_negative_logq = None
             if use_explicit_negatives:
-                explicit_negative_ids = _sample_retrieval_negative_ids(
+                explicit_negative_ids, explicit_negative_logq = _sample_retrieval_negative_ids(
                     positive_ids=positive_ids,
                     context_ids=batch_dict["hist_movie_id"],
                     all_item_ids=all_item_id_tensor,
+                    item_id_positions=item_id_positions,
+                    popularity_weights=popularity_weights,
                     multimodal_matrix=multimodal_matrix,
                     num_negatives=two_tower_num_negatives,
                     hard_negative_ratio=hard_negative_ratio,
@@ -219,6 +227,7 @@ def train_two_tower(context=None, warm_start: bool = True):
                 two_tower_temperature,
                 explicit_negative_ids=explicit_negative_ids,
                 explicit_negative_repr=explicit_negative_repr,
+                explicit_negative_logq=explicit_negative_logq,
             )
             row_loss = torch.nn.functional.cross_entropy(logits_tt, labels_tt, reduction="none")
             loss_tt = _weighted_mean(row_loss, positive_ratings)
@@ -253,46 +262,56 @@ def train_two_tower(context=None, warm_start: bool = True):
                 )
 
         train_tt_loss = total_tt_loss / max(train_size, 1)
-        val_metrics = _evaluate_loss(
+        two_tower_model.eval()
+        validation_item_embeddings, _ = _export_item_embeddings(
             two_tower_model,
             None,
-            train_data,
-            val_indices,
-            device,
+            encoded_movie_ids,
             item_feature_arrays,
-            batch_size=batch_size,
-            evaluate_two_tower=True,
-            evaluate_sequence=False,
-            two_tower_temperature=two_tower_temperature,
+            device,
+            export_batch_size,
+            export_two_tower=True,
+            export_sequence=False,
         )
+        val_metrics = _evaluate_retrieval(
+            two_tower_model,
+            validation_data,
+            encoded_movie_ids,
+            validation_item_embeddings,
+            device,
+            evaluation_topk,
+            route="two_tower",
+            item_feature_arrays=item_feature_arrays,
+        )
+        val_metric = float(val_metrics.get("ndcg@200", val_metrics.get("ndcg@100", 0.0)))
         logger.info(
-            "TwoTower epoch %s/%s done | train_loss=%.4f | val_loss=%.4f | avg_grad_norm=%.6f | epoch_time=%s | elapsed=%s",
+            "TwoTower epoch %s/%s done | train_loss=%.4f | val_ndcg@200=%.6f | val_hr@200=%.6f | avg_grad_norm=%.6f | epoch_time=%s | elapsed=%s",
             epoch + 1,
             epochs,
             train_tt_loss,
-            val_metrics["loss_blended"],
+            val_metric,
+            float(val_metrics.get("hr@200", 0.0)),
             total_grad_norm / max(grad_norm_steps, 1),
             format_eta(time.perf_counter() - epoch_start),
             format_eta(time.perf_counter() - training_start),
         )
 
-        if val_metrics["loss_blended"] < best_val_loss - min_delta:
-            best_val_loss = val_metrics["loss_blended"]
+        if val_metric > best_val_metric + min_delta:
+            best_val_metric = val_metric
             stale_epochs = 0
             best_state = {k: v.detach().cpu().clone() for k, v in two_tower_model.state_dict().items()}
-            logger.info("TwoTower validation improved | best_val_loss=%.4f", best_val_loss)
+            logger.info("TwoTower validation improved | best_val_ndcg@200=%.6f", best_val_metric)
         else:
             stale_epochs += 1
             logger.info("TwoTower validation stale | stale_epochs=%s/%s", stale_epochs, early_stopping_patience)
             if stale_epochs >= early_stopping_patience:
-                logger.info("TwoTower early stopping triggered | best_val_loss=%.4f", best_val_loss)
+                logger.info("TwoTower early stopping triggered | best_val_ndcg@200=%.6f", best_val_metric)
                 break
 
     if best_state is not None:
         two_tower_model.load_state_dict(best_state)
 
     two_tower_model.eval()
-    encoded_movie_ids = np.asarray(all_item_ids, dtype=np.int64)
     logger.info("TwoTower embedding export start | item_count=%s", len(encoded_movie_ids))
     item_embeddings, _ = _export_item_embeddings(
         two_tower_model,
@@ -333,6 +352,7 @@ def train_sequence(context=None, warm_start: bool = True):
     training_settings = resolved_config.get("sequence_training_settings", resolved_config["training_settings"])
 
     train_data = context["train_data"]
+    validation_data = context["validation_data"]
     test_data = context["test_data"]
     feature_dict = context["feature_dict"]
     vocab_dict = context["vocab_dict"]
@@ -350,9 +370,17 @@ def train_sequence(context=None, warm_start: bool = True):
     sequence_num_negatives = int(training_settings.get("sequence_num_negatives", 128))
     sequence_loss = str(training_settings.get("sequence_loss", "bce")).strip().lower()
     hard_negative_ratio = float(training_settings.get("hard_negative_ratio", 0.1))
+    negative_popularity_alpha = float(training_settings.get("negative_popularity_alpha", 0.75))
 
     device = context["device"]
     all_item_id_tensor = torch.as_tensor(all_item_ids, dtype=torch.long, device=device)
+    item_id_positions = _build_item_position_lookup(all_item_id_tensor)
+    popularity_weights = _build_retrieval_popularity_weights(
+        all_item_id_tensor,
+        item_feature_arrays,
+        device,
+        negative_popularity_alpha,
+    )
     multimodal_matrix = torch.nn.functional.normalize(
         torch.as_tensor(item_feature_arrays["multimodal_embedding"], dtype=torch.float32, device=device),
         dim=1,
@@ -375,20 +403,13 @@ def train_sequence(context=None, warm_start: bool = True):
     sequence_optimizer = torch.optim.Adam(sequence_model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     total_samples = int(len(train_data["user_id"]))
-    val_ratio = 0.1
-    val_size = max(1, int(total_samples * val_ratio)) if total_samples > 1 else 0
-    train_size = max(total_samples - val_size, 0)
-    all_indices = np.arange(total_samples, dtype=np.int64)
-    rng = np.random.default_rng(42)
-    rng.shuffle(all_indices)
-    val_indices = all_indices[:val_size]
-    train_indices = all_indices[val_size:]
+    train_indices = np.arange(total_samples, dtype=np.int64)
 
     logger.info(
-        "Sequence training start | device=%s | train_samples=%s | val_samples=%s | test_users=%s | batch_size=%s | epochs=%s | export_batch_size=%s | sequence_num_negatives=%s | sequence_loss=%s | hard_negative_ratio=%s | warm_start=%s",
+        "Sequence training start | device=%s | train_samples=%s | validation_users=%s | test_users=%s | batch_size=%s | epochs=%s | export_batch_size=%s | sequence_num_negatives=%s | sequence_loss=%s | hard_negative_ratio=%s | negative_popularity_alpha=%s | warm_start=%s",
         device,
-        train_size,
-        val_size,
+        total_samples,
+        len(validation_data["user_id"]),
         len(test_data["user_id"]),
         batch_size,
         epochs,
@@ -396,21 +417,24 @@ def train_sequence(context=None, warm_start: bool = True):
         sequence_num_negatives,
         sequence_loss,
         hard_negative_ratio,
+        negative_popularity_alpha,
         warm_start,
     )
 
     best_state = None
-    best_val_loss = float("inf")
+    best_val_metric = float("-inf")
     stale_epochs = 0
     training_start = time.perf_counter()
-    total_batches = max(int(np.ceil(train_size / max(batch_size, 1))), 1) if train_size > 0 else 1
+    total_batches = max(int(np.ceil(total_samples / max(batch_size, 1))), 1) if total_samples > 0 else 1
+    encoded_movie_ids = np.asarray(all_item_ids, dtype=np.int64)
+    evaluation_topk = int(resolved_config["evaluation_settings"].get("topk", 200))
 
     for epoch in range(epochs):
         sequence_model.train()
         total_seq_loss = 0.0
         seen_positions = 0
         epoch_start = time.perf_counter()
-        train_batches = batch_indices(train_indices, batch_size, shuffle=True) if train_size > 0 else []
+        train_batches = batch_indices(train_indices, batch_size, shuffle=True) if total_samples > 0 else []
 
         for batch_idx, indices in enumerate(train_batches, start=1):
             batch_dict = slice_train_batch(train_data, indices, device)
@@ -419,6 +443,8 @@ def train_sequence(context=None, warm_start: bool = True):
                 sequence_model,
                 batch_dict,
                 all_item_ids=all_item_id_tensor,
+                item_id_positions=item_id_positions,
+                popularity_weights=popularity_weights,
                 multimodal_matrix=multimodal_matrix,
                 num_negatives=sequence_num_negatives,
                 hard_negative_ratio=hard_negative_ratio,
@@ -452,49 +478,55 @@ def train_sequence(context=None, warm_start: bool = True):
                 )
 
         train_seq_loss = total_seq_loss / max(seen_positions, 1)
-        val_metrics = _evaluate_loss(
+        sequence_model.eval()
+        _, validation_item_embeddings = _export_item_embeddings(
             None,
             sequence_model,
-            train_data,
-            val_indices,
-            device,
+            encoded_movie_ids,
             item_feature_arrays,
-            batch_size=batch_size,
-            evaluate_two_tower=False,
-            evaluate_sequence=True,
-            all_item_ids=all_item_id_tensor,
-            multimodal_matrix=multimodal_matrix,
-            sequence_num_negatives=sequence_num_negatives,
-            hard_negative_ratio=hard_negative_ratio,
-            sequence_loss=sequence_loss,
+            device,
+            export_batch_size,
+            export_two_tower=False,
+            export_sequence=True,
         )
+        val_metrics = _evaluate_retrieval(
+            sequence_model,
+            validation_data,
+            encoded_movie_ids,
+            validation_item_embeddings,
+            device,
+            evaluation_topk,
+            route="sequence",
+            item_feature_arrays=item_feature_arrays,
+        )
+        val_metric = float(val_metrics.get("ndcg@200", val_metrics.get("ndcg@100", 0.0)))
         logger.info(
-            "Sequence epoch %s/%s done | train_loss=%.4f | val_loss=%.4f | epoch_time=%s | elapsed=%s",
+            "Sequence epoch %s/%s done | train_loss=%.4f | val_ndcg@200=%.6f | val_hr@200=%.6f | epoch_time=%s | elapsed=%s",
             epoch + 1,
             epochs,
             train_seq_loss,
-            val_metrics["loss_blended"],
+            val_metric,
+            float(val_metrics.get("hr@200", 0.0)),
             format_eta(time.perf_counter() - epoch_start),
             format_eta(time.perf_counter() - training_start),
         )
 
-        if val_metrics["loss_blended"] < best_val_loss - min_delta:
-            best_val_loss = val_metrics["loss_blended"]
+        if val_metric > best_val_metric + min_delta:
+            best_val_metric = val_metric
             stale_epochs = 0
             best_state = {k: v.detach().cpu().clone() for k, v in sequence_model.state_dict().items()}
-            logger.info("Sequence validation improved | best_val_loss=%.4f", best_val_loss)
+            logger.info("Sequence validation improved | best_val_ndcg@200=%.6f", best_val_metric)
         else:
             stale_epochs += 1
             logger.info("Sequence validation stale | stale_epochs=%s/%s", stale_epochs, early_stopping_patience)
             if stale_epochs >= early_stopping_patience:
-                logger.info("Sequence early stopping triggered | best_val_loss=%.4f", best_val_loss)
+                logger.info("Sequence early stopping triggered | best_val_ndcg@200=%.6f", best_val_metric)
                 break
 
     if best_state is not None:
         sequence_model.load_state_dict(best_state)
 
     sequence_model.eval()
-    encoded_movie_ids = np.asarray(all_item_ids, dtype=np.int64)
     logger.info("Sequence embedding export start | item_count=%s", len(encoded_movie_ids))
     _, sequence_item_embeddings = _export_item_embeddings(
         None,
@@ -541,7 +573,7 @@ def train_item_cf(context=None):
             continue
         if len(valid_ratings) < len(valid_history):
             valid_ratings = [neutral_rating] * (len(valid_history) - len(valid_ratings)) + valid_ratings
-        window_size = 5
+        window_size = 10
         for target_pos in range(1, len(valid_history)):
             target_id = int(valid_history[target_pos])
             target_weight = float(valid_ratings[target_pos])
@@ -644,6 +676,7 @@ def evaluate_retrieval(route: str = "two_tower", topk: int | None = None):
             item_hidden_dims=model_settings.get("item_hidden_dims"),
             dropout=float(model_settings.get("dropout", 0.1)),
             multimodal_table=item_feature_arrays["multimodal_embedding"],
+            item_feature_table=item_feature_arrays,
             recent_history_length=int(model_settings.get("recent_history_length", 20)),
         ).to(device)
     else:
@@ -655,6 +688,7 @@ def evaluate_retrieval(route: str = "two_tower", topk: int | None = None):
             max_len=int(model_settings.get("max_len", model_settings.get("sequence_max_len", 10))),
             dropout=float(model_settings.get("dropout", model_settings.get("sequence_dropout", 0.1))),
             multimodal_table=item_feature_arrays["multimodal_embedding"],
+            item_feature_table=item_feature_arrays,
         ).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
@@ -708,6 +742,7 @@ def _build_training_logits(
     temperature: float,
     explicit_negative_ids: torch.Tensor | None = None,
     explicit_negative_repr: torch.Tensor | None = None,
+    explicit_negative_logq: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = (user_repr @ positive_item_repr.T) / temperature
     duplicate_positive_mask = positive_item_ids.unsqueeze(0).eq(positive_item_ids.unsqueeze(1))
@@ -720,6 +755,8 @@ def _build_training_logits(
 
     if explicit_negative_ids is not None and explicit_negative_repr is not None and explicit_negative_ids.numel() > 0:
         explicit_scores = torch.einsum("bd,bnd->bn", user_repr, explicit_negative_repr) / temperature
+        if explicit_negative_logq is not None:
+            explicit_scores = explicit_scores - explicit_negative_logq.to(device=explicit_scores.device, dtype=explicit_scores.dtype)
         explicit_invalid_mask = explicit_negative_ids.le(0)
         explicit_invalid_mask |= explicit_negative_ids.eq(positive_item_ids.unsqueeze(1))
         explicit_invalid_mask |= hist_movie_ids.unsqueeze(2).eq(explicit_negative_ids.unsqueeze(1)).any(dim=1)
@@ -740,7 +777,13 @@ def _weighted_mean(loss: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
 
 
 def _valid_candidate_mask(candidates: torch.Tensor, blocked_ids: torch.Tensor, blocked_mask: torch.Tensor) -> torch.Tensor:
-    return candidates.gt(0) & ~((candidates.unsqueeze(2) == blocked_ids.unsqueeze(1)) & blocked_mask.unsqueeze(1)).any(dim=2)
+    valid = candidates.gt(0)
+    for start in range(0, blocked_ids.size(1), 128):
+        stop = min(start + 128, blocked_ids.size(1))
+        blocked_chunk = blocked_ids[:, start:stop]
+        mask_chunk = blocked_mask[:, start:stop]
+        valid &= ~((candidates.unsqueeze(2) == blocked_chunk.unsqueeze(1)) & mask_chunk.unsqueeze(1)).any(dim=2)
+    return valid
 
 
 
@@ -749,6 +792,44 @@ def _first_occurrence_mask(candidates: torch.Tensor) -> torch.Tensor:
     previous_positions = torch.arange(candidates.size(1), device=candidates.device).view(1, 1, -1)
     duplicate_previous = candidates.unsqueeze(2).eq(candidates.unsqueeze(1)) & previous_positions.lt(positions)
     return ~duplicate_previous.any(dim=2)
+
+
+def _build_item_position_lookup(all_item_ids: torch.Tensor) -> torch.Tensor:
+    if all_item_ids.numel() == 0:
+        return torch.full((1,), -1, dtype=torch.long, device=all_item_ids.device)
+    positions = torch.full(
+        (int(all_item_ids.max().detach().cpu().item()) + 1,),
+        -1,
+        dtype=torch.long,
+        device=all_item_ids.device,
+    )
+    positions[all_item_ids.long()] = torch.arange(all_item_ids.numel(), dtype=torch.long, device=all_item_ids.device)
+    return positions
+
+
+def _build_retrieval_popularity_weights(
+    all_item_ids: torch.Tensor,
+    item_feature_arrays: dict[str, np.ndarray],
+    device: torch.device,
+    alpha: float,
+) -> torch.Tensor:
+    if all_item_ids.numel() == 0:
+        return torch.zeros(0, dtype=torch.float32, device=device)
+    popularity = np.asarray(item_feature_arrays.get("popularity"), dtype=np.float32)
+    safe_ids = all_item_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+    values = np.ones(safe_ids.shape[0], dtype=np.float32)
+    valid = (safe_ids >= 0) & (safe_ids < popularity.shape[0])
+    values[valid] = np.maximum(popularity[safe_ids[valid]], 1.0)
+    weights = torch.as_tensor(values, dtype=torch.float32, device=device).pow(float(alpha))
+    if not torch.isfinite(weights).all() or float(weights.sum().detach().cpu().item()) <= 0.0:
+        weights = torch.ones_like(weights)
+    return weights
+
+
+def _lookup_item_positions(item_id_positions: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+    safe_ids = item_ids.long().clamp(min=0, max=item_id_positions.numel() - 1)
+    positions = item_id_positions[safe_ids]
+    return torch.where((item_ids > 0) & (item_ids < item_id_positions.numel()), positions, torch.full_like(positions, -1))
 
 
 
@@ -767,92 +848,78 @@ def _pack_candidate_ids(candidates: torch.Tensor, selection: torch.Tensor, width
 
 
 
-def _sample_global_unseen_negative_ids(
+def _sample_popularity_unseen_negative_ids(
     positive_ids: torch.Tensor,
     context_ids: torch.Tensor,
     all_item_ids: torch.Tensor,
+    item_id_positions: torch.Tensor,
+    popularity_weights: torch.Tensor,
     num_negatives: int,
     existing_negative_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = positive_ids.size(0)
     device = positive_ids.device
     if batch_size == 0 or num_negatives <= 0 or all_item_ids.numel() == 0:
-        return torch.zeros((batch_size, max(num_negatives, 0)), dtype=torch.long, device=device)
+        shape = (batch_size, max(num_negatives, 0))
+        return torch.zeros(shape, dtype=torch.long, device=device), torch.zeros(shape, dtype=torch.float32, device=device)
 
     blocked_parts = [context_ids.long(), positive_ids.long().unsqueeze(1)]
     if existing_negative_ids is not None and existing_negative_ids.numel() > 0:
         blocked_parts.append(existing_negative_ids.long())
     blocked_ids = torch.cat(blocked_parts, dim=1)
     blocked_mask = blocked_ids.gt(0)
-    random_width = max(num_negatives * 32, num_negatives + context_ids.size(1) + 64)
-    random_candidates = all_item_ids[torch.randint(0, all_item_ids.numel(), (batch_size, random_width), device=device)]
-    random_valid = _valid_candidate_mask(random_candidates, blocked_ids, blocked_mask)
-    random_valid &= _first_occurrence_mask(random_candidates)
-    random_selection = random_valid & (random_valid.cumsum(dim=1) <= num_negatives)
-    return _pack_candidate_ids(random_candidates, random_selection, num_negatives)
-
-
-def _sample_in_batch_simple_negative_ids(
-    positive_ids: torch.Tensor,
-    context_ids: torch.Tensor,
-    num_negatives: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size = positive_ids.size(0)
-    device = positive_ids.device
-    if batch_size == 0 or num_negatives <= 0:
-        empty = torch.zeros((batch_size, max(num_negatives, 0)), dtype=torch.long, device=device)
-        return empty, empty.new_zeros(empty.shape, dtype=torch.bool)
-    candidates = positive_ids.unsqueeze(0).expand(batch_size, -1)
-    blocked_ids = torch.cat([context_ids.long(), positive_ids.long().unsqueeze(1)], dim=1)
-    blocked_mask = blocked_ids.gt(0)
-    valid = _valid_candidate_mask(candidates, blocked_ids, blocked_mask)
-    valid &= _first_occurrence_mask(candidates)
-    selection = valid & (valid.cumsum(dim=1) <= num_negatives)
-    sampled = _pack_candidate_ids(candidates, selection, num_negatives)
-    sampled_mask = torch.arange(num_negatives, device=device).unsqueeze(0) < selection.sum(dim=1).clamp_max(num_negatives).unsqueeze(1)
-    return sampled, sampled_mask
-
-
-def _sample_simple_negative_ids(
-    positive_ids: torch.Tensor,
-    context_ids: torch.Tensor,
-    all_item_ids: torch.Tensor,
-    num_negatives: int,
-) -> torch.Tensor:
-    in_batch_ids, in_batch_mask = _sample_in_batch_simple_negative_ids(positive_ids, context_ids, num_negatives)
-    filled_counts = in_batch_mask.sum(dim=1)
-    if bool(filled_counts.eq(num_negatives).all()):
-        return in_batch_ids
-    global_ids = _sample_global_unseen_negative_ids(
-        positive_ids,
-        context_ids,
-        all_item_ids,
-        num_negatives,
-        existing_negative_ids=in_batch_ids,
-    )
-    global_mask = global_ids.gt(0)
-    combined_ids = torch.cat([in_batch_ids, global_ids], dim=1)
-    combined_mask = torch.cat([in_batch_mask, global_mask], dim=1)
-    return _pack_candidate_ids(combined_ids, combined_mask, num_negatives)
+    sampled_ids = torch.zeros((batch_size, num_negatives), dtype=torch.long, device=device)
+    sampled_logq = torch.zeros((batch_size, num_negatives), dtype=torch.float32, device=device)
+    base_weights = popularity_weights.float().clamp_min(0.0)
+    for row_idx in range(batch_size):
+        weights = base_weights.clone()
+        blocked_row = blocked_ids[row_idx][blocked_mask[row_idx]]
+        if blocked_row.numel() > 0:
+            blocked_positions = _lookup_item_positions(item_id_positions, blocked_row)
+            blocked_positions = blocked_positions[blocked_positions >= 0]
+            if blocked_positions.numel() > 0:
+                weights[blocked_positions] = 0.0
+        valid_positions = torch.nonzero(weights > 0.0, as_tuple=False).reshape(-1)
+        take = min(num_negatives, int(valid_positions.numel()))
+        if take <= 0:
+            continue
+        probabilities = weights[valid_positions]
+        probabilities = probabilities / probabilities.sum().clamp_min(1e-12)
+        selected_local = torch.multinomial(probabilities, num_samples=take, replacement=False)
+        selected_positions = valid_positions[selected_local]
+        sampled_ids[row_idx, :take] = all_item_ids[selected_positions]
+        expected_counts = (float(num_negatives) * probabilities[selected_local]).clamp(max=1.0)
+        sampled_logq[row_idx, :take] = expected_counts.clamp_min(1e-12).log()
+    return sampled_ids, sampled_logq
 
 
 def _sample_retrieval_negative_ids(
     positive_ids: torch.Tensor,
     context_ids: torch.Tensor,
     all_item_ids: torch.Tensor,
+    item_id_positions: torch.Tensor,
+    popularity_weights: torch.Tensor,
     multimodal_matrix: torch.Tensor,
     num_negatives: int,
     hard_negative_ratio: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = positive_ids.size(0)
     device = positive_ids.device
     if batch_size == 0 or num_negatives <= 0:
-        return torch.zeros((batch_size, max(num_negatives, 0)), dtype=torch.long, device=device)
+        shape = (batch_size, max(num_negatives, 0))
+        return torch.zeros(shape, dtype=torch.long, device=device), torch.zeros(shape, dtype=torch.float32, device=device)
     hard_count = min(num_negatives, max(0, int(round(num_negatives * float(hard_negative_ratio)))))
     simple_count = num_negatives - hard_count
-    simple_ids = _sample_simple_negative_ids(positive_ids, context_ids, all_item_ids, simple_count)
+    simple_ids, simple_logq = _sample_popularity_unseen_negative_ids(
+        positive_ids,
+        context_ids,
+        all_item_ids,
+        item_id_positions,
+        popularity_weights,
+        simple_count,
+    )
     if hard_count <= 0 or multimodal_matrix.numel() == 0:
-        return simple_ids
+        return simple_ids, simple_logq
 
     positive_vectors = multimodal_matrix[positive_ids.clamp(min=0, max=multimodal_matrix.size(0) - 1)]
     candidate_vectors = multimodal_matrix[all_item_ids.clamp(min=0, max=multimodal_matrix.size(0) - 1)]
@@ -868,7 +935,8 @@ def _sample_retrieval_negative_ids(
     hard_valid &= _first_occurrence_mask(hard_candidates)
     hard_selection = hard_valid & (hard_valid.cumsum(dim=1) <= hard_count)
     hard_ids = _pack_candidate_ids(hard_candidates, hard_selection, hard_count)
-    return torch.cat([simple_ids, hard_ids], dim=1)
+    hard_logq = torch.zeros((batch_size, hard_count), dtype=torch.float32, device=device)
+    return torch.cat([simple_ids, hard_ids], dim=1), torch.cat([simple_logq, hard_logq], dim=1)
 
 
 
@@ -877,6 +945,8 @@ def _compute_sequence_loss(
     sequence_model: SequenceRetrievalModel,
     batch_dict: dict[str, torch.Tensor],
     all_item_ids: torch.Tensor,
+    item_id_positions: torch.Tensor,
+    popularity_weights: torch.Tensor,
     multimodal_matrix: torch.Tensor,
     num_negatives: int,
     hard_negative_ratio: float,
@@ -902,10 +972,12 @@ def _compute_sequence_loss(
         hist_time_gap_bucket,
         hist_rating,
     )
-    negative_ids = _sample_retrieval_negative_ids(
+    negative_ids, negative_logq = _sample_retrieval_negative_ids(
         positive_ids=positive_ids,
         context_ids=hist_movie_ids,
         all_item_ids=all_item_ids,
+        item_id_positions=item_id_positions,
+        popularity_weights=popularity_weights,
         multimodal_matrix=multimodal_matrix,
         num_negatives=num_negatives,
         hard_negative_ratio=hard_negative_ratio,
@@ -914,9 +986,10 @@ def _compute_sequence_loss(
     negative_emb = sequence_model.encode_item(negative_ids.reshape(-1)).reshape(negative_ids.size(0), negative_ids.size(1), -1)
     positive_logits = (hidden_states * positive_emb).sum(dim=1)
     negative_logits = torch.einsum("bd,bnd->bn", hidden_states, negative_emb)
+    corrected_negative_logits = negative_logits - negative_logq.to(device=negative_logits.device, dtype=negative_logits.dtype)
     negative_mask = negative_ids.gt(0)
     if loss_type == "softmax":
-        logits = torch.cat([positive_logits.unsqueeze(1), negative_logits.masked_fill(~negative_mask, torch.finfo(negative_logits.dtype).min)], dim=1)
+        logits = torch.cat([positive_logits.unsqueeze(1), corrected_negative_logits.masked_fill(~negative_mask, torch.finfo(negative_logits.dtype).min)], dim=1)
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         row_loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
         return _weighted_mean(row_loss, positive_ratings), int(logits.size(0))
@@ -925,100 +998,13 @@ def _compute_sequence_loss(
     weighted_positive_loss = (positive_loss * positive_ratings.clamp_min(1.0)).sum()
     positive_weight = positive_ratings.clamp_min(1.0).sum()
     if negative_mask.any():
-        negative_loss = torch.nn.functional.binary_cross_entropy_with_logits(negative_logits[negative_mask], torch.zeros_like(negative_logits[negative_mask]), reduction="sum")
+        negative_loss = torch.nn.functional.binary_cross_entropy_with_logits(corrected_negative_logits[negative_mask], torch.zeros_like(corrected_negative_logits[negative_mask]), reduction="sum")
         denominator = positive_weight + negative_mask.sum().float().clamp_min(1.0)
         loss = (weighted_positive_loss + negative_loss) / denominator
     else:
         loss = weighted_positive_loss / positive_weight.clamp_min(1e-9)
     return loss, int(positive_logits.numel())
 
-
-
-def _evaluate_loss(
-    two_tower_model,
-    sequence_model,
-    train_data: dict[str, np.ndarray],
-    eval_indices: np.ndarray,
-    device: torch.device,
-    item_feature_arrays: dict[str, np.ndarray] | dict[str, torch.Tensor],
-    batch_size: int,
-    evaluate_two_tower: bool = True,
-    evaluate_sequence: bool = True,
-    all_item_ids: torch.Tensor | None = None,
-    multimodal_matrix: torch.Tensor | None = None,
-    sequence_num_negatives: int = 0,
-    hard_negative_ratio: float = 0.1,
-    sequence_loss: str = "bce",
-    two_tower_temperature: float = 1.0,
-) -> dict[str, float]:
-    if evaluate_two_tower and two_tower_model is None:
-        raise ValueError("two_tower_model is required when evaluate_two_tower=True")
-    if evaluate_sequence and sequence_model is None:
-        raise ValueError("sequence_model is required when evaluate_sequence=True")
-    if two_tower_model is not None:
-        two_tower_model.eval()
-    if sequence_model is not None:
-        sequence_model.eval()
-    total_tt_loss, total_seq_loss = 0.0, 0.0
-    total_tt_examples, total_seq_examples = 0, 0
-    eval_batches = batch_indices(eval_indices, batch_size, shuffle=False)
-    with torch.no_grad():
-        for batch_idx, indices in enumerate(eval_batches, start=1):
-            batch_dict = slice_train_batch(train_data, indices, device)
-            loss_tt = torch.tensor(0.0, device=device)
-            loss_seq = torch.tensor(0.0, device=device)
-            if evaluate_two_tower:
-                user_repr_tt = two_tower_model.encode_user(batch_dict)
-                item_repr_tt = two_tower_model.encode_item(batch_dict["movie_id"])
-                logits_tt, labels_tt = _build_training_logits(
-                    user_repr_tt,
-                    item_repr_tt,
-                    batch_dict["movie_id"],
-                    batch_dict["hist_movie_id"],
-                    two_tower_temperature,
-                )
-                row_loss = torch.nn.functional.cross_entropy(logits_tt, labels_tt, reduction="none")
-                loss_tt = _weighted_mean(row_loss, batch_dict["rating"])
-            if evaluate_sequence:
-                if all_item_ids is None or multimodal_matrix is None:
-                    raise ValueError("all_item_ids and multimodal_matrix are required when evaluate_sequence=True")
-                loss_seq, supervised_positions = _compute_sequence_loss(
-                    sequence_model,
-                    batch_dict,
-                    all_item_ids=all_item_ids,
-                    multimodal_matrix=multimodal_matrix,
-                    num_negatives=sequence_num_negatives,
-                    hard_negative_ratio=hard_negative_ratio,
-                    loss_type=sequence_loss,
-                )
-                if supervised_positions == 0:
-                    continue
-            loss_blended = 0.5 * (loss_tt + loss_seq) if evaluate_two_tower and evaluate_sequence else (loss_tt + loss_seq)
-            if not torch.isfinite(loss_blended):
-                logger.warning(
-                    "Retrieval validation produced non-finite loss | batch=%s | two_tower_enabled=%s | sequence_enabled=%s | two_tower_loss=%s | sequence_loss=%s",
-                    batch_idx,
-                    evaluate_two_tower,
-                    evaluate_sequence,
-                    float(loss_tt.detach().cpu().item()) if torch.isfinite(loss_tt) else float("nan"),
-                    float(loss_seq.detach().cpu().item()) if torch.isfinite(loss_seq) else float("nan"),
-                )
-                continue
-            batch_size_now = batch_dict["user_id"].size(0)
-            total_tt_loss += float(loss_tt.item()) * batch_size_now
-            total_tt_examples += batch_size_now
-            if evaluate_sequence:
-                total_seq_loss += float(loss_seq.item()) * supervised_positions
-                total_seq_examples += supervised_positions
-            else:
-                total_seq_loss += float(loss_seq.item()) * batch_size_now
-                total_seq_examples += batch_size_now
-    if total_tt_examples == 0 and total_seq_examples == 0:
-        return {"loss_tt": float("inf"), "loss_seq": float("inf"), "loss_blended": float("inf")}
-    avg_tt = total_tt_loss / total_tt_examples if evaluate_two_tower and total_tt_examples > 0 else 0.0
-    avg_seq = total_seq_loss / total_seq_examples if evaluate_sequence and total_seq_examples > 0 else 0.0
-    blended = 0.5 * (avg_tt + avg_seq) if evaluate_two_tower and evaluate_sequence else (avg_tt + avg_seq)
-    return {"loss_tt": avg_tt, "loss_seq": avg_seq, "loss_blended": blended}
 
 
 

@@ -8,6 +8,7 @@ common:
     early_stopping_patience: 2
     min_delta: 1.0e-4
     hard_negative_ratio: 0.1
+    negative_popularity_alpha: 0.75
     export_batch_size: 4096
     positive_rating_min: 3.0
     eval_positive_rating_min: 4.0
@@ -33,7 +34,7 @@ models:
       dropout: 0.1
       recent_history_length: 20
     training:
-      two_tower_num_negatives: 256
+      two_tower_num_negatives: 200
       two_tower_temperature: 0.05
 
   sequence:

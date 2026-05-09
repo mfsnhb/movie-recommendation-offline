@@ -10,6 +10,9 @@ from torch.utils.data import Dataset
 from offline.ranking.protocol import CANDIDATE_FIELDS, CANDIDATE_RECALL_FEATURE_FIELDS, HISTORY_FIELDS, SPARSE_ITEM_FEATURE_FIELDS, STATIC_USER_FIELDS, extract_split_sample
 
 
+_MIN_SAMPLING_PROB = 1e-12
+
+
 class SequenceRankingDataset(Dataset):
     def __init__(self, split_data: dict):
         self.split_data = split_data
@@ -95,10 +98,8 @@ class SequenceRankingTrainCollator:
     all_item_ids: np.ndarray
     num_negatives: int
     low_rating_negative_ratio: float = 0.6
-    recall_negative_ratio: float = 0.3
-    random_negative_ratio: float = 0.1
-    fused_candidates_by_user: dict[int, np.ndarray] | None = None
-    fused_scores_by_user: dict[int, np.ndarray] | None = None
+    random_negative_ratio: float = 0.4
+    negative_popularity_alpha: float = 0.75
     seed: int = 42
 
     def __post_init__(self) -> None:
@@ -108,6 +109,8 @@ class SequenceRankingTrainCollator:
         self.item_id_positions = np.full(max_item_id + 1, -1, dtype=np.int32)
         if self.all_item_ids.size:
             self.item_id_positions[self.all_item_ids] = np.arange(self.all_item_ids.size, dtype=np.int32)
+        popularity = self.item_features["popularity"][self.all_item_ids] if self.all_item_ids.size else np.zeros(0, dtype=np.float32)
+        self.popularity_weights = np.power(np.maximum(popularity.astype(np.float64), 1.0), float(self.negative_popularity_alpha))
         self.rng = np.random.default_rng(self.seed)
 
     def __call__(self, samples: list[dict]) -> dict[str, torch.Tensor]:
@@ -123,82 +126,89 @@ class SequenceRankingTrainCollator:
             _fill_history_slots(batch, item_features=self.item_features, row_idx=row_idx)
             positive_ids[row_idx] = int(sample["target_movie_id"])
 
-        low_rating_count, hard_count, random_count = _negative_counts_from_ratios(
+        low_rating_count, popularity_count = _negative_counts_from_ratios(
             num_negatives=self.num_negatives,
             low_rating_ratio=self.low_rating_negative_ratio,
-            recall_ratio=self.recall_negative_ratio,
-            random_ratio=self.random_negative_ratio,
+            popularity_ratio=self.random_negative_ratio,
         )
-        low_rating_negative_ids = _sample_low_rating_negative_pool(
+        low_rating_negative_ids, low_rating_negative_logq = _sample_low_rating_negative_pool(
             low_rating_movie_ids=batch["low_rating_movie_id"],
+            positive_movie_ids=batch["positive_movie_id"],
             positive_ids=positive_ids,
             count=low_rating_count,
             rng=self.rng,
         )
-        hard_negative_ids, hard_negative_ranks, hard_negative_scores = _sample_recall_hard_negative_ids(
-            samples=samples,
-            hist_movie_ids=batch["hist_movie_id"],
-            positive_ids=positive_ids,
-            count=hard_count,
-            fused_candidates_by_user=self.fused_candidates_by_user,
-            fused_scores_by_user=self.fused_scores_by_user,
-            extra_blocked_ids=low_rating_negative_ids,
-        )
-        negative_ids = _sample_batch_negative_ids(
+        negative_ids, negative_logq = _sample_popularity_negative_ids(
             all_item_ids=self.all_item_ids,
             item_id_positions=self.item_id_positions,
-            hist_movie_ids=batch["hist_movie_id"],
+            popularity_weights=self.popularity_weights,
+            positive_movie_ids=batch["positive_movie_id"],
             positive_ids=positive_ids,
-            count=random_count,
+            count=popularity_count,
             rng=self.rng,
-            extra_blocked_ids=np.concatenate([low_rating_negative_ids, hard_negative_ids], axis=1),
+            extra_blocked_ids=low_rating_negative_ids,
         )
-        candidate_ids = np.concatenate([positive_ids.reshape(-1, 1), low_rating_negative_ids, hard_negative_ids, negative_ids], axis=1)
+        candidate_ids = np.concatenate([positive_ids.reshape(-1, 1), low_rating_negative_ids, negative_ids], axis=1)
+        positive_logq = _popularity_logq_for_ids(
+            item_ids=positive_ids.reshape(-1, 1),
+            item_id_positions=self.item_id_positions,
+            popularity_weights=self.popularity_weights,
+            sample_count=popularity_count,
+        )
+        candidate_logq = np.concatenate([positive_logq, low_rating_negative_logq, negative_logq], axis=1)
         candidate_ranks = np.zeros(candidate_ids.shape, dtype=np.float32)
         candidate_scores = np.zeros(candidate_ids.shape, dtype=np.float32)
-        hard_start = 1 + low_rating_negative_ids.shape[1]
-        candidate_ranks[:, hard_start : hard_start + hard_negative_ids.shape[1]] = hard_negative_ranks
-        candidate_scores[:, hard_start : hard_start + hard_negative_ids.shape[1]] = hard_negative_scores
         _fill_candidate_slots(batch, candidate_ids=candidate_ids, item_features=self.item_features, candidate_recall_ranks=candidate_ranks, candidate_recall_scores=candidate_scores)
+        batch["candidate_logq"][:, : candidate_logq.shape[1]] = candidate_logq
         return _numpy_batch_to_torch(batch)
 
 
 def _negative_counts_from_ratios(
     num_negatives: int,
     low_rating_ratio: float,
-    recall_ratio: float,
-    random_ratio: float,
-) -> tuple[int, int, int]:
+    popularity_ratio: float,
+) -> tuple[int, int]:
     total = max(int(num_negatives), 0)
     if total == 0:
-        return 0, 0, 0
-    ratios = np.asarray([low_rating_ratio, recall_ratio, random_ratio], dtype=np.float64)
+        return 0, 0
+    ratios = np.asarray([low_rating_ratio, popularity_ratio], dtype=np.float64)
     ratios = np.where(np.isfinite(ratios) & (ratios > 0), ratios, 0.0)
     if float(ratios.sum()) <= 0.0:
-        ratios = np.asarray([0.6, 0.3, 0.1], dtype=np.float64)
+        ratios = np.asarray([0.5, 0.5], dtype=np.float64)
     quotas = ratios / ratios.sum() * total
     counts = np.floor(quotas).astype(np.int32)
     remainder = total - int(counts.sum())
     if remainder > 0:
         order = np.argsort(-(quotas - counts))
         counts[order[:remainder]] += 1
-    return int(counts[0]), int(counts[1]), int(counts[2])
+    return int(counts[0]), int(counts[1])
+
+
+def _blocked_positive_set(positive_movie_ids: np.ndarray, positive_id: int, extra_blocked_ids: np.ndarray | None = None, row_idx: int | None = None) -> set[int]:
+    blocked = set(int(item_id) for item_id in positive_movie_ids.reshape(-1).tolist() if int(item_id) > 0)
+    blocked.add(int(positive_id))
+    if extra_blocked_ids is not None and extra_blocked_ids.size > 0 and row_idx is not None:
+        blocked.update(int(item_id) for item_id in extra_blocked_ids[row_idx].reshape(-1).tolist() if int(item_id) > 0)
+    return blocked
 
 
 def _sample_low_rating_negative_pool(
     low_rating_movie_ids: np.ndarray,
+    positive_movie_ids: np.ndarray,
     positive_ids: np.ndarray,
     count: int,
     rng: np.random.Generator,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     batch_size = int(positive_ids.shape[0])
     if count <= 0:
-        return np.zeros((batch_size, 0), dtype=np.int32)
+        return np.zeros((batch_size, 0), dtype=np.int32), np.zeros((batch_size, 0), dtype=np.float32)
 
     negatives = np.zeros((batch_size, count), dtype=np.int32)
+    logq = np.zeros((batch_size, count), dtype=np.float32)
     for row_idx in range(batch_size):
-        candidates = low_rating_movie_ids[row_idx]
-        candidates = candidates[(candidates > 0) & (candidates != positive_ids[row_idx])]
+        blocked = _blocked_positive_set(positive_movie_ids[row_idx], int(positive_ids[row_idx]))
+        candidates = np.asarray(low_rating_movie_ids[row_idx], dtype=np.int32)
+        candidates = np.asarray([int(item_id) for item_id in candidates.tolist() if int(item_id) > 0 and int(item_id) not in blocked], dtype=np.int32)
         if candidates.size == 0:
             continue
         unique_candidates = np.unique(candidates.astype(np.int32, copy=False))
@@ -208,95 +218,76 @@ def _sample_low_rating_negative_pool(
         else:
             selected = unique_candidates[-take:]
         negatives[row_idx, :take] = selected
-    return negatives
+        expected_count = min(float(count) / max(float(unique_candidates.size), 1.0), 1.0)
+        logq[row_idx, :take] = np.float32(np.log(max(expected_count, _MIN_SAMPLING_PROB)))
+    return negatives, logq
 
 
-def _sample_recall_hard_negative_ids(
-    samples: list[dict],
-    hist_movie_ids: np.ndarray,
-    positive_ids: np.ndarray,
-    count: int,
-    fused_candidates_by_user: dict[int, np.ndarray] | None,
-    fused_scores_by_user: dict[int, np.ndarray] | None,
-    extra_blocked_ids: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    batch_size = int(positive_ids.shape[0])
-    negatives = np.zeros((batch_size, count), dtype=np.int32)
-    ranks = np.zeros((batch_size, count), dtype=np.float32)
-    scores = np.zeros((batch_size, count), dtype=np.float32)
-    if count <= 0 or not fused_candidates_by_user:
-        return negatives, ranks, scores
-
-    for row_idx, sample in enumerate(samples):
-        user_id = int(sample["user_id"])
-        candidates = fused_candidates_by_user.get(user_id)
-        if candidates is None:
-            continue
-        candidate_array = np.asarray(candidates, dtype=np.int32).reshape(-1)
-        score_array = None
-        if fused_scores_by_user:
-            score_values = fused_scores_by_user.get(user_id)
-            if score_values is not None:
-                score_array = np.asarray(score_values, dtype=np.float32).reshape(-1)
-        blocked = set(int(item_id) for item_id in hist_movie_ids[row_idx].tolist() if int(item_id) > 0)
-        blocked.add(int(positive_ids[row_idx]))
-        if extra_blocked_ids is not None and extra_blocked_ids.size > 0:
-            blocked.update(int(item_id) for item_id in extra_blocked_ids[row_idx].tolist() if int(item_id) > 0)
-        selected = []
-        selected_ranks = []
-        selected_scores = []
-        for rank_idx, item_id in enumerate(candidate_array.tolist(), start=1):
-            item_id = int(item_id)
-            if item_id <= 0 or item_id in blocked:
-                continue
-            selected.append(item_id)
-            selected_ranks.append(float(rank_idx))
-            selected_scores.append(float(score_array[rank_idx - 1]) if score_array is not None and rank_idx - 1 < score_array.size else 0.0)
-            blocked.add(item_id)
-            if len(selected) >= count:
-                break
-        take = len(selected)
-        if take > 0:
-            negatives[row_idx, :take] = np.asarray(selected, dtype=np.int32)
-            ranks[row_idx, :take] = np.asarray(selected_ranks, dtype=np.float32)
-            scores[row_idx, :take] = np.asarray(selected_scores, dtype=np.float32)
-    return negatives, ranks, scores
-
-def _sample_batch_negative_ids(
+def _sample_popularity_negative_ids(
     all_item_ids: np.ndarray,
     item_id_positions: np.ndarray,
-    hist_movie_ids: np.ndarray,
+    popularity_weights: np.ndarray,
+    positive_movie_ids: np.ndarray,
     positive_ids: np.ndarray,
     count: int,
     rng: np.random.Generator,
     extra_blocked_ids: np.ndarray | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     batch_size = int(positive_ids.shape[0])
     if count <= 0:
-        return np.zeros((batch_size, 0), dtype=np.int32)
+        return np.zeros((batch_size, 0), dtype=np.int32), np.zeros((batch_size, 0), dtype=np.float32)
     if all_item_ids.size == 0:
-        return np.zeros((batch_size, count), dtype=np.int32)
+        return np.zeros((batch_size, count), dtype=np.int32), np.zeros((batch_size, count), dtype=np.float32)
 
-    scores = rng.random((batch_size, all_item_ids.size), dtype=np.float32)
-    blocked_ids = np.concatenate([hist_movie_ids.astype(np.int32, copy=False), positive_ids.reshape(-1, 1)], axis=1)
-    if extra_blocked_ids is not None and extra_blocked_ids.size > 0:
-        blocked_ids = np.concatenate([blocked_ids, extra_blocked_ids.astype(np.int32, copy=False)], axis=1)
-    flat_blocked = blocked_ids.reshape(-1)
-    flat_rows = np.repeat(np.arange(batch_size, dtype=np.int64), blocked_ids.shape[1])
-    valid_blocked = (flat_blocked > 0) & (flat_blocked < item_id_positions.shape[0])
-    if np.any(valid_blocked):
-        blocked_positions = item_id_positions[flat_blocked[valid_blocked]]
-        valid_positions = blocked_positions >= 0
-        if np.any(valid_positions):
-            scores[flat_rows[valid_blocked][valid_positions], blocked_positions[valid_positions]] = -1.0
-
-    take = min(count, int(all_item_ids.size))
-    selected_positions = np.argpartition(scores, kth=all_item_ids.size - take, axis=1)[:, -take:]
-    selected_scores = np.take_along_axis(scores, selected_positions, axis=1)
-    selected_ids = np.where(selected_scores >= 0.0, all_item_ids[selected_positions], 0).astype(np.int32, copy=False)
     negatives = np.zeros((batch_size, count), dtype=np.int32)
-    negatives[:, :take] = selected_ids
-    return negatives
+    logq = np.zeros((batch_size, count), dtype=np.float32)
+    base_weights = np.asarray(popularity_weights, dtype=np.float64)
+    for row_idx in range(batch_size):
+        weights = base_weights.copy()
+        blocked = _blocked_positive_set(positive_movie_ids[row_idx], int(positive_ids[row_idx]), extra_blocked_ids, row_idx)
+        if blocked:
+            blocked_array = np.asarray(list(blocked), dtype=np.int32)
+            valid_blocked = (blocked_array > 0) & (blocked_array < item_id_positions.shape[0])
+            if np.any(valid_blocked):
+                blocked_positions = item_id_positions[blocked_array[valid_blocked]]
+                blocked_positions = blocked_positions[blocked_positions >= 0]
+                weights[blocked_positions] = 0.0
+        valid_positions = np.flatnonzero(weights > 0.0)
+        take = min(count, int(valid_positions.size))
+        if take <= 0:
+            continue
+        probabilities = weights[valid_positions]
+        probabilities = probabilities / probabilities.sum()
+        selected_positions = rng.choice(valid_positions, size=take, replace=False, p=probabilities)
+        negatives[row_idx, :take] = all_item_ids[selected_positions].astype(np.int32, copy=False)
+        selected_probabilities = probabilities[np.searchsorted(valid_positions, selected_positions)]
+        expected_counts = np.minimum(float(count) * selected_probabilities, 1.0)
+        logq[row_idx, :take] = np.log(np.maximum(expected_counts, _MIN_SAMPLING_PROB)).astype(np.float32, copy=False)
+    return negatives, logq
+
+
+def _popularity_logq_for_ids(
+    item_ids: np.ndarray,
+    item_id_positions: np.ndarray,
+    popularity_weights: np.ndarray,
+    sample_count: int,
+) -> np.ndarray:
+    ids = np.asarray(item_ids, dtype=np.int32)
+    logq = np.zeros(ids.shape, dtype=np.float32)
+    if sample_count <= 0 or ids.size == 0 or popularity_weights.size == 0:
+        return logq
+    weights = np.asarray(popularity_weights, dtype=np.float64)
+    denominator = float(weights.sum())
+    if denominator <= 0.0:
+        return logq
+    valid_ids = (ids > 0) & (ids < item_id_positions.shape[0])
+    positions = np.full(ids.shape, -1, dtype=np.int32)
+    positions[valid_ids] = item_id_positions[ids[valid_ids]]
+    valid_positions = positions >= 0
+    expected_counts = np.zeros(ids.shape, dtype=np.float64)
+    expected_counts[valid_positions] = np.minimum(float(sample_count) * weights[positions[valid_positions]] / denominator, 1.0)
+    logq[valid_positions] = np.log(np.maximum(expected_counts[valid_positions], _MIN_SAMPLING_PROB)).astype(np.float32, copy=False)
+    return logq
 
 
 def _init_batch_arrays(batch_size: int, history_width: int, candidate_size: int, genre_count: int) -> dict[str, np.ndarray]:
@@ -325,7 +316,17 @@ def _init_batch_arrays(batch_size: int, history_width: int, candidate_size: int,
     for field in CANDIDATE_RECALL_FEATURE_FIELDS:
         batch[field] = np.zeros((batch_size, candidate_size), dtype=np.float32)
     batch["candidate_relevance"] = np.zeros((batch_size, candidate_size), dtype=np.float32)
+    batch["candidate_logq"] = np.zeros((batch_size, candidate_size), dtype=np.float32)
     return batch
+
+
+def _feedback_from_rating(rating: np.ndarray) -> np.ndarray:
+    rating_values = np.asarray(rating, dtype=np.float32)
+    feedback = np.zeros(rating_values.shape, dtype=np.int32)
+    feedback[(rating_values > 0.0) & (rating_values <= 2.0)] = 1
+    feedback[np.rint(rating_values) == 3.0] = 2
+    feedback[rating_values >= 4.0] = 3
+    return feedback
 
 
 def _fill_base_fields(batch: dict[str, np.ndarray], sample: dict, row_idx: int) -> None:
@@ -333,10 +334,13 @@ def _fill_base_fields(batch: dict[str, np.ndarray], sample: dict, row_idx: int) 
         batch[field][row_idx] = int(sample[field])
     batch["user_id_raw"][row_idx] = int(sample.get("user_id_raw", 0))
     batch["hist_movie_id"][row_idx] = np.asarray(sample["hist_movie_id"], dtype=np.int32)
-    batch["hist_rating"][row_idx] = np.asarray(sample.get("hist_rating", np.zeros_like(sample["hist_movie_id"], dtype=np.float32)), dtype=np.float32)
+    hist_rating = np.asarray(sample.get("hist_rating", np.zeros_like(sample["hist_movie_id"], dtype=np.float32)), dtype=np.float32)
+    batch["hist_rating"][row_idx] = hist_rating
+    batch["hist_feedback"][row_idx] = np.asarray(sample.get("hist_feedback", _feedback_from_rating(hist_rating)), dtype=np.int32)
     batch["hist_time_gap_bucket"][row_idx] = np.asarray(sample.get("hist_time_gap_bucket", np.zeros_like(sample["hist_movie_id"], dtype=np.int32)), dtype=np.int32)
     batch["hist_length"][row_idx] = int(sample["hist_length"])
     batch["low_rating_movie_id"][row_idx] = np.asarray(sample.get("low_rating_movie_id", np.zeros_like(sample["hist_movie_id"], dtype=np.int32)), dtype=np.int32)
+    batch["positive_movie_id"][row_idx] = np.asarray(sample.get("positive_movie_id", np.zeros_like(sample["hist_movie_id"], dtype=np.int32)), dtype=np.int32)
     batch["target_rating"][row_idx] = float(sample.get("target_rating", 0.0))
 
 
@@ -384,7 +388,7 @@ def _numpy_batch_to_torch(batch: dict[str, np.ndarray]) -> dict[str, torch.Tenso
             result[field] = torch.as_tensor(values, dtype=torch.bool)
         elif field == "target_index":
             result[field] = torch.as_tensor(values, dtype=torch.long)
-        elif field in {"hist_rating", "target_rating", "candidate_relevance", "candidate_recall_rank", "candidate_recall_score"}:
+        elif field in {"hist_rating", "target_rating", "candidate_relevance", "candidate_recall_rank", "candidate_recall_score", "candidate_logq"}:
             result[field] = torch.as_tensor(values, dtype=torch.float32)
         else:
             result[field] = torch.as_tensor(values, dtype=torch.long)

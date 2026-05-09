@@ -24,7 +24,6 @@ from offline.ranking.protocol import (
     extract_split_sample,
     get_all_item_ids,
     get_item_feature_arrays,
-    get_seen_movie_ids,
 )
 from offline.training.retrieval_common import validate_min_target_rating
 from offline.utils.config import resolve_ranking_config, resolve_ranking_model_names
@@ -196,8 +195,8 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     emb_dim = int(model_settings.get("embedding_dim", 16))
     train_negatives = int(training_settings.get("train_negatives", 20))
     low_rating_negative_ratio = float(training_settings.get("low_rating_negative_ratio", 0.6))
-    recall_negative_ratio = float(training_settings.get("recall_negative_ratio", 0.3))
-    random_negative_ratio = float(training_settings.get("random_negative_ratio", 0.1))
+    random_negative_ratio = float(training_settings.get("random_negative_ratio", 0.4))
+    negative_popularity_alpha = float(training_settings.get("negative_popularity_alpha", 0.75))
 
     device = _resolve_torch_device(resolved_config.get("training_settings", {}))
     train_loader = DataLoader(
@@ -210,10 +209,8 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
             all_item_ids=all_item_ids,
             num_negatives=train_negatives,
             low_rating_negative_ratio=low_rating_negative_ratio,
-            recall_negative_ratio=recall_negative_ratio,
             random_negative_ratio=random_negative_ratio,
-            fused_candidates_by_user=fused_candidates_by_user,
-            fused_scores_by_user=fused_scores_by_user,
+            negative_popularity_alpha=negative_popularity_alpha,
             seed=42,
         ),
     )
@@ -228,7 +225,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     logger.info(
-        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | validation_samples=%s | validation_users=%s | batch_size=%s | epochs=%s | sampled_softmax_negatives=%s | negative_ratios=low_rating:recall:random %.2f:%.2f:%.2f | validation_negatives=%s | warm_start=%s",
+        "Ranking training start | model=%s | protocol=%s | device=%s | train_samples=%s | validation_samples=%s | validation_users=%s | batch_size=%s | epochs=%s | sampled_softmax_negatives=%s | negative_ratios=low_rating:popularity %.2f:%.2f | negative_popularity_alpha=%.2f | validation_negatives=%s | warm_start=%s",
         model_name,
         ranking_samples.get("protocol", "unknown"),
         device,
@@ -239,8 +236,8 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
         epochs,
         train_negatives,
         low_rating_negative_ratio,
-        recall_negative_ratio,
         random_negative_ratio,
+        negative_popularity_alpha,
         int(training_settings.get("validation_negatives", 1000)),
         warm_start,
     )
@@ -265,6 +262,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
                 batch["target_index"],
                 batch["target_rating"],
                 batch["candidate_mask"],
+                batch.get("candidate_logq"),
                 rating_weighting_enabled=bool(training_settings.get("rating_weighting_enabled", True)),
                 rating_weight_neutral=float(training_settings.get("rating_weight_neutral", 3.0)),
                 rating_weight_scale=float(training_settings.get("rating_weight_scale", 0.25)),
@@ -457,6 +455,7 @@ def _sampled_softmax_candidate_loss(
     target_index: torch.Tensor,
     target_rating: torch.Tensor,
     candidate_mask: torch.Tensor,
+    candidate_logq: torch.Tensor | None,
     rating_weighting_enabled: bool,
     rating_weight_neutral: float,
     rating_weight_scale: float,
@@ -470,7 +469,10 @@ def _sampled_softmax_candidate_loss(
     if not valid_rows.any():
         return torch.zeros((), dtype=logits.dtype, device=logits.device)
 
-    masked_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+    corrected_logits = logits
+    if candidate_logq is not None:
+        corrected_logits = logits - candidate_logq.to(device=logits.device, dtype=logits.dtype)
+    masked_logits = corrected_logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
     row_losses = torch.nn.functional.cross_entropy(masked_logits[valid_rows], target_index[valid_rows], reduction="none")
     if not rating_weighting_enabled:
         return row_losses.mean()
@@ -518,7 +520,7 @@ def _evaluate_hard_negative_validation(
                 sample = extract_split_sample(split_data, sample_idx)
                 target = int(sample["target_movie_id"])
                 user_id = int(sample["user_id"])
-                seen_ids = set(get_seen_movie_ids(sample).tolist())
+                seen_ids = set(int(item_id) for item_id in np.asarray(sample.get("positive_movie_id", []), dtype=np.int32).reshape(-1).tolist() if int(item_id) > 0)
                 seen_ids.discard(target)
                 selected: list[int] = [target] if target > 0 else []
                 selected_ranks: list[float] = [0.0] if target > 0 else []
@@ -652,6 +654,10 @@ def _evaluate_fused_candidates_subset(
                 if candidates is None or int(np.asarray(candidates).size) == 0:
                     skipped_missing_candidates += 1
                     continue
+                candidate_array = np.asarray(candidates, dtype=np.int32)
+                blocked_positive = set(int(item_id) for item_id in np.asarray(sample.get("positive_movie_id", []), dtype=np.int32).reshape(-1).tolist() if int(item_id) > 0)
+                blocked_positive.discard(target)
+                candidates = [int(item_id) for item_id in candidate_array.reshape(-1).tolist() if int(item_id) == target or int(item_id) not in blocked_positive]
                 candidate_array = np.asarray(candidates, dtype=np.int32)
                 scores_array = np.zeros(candidate_array.reshape(-1).shape[0], dtype=np.float32)
                 ranks_array = np.arange(1, scores_array.size + 1, dtype=np.float32)

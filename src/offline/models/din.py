@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from offline.models.feature_encoders import MovieFeatureEncoder, STATIC_USER_FIELDS, build_mlp
+from offline.models.feature_encoders import MovieFeatureEncoder, SequenceFeatureEncoder, STATIC_USER_FIELDS, build_mlp
 
 
 class LocalActivationUnit(nn.Module):
@@ -40,6 +40,7 @@ class DINModel(nn.Module):
         self.top_m_history = int(top_m_history)
         self.force_recent_history = int(force_recent_history)
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
+        self.sequence_encoder = SequenceFeatureEncoder(feature_dict, emb_dim, dropout=dropout)
         self.static_embeddings = nn.ModuleDict({field: nn.Embedding(feature_dict[field], emb_dim, padding_idx=0) for field in STATIC_USER_FIELDS})
         self.user_profile_projection = build_mlp(emb_dim * len(STATIC_USER_FIELDS), [emb_dim * 2], emb_dim, dropout=dropout)
         self.activation_unit = LocalActivationUnit(emb_dim, attention_hidden_dims, dropout)
@@ -64,9 +65,8 @@ class DINModel(nn.Module):
             "startYear": batch["hist_startYear"],
             "popularity": batch["hist_popularity"],
             "averageRating": batch["hist_averageRating"],
-            "interaction_rating": batch["hist_rating"],
-            "interaction_time_gap_bucket": batch["hist_time_gap_bucket"],
         })
+        history_embedding = self.sequence_encoder(history_embedding, batch["hist_rating"], batch["hist_time_gap_bucket"], batch.get("hist_feedback"))
         history_mask = history_movie_id.gt(0)
         attention_history, attention_mask = self._candidate_topm_history(candidate_embedding, history_embedding, history_mask)
 

@@ -2,15 +2,15 @@ default_model: din
 
 common:
   training:
-    early_stopping_patience: 2
+    early_stopping_patience: 3
     validation_samples_per_user: 1
     validation_max_users: 6040
     min_delta: 1.0e-4
-    train_negatives: 20
-    low_rating_negative_ratio: 0.6
-    recall_negative_ratio: 0.3
-    random_negative_ratio: 0.1
-    validation_negatives: 500
+    train_negatives: 10
+    low_rating_negative_ratio: 0.5
+    random_negative_ratio: 0.5
+    negative_popularity_alpha: 0.75
+    validation_negatives: 300
     positive_rating_min: 4.0
     negative_rating_max: 2.0
     rating_weighting_enabled: true
@@ -46,7 +46,7 @@ models:
       dnn_hidden_dims: [256, 128]
       attention_hidden_dims: [128, 64]
       top_m_history: 100
-      force_recent_history: 30
+      force_recent_history: 75
       dropout: 0.1
     training:
       batch_size: 512

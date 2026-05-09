@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from offline.models.feature_encoders import MovieFeatureEncoder, UserFeatureEncoder, build_mlp
+from offline.models.feature_encoders import MovieFeatureEncoder, SequenceFeatureEncoder, UserFeatureEncoder, build_mlp
 
 
 class TwoTowerRetrievalModel(nn.Module):
@@ -34,15 +34,13 @@ class TwoTowerRetrievalModel(nn.Module):
             dropout=dropout,
             output_norm=False,
         )
+        self.sequence_encoder = SequenceFeatureEncoder(feature_dict, emb_dim, dropout=dropout)
         self.recent_history_length = int(recent_history_length)
         self.user_projection = build_mlp(emb_dim * 3, user_hidden_dims or [emb_dim * 4, emb_dim * 2], emb_dim, dropout=dropout)
 
     def encode_user(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        history_embedding = self.movie_encoder({
-            "movie_id": batch["hist_movie_id"],
-            "interaction_rating": batch["hist_rating"],
-            "interaction_time_gap_bucket": batch["hist_time_gap_bucket"],
-        })
+        movie_embedding = self.movie_encoder(batch["hist_movie_id"])
+        history_embedding = self.sequence_encoder(movie_embedding, batch["hist_rating"], batch["hist_time_gap_bucket"])
         history_mask = batch["hist_movie_id"].gt(0)
         static_user = self.user_encoder(batch)
         pooled_history = self._mean_pool(history_embedding, history_mask)

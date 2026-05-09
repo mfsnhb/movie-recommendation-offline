@@ -67,14 +67,6 @@ class MovieFeatureEncoder(nn.Module):
         self.multimodal_projection = build_mlp(self.multimodal_dim, [emb_dim * 2], emb_dim, dropout=dropout)
         self.multimodal_gate = nn.Parameter(torch.tensor(-2.0))
         self.projection = build_mlp(emb_dim * 6, hidden_dims or [emb_dim * 2], emb_dim, dropout=dropout)
-        interaction_emb_dim = max(4, emb_dim // 4)
-        self.interaction_rating_emb = nn.Embedding(6, interaction_emb_dim, padding_idx=0)
-        self.interaction_time_gap_emb = nn.Embedding(
-            int(feature_dict.get("hist_time_gap_bucket", feature_dict.get("time_gap_bucket", 2))),
-            interaction_emb_dim,
-            padding_idx=0,
-        )
-        self.interaction_projection = build_mlp(emb_dim + interaction_emb_dim * 2, [emb_dim * 2], emb_dim, dropout=dropout)
         self.has_item_feature_table = item_feature_table is not None
         if item_feature_table is not None:
             for field in SPARSE_ITEM_FEATURE_FIELDS:
@@ -109,25 +101,41 @@ class MovieFeatureEncoder(nn.Module):
         output = self.projection(torch.cat(structured_parts, dim=-1))
         multimodal = self.multimodal_table[movie_ids.clamp(min=0, max=self.multimodal_table.size(0) - 1)]
         output = output + torch.sigmoid(self.multimodal_gate) * self.multimodal_projection(multimodal)
-        interaction_rating = item_batch.get("interaction_rating", item_batch.get("rating"))
-        interaction_time_gap = item_batch.get("interaction_time_gap_bucket", item_batch.get("time_gap_bucket"))
-        if interaction_rating is not None or interaction_time_gap is not None:
-            if interaction_rating is None:
-                rating_ids = torch.zeros_like(movie_ids, dtype=torch.long)
-            else:
-                rating_ids = interaction_rating.float().round().long().clamp(min=0, max=5)
-            if interaction_time_gap is None:
-                time_gap_ids = torch.zeros_like(movie_ids, dtype=torch.long)
-            else:
-                time_gap_ids = interaction_time_gap.long().clamp(min=0, max=self.interaction_time_gap_emb.num_embeddings - 1)
-            output = self.interaction_projection(torch.cat([
-                output,
-                self.interaction_rating_emb(rating_ids),
-                self.interaction_time_gap_emb(time_gap_ids),
-            ], dim=-1))
         if self.output_norm:
             output = torch.nn.functional.normalize(output, dim=-1)
         return output
+
+
+class SequenceFeatureEncoder(nn.Module):
+    def __init__(self, feature_dict: dict, emb_dim: int, dropout: float = 0.1):
+        super().__init__()
+        interaction_emb_dim = max(4, emb_dim // 2)
+        self.rating_emb = nn.Embedding(6, interaction_emb_dim, padding_idx=0)
+        self.time_gap_emb = nn.Embedding(
+            int(feature_dict.get("hist_time_gap_bucket", feature_dict.get("time_gap_bucket", 2))),
+            interaction_emb_dim,
+            padding_idx=0,
+        )
+        self.feedback_emb = nn.Embedding(4, interaction_emb_dim, padding_idx=0)
+        self.projection = build_mlp(emb_dim + interaction_emb_dim * 3, [emb_dim * 2], emb_dim, dropout=dropout)
+
+    def forward(self, movie_embedding: torch.Tensor, rating: torch.Tensor, time_gap_bucket: torch.Tensor, feedback: torch.Tensor | None = None) -> torch.Tensor:
+        rating_ids = rating.float().round().long().clamp(min=0, max=5)
+        time_gap_ids = time_gap_bucket.long().clamp(min=0, max=self.time_gap_emb.num_embeddings - 1)
+        if feedback is None:
+            rating_values = rating.float()
+            feedback_ids = torch.zeros_like(rating_ids)
+            feedback_ids = torch.where((rating_values > 0.0) & (rating_values <= 2.0), torch.ones_like(feedback_ids), feedback_ids)
+            feedback_ids = torch.where(rating_values.round().eq(3.0), torch.full_like(feedback_ids, 2), feedback_ids)
+            feedback_ids = torch.where(rating_values.ge(4.0), torch.full_like(feedback_ids, 3), feedback_ids)
+        else:
+            feedback_ids = feedback.long().clamp(min=0, max=self.feedback_emb.num_embeddings - 1)
+        return self.projection(torch.cat([
+            movie_embedding,
+            self.rating_emb(rating_ids),
+            self.time_gap_emb(time_gap_ids),
+            self.feedback_emb(feedback_ids),
+        ], dim=-1))
 
 
 class UserFeatureEncoder(nn.Module):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from offline.models.feature_encoders import MovieFeatureEncoder
+from offline.models.feature_encoders import MovieFeatureEncoder, SequenceFeatureEncoder
 
 
 def _left_align_by_mask(values: torch.Tensor, keep_mask: torch.Tensor) -> torch.Tensor:
@@ -59,6 +59,7 @@ class SequenceRetrievalModel(nn.Module):
         self.max_len = max_len
         self.hidden_dim = int(hidden_dim or emb_dim)
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table, item_feature_table=item_feature_table)
+        self.sequence_encoder = SequenceFeatureEncoder(feature_dict, emb_dim, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
         self.gru = nn.GRU(
             input_size=emb_dim,
@@ -97,11 +98,8 @@ class SequenceRetrievalModel(nn.Module):
         compact_time_gap = _left_align_by_order(hist_time_gap_bucket, order, counts).long()
         compact_mask = compact_movie_ids.gt(0)
         lengths = compact_mask.sum(dim=1).cpu()
-        x = self.movie_encoder({
-            "movie_id": compact_movie_ids,
-            "interaction_rating": compact_rating,
-            "interaction_time_gap_bucket": compact_time_gap,
-        })
+        movie_embedding = self.movie_encoder(compact_movie_ids)
+        x = self.sequence_encoder(movie_embedding, compact_rating, compact_time_gap)
         x = self.dropout(x)
         compact_states = torch.zeros(hist_movie_ids.size(0), hist_movie_ids.size(1), self.hidden_dim, device=hist_movie_ids.device, dtype=x.dtype)
         non_empty = lengths.gt(0)

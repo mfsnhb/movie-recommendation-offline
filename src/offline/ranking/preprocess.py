@@ -19,7 +19,7 @@ from offline.utils.logging import get_logger
 
 
 logger = get_logger("offline.features.ranking")
-_SAMPLE_PROTOCOL = "prefix_positive_targets_v9_all_history"
+_SAMPLE_PROTOCOL = "prefix_positive_targets_v10_feedback_pool"
 _ID_DTYPE = np.uint16
 _POPULARITY_BUCKET_COUNT = 10
 _AVERAGE_RATING_BUCKET_COUNT = 5
@@ -108,9 +108,11 @@ def _allocate_split_arrays(sample_count: int, max_seq_len: int) -> dict[str, np.
         "user_id_raw": np.zeros(sample_count, dtype=np.int32),
         "hist_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "hist_rating": np.zeros((sample_count, max_seq_len), dtype=np.float32),
+        "hist_feedback": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "hist_time_gap_bucket": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "hist_length": np.zeros(sample_count, dtype=_ID_DTYPE),
         "low_rating_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
+        "positive_movie_id": np.zeros((sample_count, max_seq_len), dtype=_ID_DTYPE),
         "target_movie_id": np.zeros(sample_count, dtype=_ID_DTYPE),
         "target_rating": np.zeros(sample_count, dtype=np.float32),
     }
@@ -123,6 +125,15 @@ def _fill_padded_row(target: np.ndarray, values: list[int]) -> int:
         target[-length:] = np.asarray(clipped, dtype=target.dtype)
     return length
 
+
+
+def _rating_feedback_ids(ratings: list[float] | np.ndarray) -> np.ndarray:
+    rating_values = np.asarray(ratings, dtype=np.float32).reshape(-1)
+    feedback = np.zeros(rating_values.shape, dtype=_ID_DTYPE)
+    feedback[(rating_values > 0.0) & (rating_values <= 2.0)] = 1
+    feedback[np.rint(rating_values) == 3.0] = 2
+    feedback[rating_values >= 4.0] = 3
+    return feedback
 
 
 def _fill_padded_float_row(target: np.ndarray, values: list[float]) -> None:
@@ -172,6 +183,7 @@ def _write_sample_row(
     hist_ratings: list[float],
     hist_timestamps: list[int],
     low_rating_movies: list[int],
+    positive_movies: list[int],
     target_movie_id: int,
     target_rating: float,
     target_timestamp: int,
@@ -185,13 +197,17 @@ def _write_sample_row(
     store["user_id_raw"][row_idx] = user_id_raw
     store["hist_movie_id"][row_idx].fill(0)
     store["hist_rating"][row_idx].fill(0.0)
+    store["hist_feedback"][row_idx].fill(0)
     store["hist_time_gap_bucket"][row_idx].fill(0)
     store["low_rating_movie_id"][row_idx].fill(0)
+    store["positive_movie_id"][row_idx].fill(0)
     hist_length = _fill_padded_row(store["hist_movie_id"][row_idx], hist_movies)
     _fill_padded_float_row(store["hist_rating"][row_idx], hist_ratings)
+    _fill_padded_row(store["hist_feedback"][row_idx], _rating_feedback_ids(hist_ratings).astype(int).tolist())
     store["hist_time_gap_bucket"][row_idx] = _build_time_gap_buckets(hist_timestamps, target_timestamp, store["hist_time_gap_bucket"][row_idx].shape[0])
     store["hist_length"][row_idx] = hist_length
     _fill_padded_row(store["low_rating_movie_id"][row_idx], low_rating_movies)
+    _fill_padded_row(store["positive_movie_id"][row_idx], positive_movies)
     store["target_movie_id"][row_idx] = target_movie_id
     store["target_rating"][row_idx] = np.float32(target_rating)
 
@@ -206,6 +222,7 @@ def _write_target_sample(
     timestamp_sequence: list[int],
     target_idx: int,
     negative_rating_max: float,
+    positive_rating_min: float,
 ) -> None:
     hist_movies, hist_ratings, hist_timestamps, low_rating_movies = _split_history_by_rating(
         movie_sequence,
@@ -214,6 +231,11 @@ def _write_target_sample(
         target_idx,
         negative_rating_max,
     )
+    positive_movies = [
+        int(movie_id)
+        for movie_id, rating in zip(movie_sequence, rating_sequence, strict=True)
+        if float(rating) >= float(positive_rating_min)
+    ]
     _write_sample_row(
         store,
         row_idx=row_idx,
@@ -223,6 +245,7 @@ def _write_target_sample(
         hist_ratings=hist_ratings,
         hist_timestamps=hist_timestamps,
         low_rating_movies=low_rating_movies,
+        positive_movies=positive_movies,
         target_movie_id=int(movie_sequence[target_idx]),
         target_rating=float(rating_sequence[target_idx]),
         target_timestamp=int(timestamp_sequence[target_idx]),
@@ -356,6 +379,7 @@ def build_prefix_train_eval_samples(
             timestamp_sequence=timestamp_sequence,
             target_idx=validation_target_idx,
             negative_rating_max=negative_rating_max,
+            positive_rating_min=positive_threshold,
         )
         validation_row += 1
 
@@ -369,6 +393,7 @@ def build_prefix_train_eval_samples(
             timestamp_sequence=timestamp_sequence,
             target_idx=test_target_idx,
             negative_rating_max=negative_rating_max,
+            positive_rating_min=positive_threshold,
         )
         test_row += 1
 
@@ -384,6 +409,7 @@ def build_prefix_train_eval_samples(
                 timestamp_sequence=timestamp_sequence,
                 target_idx=target_idx,
                 negative_rating_max=negative_rating_max,
+                positive_rating_min=positive_threshold,
             )
             item_popularity[target_movie_id] += 1
             train_row += 1
@@ -465,6 +491,7 @@ def run_ranking_preprocessing():
     vocab_dict["popularity"] = np.arange(_POPULARITY_BUCKET_COUNT, dtype=np.int32)
     vocab_dict["time_gap_bucket"] = np.arange(1, _TIME_GAP_BUCKET_COUNT + 1, dtype=np.int32)
     feature_dict = {key: len(values) + 1 for key, values in vocab_dict.items()}
+    feature_dict["hist_feedback"] = 4
     feature_dict["multimodal_embedding_dim"] = int(multimodal_artifacts.embeddings.shape[1])
 
     save_pickle(samples, RANKING_SAMPLE_PATH)

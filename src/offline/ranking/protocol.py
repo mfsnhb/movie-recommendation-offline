@@ -7,7 +7,7 @@ STATIC_USER_FIELDS = ["user_id", "gender", "age", "occupation", "zip_code"]
 POINTWISE_ITEM_FIELDS = ["movie_id", "genres", "isAdult", "startYear", "popularity", "averageRating"]
 POINTWISE_SEQUENCE_FIELDS = ["hist_movie_id"]
 
-HISTORY_FIELDS = ["hist_movie_id", "hist_rating", "hist_time_gap_bucket", "hist_length", "low_rating_movie_id"]
+HISTORY_FIELDS = ["hist_movie_id", "hist_rating", "hist_feedback", "hist_time_gap_bucket", "hist_length", "low_rating_movie_id", "positive_movie_id"]
 CANDIDATE_FIELDS = ["candidate_movie_id", "candidate_genres", "candidate_isAdult", "candidate_startYear", "candidate_popularity", "candidate_averageRating"]
 CANDIDATE_RECALL_FEATURE_FIELDS = ["candidate_recall_rank", "candidate_recall_score"]
 SPARSE_ITEM_FEATURE_FIELDS = ["genres", "isAdult", "startYear", "popularity", "averageRating"]

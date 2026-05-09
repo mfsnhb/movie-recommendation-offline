@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from offline.models.feature_encoders import MovieFeatureEncoder, UserFeatureEncoder, build_mlp
+from offline.models.feature_encoders import MovieFeatureEncoder, SequenceFeatureEncoder, UserFeatureEncoder, build_mlp
 
 
 class DeepFMModel(nn.Module):
@@ -17,6 +17,7 @@ class DeepFMModel(nn.Module):
     ):
         super().__init__()
         self.movie_encoder = MovieFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False, multimodal_table=multimodal_table)
+        self.sequence_encoder = SequenceFeatureEncoder(feature_dict, emb_dim, dropout=dropout)
         self.user_encoder = UserFeatureEncoder(feature_dict, emb_dim, dropout=dropout, output_norm=False)
         self.movie_linear = nn.Embedding(feature_dict["movie_id"], 1, padding_idx=0)
         self.dnn = build_mlp(emb_dim * 3, dnn_hidden_dims or [128, 64], 1, dropout=dropout)
@@ -39,9 +40,8 @@ class DeepFMModel(nn.Module):
             "startYear": batch["hist_startYear"],
             "popularity": batch["hist_popularity"],
             "averageRating": batch["hist_averageRating"],
-            "interaction_rating": batch["hist_rating"],
-            "interaction_time_gap_bucket": batch["hist_time_gap_bucket"],
         })
+        context_movie = self.sequence_encoder(context_movie, batch["hist_rating"], batch["hist_time_gap_bucket"], batch.get("hist_feedback"))
         history_mask = batch["hist_movie_id"].gt(0)
         history_weights = history_mask.unsqueeze(-1).float()
         pooled_history = (context_movie * history_weights).sum(dim=1) / history_weights.sum(dim=1).clamp_min(1e-9)

@@ -461,8 +461,8 @@ def _item_cf_candidates(test_data, item_cf_model, topk):
     for idx, user_id in enumerate(test_data["user_id"]):
         history = [int(x) for x in np.asarray(test_data["hist_movie_id"][idx]).reshape(-1) if int(x) > 0]
         scores = Counter()
-        for rank, movie_id in enumerate(reversed(history[-5:]), start=1):
-            weight = 1.0 / rank
+        for rank, movie_id in enumerate(reversed(history[-50:]), start=1):
+            weight = 1.0 / float(np.log2(rank + 1))
             for candidate_id, candidate_score in item_cf_model.get(movie_id, {}).items():
                 scores[int(candidate_id)] += float(candidate_score) * weight
         if not scores:
