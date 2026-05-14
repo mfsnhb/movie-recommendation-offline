@@ -649,6 +649,7 @@ def _evaluate_fused_candidates_subset(
             candidate_score_pools = []
             for sample_idx in batch_indices:
                 sample = extract_split_sample(split_data, sample_idx)
+                target = int(sample["target_movie_id"])
                 user_id = int(sample["user_id"])
                 candidates = fused_candidates_by_user.get(user_id)
                 if candidates is None or int(np.asarray(candidates).size) == 0:
