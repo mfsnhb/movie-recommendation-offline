@@ -6,7 +6,7 @@ import yaml
 
 
 RETRIEVAL_ROUTE_NAMES = ("two_tower", "sequence", "item_cf", "multimodal", "genre", "popular")
-RANKING_MODEL_NAMES = ("deepfm", "din")
+RANKING_MODEL_NAMES = ("deepfm", "din", "din_moe")
 
 
 def load_yaml_config(path: Path) -> dict:

@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from offline.evaluate.metrics import hit_rate_at_k, ndcg_at_k, ranking_metrics, save_metrics
 from offline.evaluate.multi_recall import evaluate_final_candidates
 from offline.models.deepfm import DeepFMModel
-from offline.models.din import DINModel
+from offline.models.din import DINModel, MoEDINModel
 from offline.ranking.dataset import (
     SequenceRankingDataset,
     SequenceRankingTrainCollator,
@@ -85,8 +85,8 @@ def train_ranking_models(models=None, warm_start: bool = True):
     for model_name in selected_models:
         if model_name == "deepfm":
             results[model_name] = train_deepfm(warm_start=warm_start)
-        elif model_name == "din":
-            results[model_name] = train_din(warm_start=warm_start)
+        elif model_name in {"din", "din_moe"}:
+            results[model_name] = _train_torch_ranking_model(model_name, warm_start=warm_start)
         else:
             raise ValueError(f"Unsupported ranking model: {model_name}")
     return results
@@ -100,6 +100,76 @@ def train_deepfm(warm_start: bool = True):
 
 def train_din(warm_start: bool = True):
     return _train_torch_ranking_model("din", warm_start=warm_start)
+
+
+
+def _sequence_group_indices(split_data: dict, threshold: int = 200) -> dict[str, list[int]]:
+    hist_lengths = np.asarray(split_data["hist_length"], dtype=np.int32).reshape(-1)
+    long_indices = np.flatnonzero(hist_lengths > int(threshold)).astype(int).tolist()
+    short_indices = np.flatnonzero(hist_lengths <= int(threshold)).astype(int).tolist()
+    return {"long": long_indices, "short": short_indices}
+
+
+def _prefixed_metrics(metrics: dict, prefix: str) -> dict:
+    return {f"{prefix}_{key}": value for key, value in metrics.items()}
+
+
+def _target_in_recall_indices(split_data: dict, sample_indices: list[int], fused_candidates_by_user: dict[int, np.ndarray]) -> list[int]:
+    matched_indices: list[int] = []
+    for sample_idx in sample_indices:
+        target = int(np.asarray(split_data["target_movie_id"][sample_idx]).reshape(-1)[0])
+        user_id = int(np.asarray(split_data["user_id"][sample_idx]).reshape(-1)[0])
+        candidates = fused_candidates_by_user.get(user_id)
+        if candidates is None:
+            continue
+        if target in set(np.asarray(candidates, dtype=np.int32).reshape(-1).astype(int).tolist()):
+            matched_indices.append(int(sample_idx))
+    return matched_indices
+
+
+def _recall_candidate_coverage_metrics(split_data: dict, sample_indices: list[int], fused_candidates_by_user: dict[int, np.ndarray], all_item_ids: np.ndarray, topks: tuple[int, ...] = (50, 100, 200)) -> dict:
+    metrics: dict[str, float | int] = {}
+    total = int(len(sample_indices))
+    metrics["recall_candidate_users"] = total
+    if total == 0:
+        for topk in topks:
+            metrics[f"recall_candidate_hit@{topk}"] = 0.0
+            metrics[f"recall_candidate_catalog_coverage@{topk}"] = 0.0
+        metrics["recall_candidate_hit"] = 0.0
+        return metrics
+
+    hits = {int(topk): 0 for topk in topks}
+    any_hit = 0
+    missing_candidates = 0
+    recommended_by_k: dict[int, list[int]] = {int(topk): [] for topk in topks}
+    for sample_idx in sample_indices:
+        target = int(np.asarray(split_data["target_movie_id"][sample_idx]).reshape(-1)[0])
+        user_id = int(np.asarray(split_data["user_id"][sample_idx]).reshape(-1)[0])
+        candidates = fused_candidates_by_user.get(user_id)
+        if candidates is None:
+            missing_candidates += 1
+            candidate_array = np.zeros(0, dtype=np.int32)
+        else:
+            candidate_array = np.asarray(candidates, dtype=np.int32).reshape(-1)
+        for topk in topks:
+            recommended_by_k[int(topk)].extend(candidate_array[: int(topk)].astype(int).tolist())
+        matched_positions = np.flatnonzero(candidate_array == target)
+        if matched_positions.size == 0:
+            continue
+        any_hit += 1
+        rank = int(matched_positions[0]) + 1
+        for topk in topks:
+            if rank <= int(topk):
+                hits[int(topk)] += 1
+    for topk in topks:
+        metrics[f"recall_candidate_hit@{topk}"] = float(hits[int(topk)] / total)
+        catalog = set(np.asarray(all_item_ids, dtype=np.int32).reshape(-1).astype(int).tolist()) if all_item_ids is not None else set()
+        metrics[f"recall_candidate_catalog_coverage@{topk}"] = float(len(set(recommended_by_k[int(topk)])) / len(catalog)) if catalog else 0.0
+    metrics["recall_candidate_hit"] = float(any_hit / total)
+    metrics["recall_candidate_target_hits"] = int(any_hit)
+    metrics["recall_candidate_missing_users"] = int(missing_candidates)
+    metrics["recall_candidate_avg_size"] = float(np.mean([len(fused_candidates_by_user.get(int(np.asarray(split_data["user_id"][idx]).reshape(-1)[0]), [])) for idx in sample_indices])) if sample_indices else 0.0
+    return metrics
 
 
 
@@ -124,16 +194,62 @@ def evaluate_ranking_model(model_name: str) -> dict:
     checkpoint = torch.load(get_ranking_model_path(normalized_model_name), map_location=device)
     model = _build_model(normalized_model_name, feature_dict, model_settings, emb_dim, item_features).to(device)
     model.load_state_dict(checkpoint["state_dict"])
+    test_data = ranking_samples["test"]
+    sample_indices = list(range(int(len(test_data["user_id"]))))
     metrics = _evaluate_fused_candidates_subset(
         model,
-        ranking_samples["test"],
-        list(range(int(len(ranking_samples["test"]["user_id"])))),
+        test_data,
+        sample_indices,
         item_features,
         all_item_ids,
         device,
         final_topk=final_topk,
         fused_candidates_by_user=fused_candidates_by_user,
     )
+    coverage_metrics = _recall_candidate_coverage_metrics(test_data, sample_indices, fused_candidates_by_user, all_item_ids)
+    metrics.update(coverage_metrics)
+    conditional_indices = _target_in_recall_indices(test_data, sample_indices, fused_candidates_by_user)
+    conditional_metrics = _evaluate_fused_candidates_subset(
+        model,
+        test_data,
+        conditional_indices,
+        item_features,
+        all_item_ids,
+        device,
+        final_topk=final_topk,
+        fused_candidates_by_user=fused_candidates_by_user,
+    )
+    metrics.update(_prefixed_metrics(conditional_metrics, "conditional_rerank"))
+    metrics["conditional_rerank_users"] = int(len(conditional_indices))
+    group_indices = _sequence_group_indices(test_data, threshold=200)
+    metrics["long_sequence_threshold"] = 200
+    for group_name, indices in group_indices.items():
+        group_metrics = _evaluate_fused_candidates_subset(
+            model,
+            test_data,
+            indices,
+            item_features,
+            all_item_ids,
+            device,
+            final_topk=final_topk,
+            fused_candidates_by_user=fused_candidates_by_user,
+        )
+        metrics.update(_prefixed_metrics(group_metrics, f"{group_name}_sequence"))
+        metrics.update(_prefixed_metrics(_recall_candidate_coverage_metrics(test_data, indices, fused_candidates_by_user, all_item_ids), f"{group_name}_sequence"))
+        group_conditional_indices = _target_in_recall_indices(test_data, indices, fused_candidates_by_user)
+        group_conditional_metrics = _evaluate_fused_candidates_subset(
+            model,
+            test_data,
+            group_conditional_indices,
+            item_features,
+            all_item_ids,
+            device,
+            final_topk=final_topk,
+            fused_candidates_by_user=fused_candidates_by_user,
+        )
+        metrics.update(_prefixed_metrics(group_conditional_metrics, f"{group_name}_sequence_conditional_rerank"))
+        metrics[f"{group_name}_sequence_conditional_rerank_users"] = int(len(group_conditional_indices))
+        metrics[f"{group_name}_sequence_users"] = int(len(indices))
     save_metrics(get_ranking_metrics_path(normalized_model_name), metrics)
     logger.info("Ranking metrics saved | model=%s | path=%s | metrics=%s", normalized_model_name, get_ranking_metrics_path(normalized_model_name).name, metrics)
     return metrics
@@ -285,7 +401,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
                 remaining_epochs = epochs - epoch - 1
                 eta_seconds = avg_batch_time * (remaining_batches + remaining_epochs * total_batches)
                 logger.info(
-                    "Ranking epoch %s/%s | model=%s | batch %s/%s | batch_loss=%.4f | avg_loss=%.4f | candidate_groups=%s | eta=%s",
+                    "Ranking epoch %s/%s | model=%s | batch %s/%s | batch_loss=%.4f | avg_loss=%.4f | negatives_per_sample=%s | eta=%s",
                     epoch + 1,
                     epochs,
                     model_name,
@@ -293,7 +409,7 @@ def _train_torch_ranking_model(model_name: str, warm_start: bool = True):
                     total_batches,
                     batch_loss,
                     total_loss / max(seen_groups, 1),
-                    batch_groups,
+                    train_negatives,
                     format_eta(eta_seconds),
                 )
 
@@ -408,6 +524,19 @@ def _build_model(model_name: str, feature_dict: dict, model_settings: dict, emb_
             dnn_hidden_dims=model_settings.get("dnn_hidden_dims"),
             dropout=float(model_settings.get("dropout", 0.1)),
             multimodal_table=multimodal_table,
+        )
+        return scorer
+
+    if model_name == "din_moe":
+        scorer = MoEDINModel(
+            feature_dict,
+            emb_dim,
+            dnn_hidden_dims=model_settings.get("dnn_hidden_dims"),
+            attention_hidden_dims=model_settings.get("attention_hidden_dims"),
+            dropout=float(model_settings.get("dropout", 0.1)),
+            multimodal_table=multimodal_table,
+            top_m_history=int(model_settings.get("top_m_history", 32)),
+            force_recent_history=int(model_settings.get("force_recent_history", 0)),
         )
         return scorer
 
@@ -744,7 +873,7 @@ def _evaluate_final_candidates(
         raise FileNotFoundError("Missing fused multi-recall candidates for final evaluation")
     ranking_test = ranking_samples["test"]
     sample_indices = list(range(int(len(ranking_test["user_id"]))))
-    return _evaluate_fused_candidates_subset(
+    metrics = _evaluate_fused_candidates_subset(
         model,
         ranking_test,
         sample_indices,
@@ -754,3 +883,48 @@ def _evaluate_final_candidates(
         final_topk,
         fused_candidates_by_user,
     )
+    coverage_metrics = _recall_candidate_coverage_metrics(ranking_test, sample_indices, fused_candidates_by_user, all_item_ids)
+    metrics.update(coverage_metrics)
+    conditional_indices = _target_in_recall_indices(ranking_test, sample_indices, fused_candidates_by_user)
+    conditional_metrics = _evaluate_fused_candidates_subset(
+        model,
+        ranking_test,
+        conditional_indices,
+        item_features,
+        all_item_ids,
+        device,
+        final_topk,
+        fused_candidates_by_user,
+    )
+    metrics.update(_prefixed_metrics(conditional_metrics, "conditional_rerank"))
+    metrics["conditional_rerank_users"] = int(len(conditional_indices))
+    group_indices = _sequence_group_indices(ranking_test, threshold=200)
+    metrics["long_sequence_threshold"] = 200
+    for group_name, indices in group_indices.items():
+        group_metrics = _evaluate_fused_candidates_subset(
+            model,
+            ranking_test,
+            indices,
+            item_features,
+            all_item_ids,
+            device,
+            final_topk,
+            fused_candidates_by_user,
+        )
+        metrics.update(_prefixed_metrics(group_metrics, f"{group_name}_sequence"))
+        metrics.update(_prefixed_metrics(_recall_candidate_coverage_metrics(ranking_test, indices, fused_candidates_by_user, all_item_ids), f"{group_name}_sequence"))
+        group_conditional_indices = _target_in_recall_indices(ranking_test, indices, fused_candidates_by_user)
+        group_conditional_metrics = _evaluate_fused_candidates_subset(
+            model,
+            ranking_test,
+            group_conditional_indices,
+            item_features,
+            all_item_ids,
+            device,
+            final_topk,
+            fused_candidates_by_user,
+        )
+        metrics.update(_prefixed_metrics(group_conditional_metrics, f"{group_name}_sequence_conditional_rerank"))
+        metrics[f"{group_name}_sequence_conditional_rerank_users"] = int(len(group_conditional_indices))
+        metrics[f"{group_name}_sequence_users"] = int(len(indices))
+    return metrics
